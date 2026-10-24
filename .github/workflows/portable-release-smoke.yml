@@ -5,12 +5,12 @@ on:
       tag:
         description: "Existing GitHub release tag to smoke-test"
         required: true
-        default: "v2026.10.24-remote-beta2"
+        default: "v2026.10.25-remote-beta3"
         type: string
       sha256:
         description: "Expected release ZIP SHA-256 (pinned by operator)"
         required: true
-        default: "46e43217fe6cace1f7a55c8aa00afba694fd03926c276565671a7566cee0d540"
+        default: "8b8696b39871ce1a635afe8ad14081821494f4af950eeaa383835ab8d5df6c3b"
         type: string
 permissions:
   contents: read
@@ -53,6 +53,16 @@ jobs:
           $agent = Join-Path $installed 'bridge-v3/ff_win_v3_main.py'
           $marker = Join-Path $installed 'bridge-v3/ff-local-owned-runtime.json'
           if (-not (Test-Path $launcher) -or -not (Test-Path $agent) -or -not (Test-Path $marker)) { throw 'CORE_INSTALL_FILES_MISSING' }
+          # New Beta 3 contract: the portable ZIP ships the addon manager, but not the large assets.
+          $addonManager = Join-Path $payload 'tools/optional_addons.py'
+          $addonLauncher = Join-Path $payload 'ADDONS.cmd'
+          $embeddedPython = Join-Path $installed 'tools/python-3.13.9-embed/python.exe'
+          if (-not (Test-Path $addonManager) -or -not (Test-Path $addonLauncher) -or -not (Test-Path $embeddedPython)) { throw 'ADDON_MANAGER_MISSING' }
+          $addonStatusJson = & $embeddedPython $addonManager status --install-root $installed | Out-String
+          if ($LASTEXITCODE -ne 0) { throw 'ADDON_STATUS_FAILED' }
+          $addonStatus = $addonStatusJson | ConvertFrom-Json
+          if (-not $addonStatus.core_installed -or $addonStatus.addons.browser -ne 'missing_optional_dependency' -or $addonStatus.addons.visual -ne 'missing_optional_dependency') { throw 'ADDON_STATUS_WRONG_DEFAULT' }
+          Write-Host 'OPTIONAL_ADDONS_STATUS_PASS'
           $port = 47061
           $proc = $null
           try {
