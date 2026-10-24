@@ -81,3 +81,17 @@ It returns separately: **candidate availability**, **task compatibility**, **sem
 An isolated real Bridge v3 process on a nonstandard loopback port was exercised via authenticated RPC: ping, CLI-first capability, natural-language programmatic plan, invalid-surface rejection, unified task preflight and rejection of agent-supplied physical-input permission (**6/6 PASS**). The trial used a separate temporary root, never paid for AI inference or took over the desktop, then stopped its owned PID and removed its own temporary files. Owner's live 39073 and 39076 listeners remained healthy. This is genuine **read-only integration evidence**, not proof that an unstructured Cursor/Antigravity/Excel task was executed end-to-end.
 
 Note that a read-only `task_preflight` request carrying `physical_input_allowed=true` is intentionally blocked by the outer Bridge policy before planning. Do **not** bypass or relax that protection to make a malicious test pass.
+
+
+## Permanent independent Windows runner acceptance (real process)
+
+`tests/integration/isolated_rpc_smoke.py` starts the **current source** `ff_win_v3_main.py` with `FF_BRIDGE_ROOT` set to a disposable Windows temp directory and a random 127.0.0.1 port. It creates an independent local RPC secret (never printed), then checks:
+
+1. authenticated `ping` from the newly launched process;
+2. CLI-first enforcement advertised in live capabilities;
+3. unified no-effect `task_preflight` without GUI/model/billing;
+4. rejection of an agent-supplied foreground flag;
+5. rejection of unscoped `start_process`;
+6. **actual** task-scoped read-only `git status` through normal Bridge process RPC, successful `read_process_output`, independent second Git verification, tracked source SHA unchanged.
+
+`finally` terminates the owned agent PID and removes the temporary root; it has no access to operator GitHub tokens or remote transport keys. The public GitHub-hosted `windows-latest` runner now executes this acceptance alongside the unit tests on every PR and `main` push. It is a P0 proof of *one bounded free programmatic task*, not of Cursor/Antigravity/Office assistant completion, host chat consent or full fallback orchestration.

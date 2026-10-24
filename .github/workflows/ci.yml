@@ -19,6 +19,9 @@ jobs:
       - name: Pairing permission and consent regression
         shell: pwsh
         run: python -m unittest discover -s tests -v
+      - name: Real isolated Bridge RPC and read-only task acceptance
+        shell: pwsh
+        run: python tests/integration/isolated_rpc_smoke.py
       - name: PowerShell parsing
         shell: pwsh
         run: |
