@@ -37,3 +37,9 @@
 - [#7 — CLI/API-first and native hidden GUI routing](https://github.com/Ai-b0ss/windows-bridge-core/issues/7) **P1**.
 
 Agents: claim one public issue, branch from current public `main`, implement with evidence and create PR; use free public CI. Keep sensitive device-specific support evidence in the authorized private support channel, never in public issues or public CI logs.
+
+## October 25 release update — preferred new installation
+
+The preferred portable remote-support build is [Beta 3](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3): 61,788,313 bytes, SHA-256 `8b8696b39871ce1a635afe8ad14081821494f4af950eeaa383835ab8d5df6c3b`. It adds `ADDONS.cmd` and an offline, pinned optional browser/visual addon installer while keeping both large addons out of the default ZIP. See [OPTIONAL-ADDONS.md](OPTIONAL-ADDONS.md). The [clean GitHub-hosted Windows install plus addon-status smoke](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40138294471) passed. The older Beta2 run above remains valid historical evidence, not the preferred new release.
+
+Real friend-laptop pairing, Windows elevation, advanced GPU inference and all individual browser/vision RPC routes remain independently unverified; do not infer coverage from a runner setup or checksum alone.
