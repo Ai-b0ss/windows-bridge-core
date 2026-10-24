@@ -1,0 +1,78 @@
+name: Portable Release Windows Smoke
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing GitHub release tag to smoke-test"
+        required: true
+        default: "v2026.10.24-remote-beta2"
+        type: string
+      sha256:
+        description: "Expected release ZIP SHA-256 (pinned by operator)"
+        required: true
+        default: "46e43217fe6cace1f7a55c8aa00afba694fd03926c276565671a7566cee0d540"
+        type: string
+permissions:
+  contents: read
+jobs:
+  portable-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download release ZIP and test on clean Windows
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          EXPECTED_SHA: ${{ inputs.sha256 }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_SHA -notmatch '^[A-Fa-f0-9]{64}$') { throw 'EXPECTED_SHA_INVALID' }
+          if ($env:RELEASE_TAG -notmatch '^v[0-9A-Za-z._-]{1,80}$') { throw 'RELEASE_TAG_INVALID' }
+          $base = Join-Path $env:RUNNER_TEMP 'windows-bridge-clean-smoke'
+          $download = Join-Path $base 'download'
+          $payload = Join-Path $base 'package'
+          $stage = Join-Path $base 'stage'
+          $installed = Join-Path $base 'installed'
+          New-Item -ItemType Directory -Path $download,$payload -Force | Out-Null
+          gh release download $env:RELEASE_TAG -R Ai-b0ss/windows-bridge-core --pattern 'Windows-Bridge-Full-Core-Remote-*.zip' --dir $download
+          if ($LASTEXITCODE -ne 0) { throw 'RELEASE_DOWNLOAD_FAILED' }
+          $files = @(Get-ChildItem -LiteralPath $download -File -Filter '*.zip')
+          if ($files.Count -ne 1) { throw 'RELEASE_ZIP_COUNT_NOT_ONE' }
+          $actual = (Get-FileHash -LiteralPath $files[0].FullName -Algorithm SHA256).Hash
+          if ($actual -ine $env:EXPECTED_SHA) { throw 'RELEASE_SHA256_MISMATCH' }
+          Expand-Archive -LiteralPath $files[0].FullName -DestinationPath $payload -Force
+          $installer = Join-Path $payload 'install.ps1'
+          if (-not (Test-Path $installer)) { throw 'INSTALLER_MISSING' }
+          Write-Host 'RELEASE_SHA256_VERIFIED'
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $installer -StageOnly -NoStartup -InstallRoot $stage
+          if ($LASTEXITCODE -ne 0) { throw 'STAGE_INSTALL_FAILED' }
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File $installer -NoStartup -Transport Local -InstallRoot $installed -RpcPort 47061
+          if ($LASTEXITCODE -ne 0) { throw 'LOCAL_INSTALL_FAILED' }
+          $launcher = Join-Path $installed 'Start-FF.ps1'
+          $agent = Join-Path $installed 'bridge-v3/ff_win_v3_main.py'
+          $marker = Join-Path $installed 'bridge-v3/ff-local-owned-runtime.json'
+          if (-not (Test-Path $launcher) -or -not (Test-Path $agent) -or -not (Test-Path $marker)) { throw 'CORE_INSTALL_FILES_MISSING' }
+          $port = 47061
+          $proc = $null
+          try {
+            $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList "-NoLogo -NoProfile -ExecutionPolicy Bypass -File `"$launcher`" -Port $port" -WindowStyle Hidden -PassThru
+            $ready = $false
+            for ($i=0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 500
+              $listening = @(Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue)
+              if ($listening.Count) { $ready = $true; break }
+            }
+            if (-not $ready) { throw 'RUNTIME_NEVER_LISTENED' }
+            if (@($listening | Where-Object { $_.LocalAddress -ne '127.0.0.1' }).Count -gt 0) { throw 'RUNTIME_LISTENED_PUBLICLY' }
+            Write-Host 'PORTABLE_RELEASE_SMOKE_PASS'
+          } finally {
+            if ($proc) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+            Get-CimInstance Win32_Process | Where-Object {
+              $_.Name -in @('python.exe','pythonw.exe','powershell.exe') -and
+              $_.CommandLine -and
+              $_.CommandLine.IndexOf($installed,[StringComparison]::OrdinalIgnoreCase) -ge 0
+            } | ForEach-Object {
+              Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
+            }
+          }
