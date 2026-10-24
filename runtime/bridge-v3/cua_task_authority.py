@@ -13,6 +13,7 @@ from contextvars import ContextVar
 import hashlib
 import json
 import os
+import platform
 from pathlib import Path
 import re
 import secrets
@@ -37,9 +38,14 @@ def identity(value):
     return value
 
 class AuthorityStore:
-    def __init__(self, root, *, public_key=None):
+    def __init__(self, root, *, public_key=None, device_id=None):
         self.root = Path(root)
         self.path = self.root / "owner-approvals.sqlite3"
+        # The same trusted signer may authorize multiple owned machines, but
+        # a signed decision for one device cannot be consumed on another.
+        # Hostname is an operational device ID, NOT hardware attestation.
+        # A later signed host device-identity scheme must strengthen this.
+        self.device_id = identity(device_id if device_id is not None else platform.node())
         # Public verification key is captured at startup. The corresponding
         # signing key belongs to the authenticated owner/controller and must
         # never be present in the bridge, scripts, ZIP or logs.
@@ -72,7 +78,9 @@ class AuthorityStore:
         self.root.mkdir(parents=True, exist_ok=True)
         con = sqlite3.connect(self.path, timeout=5)
         con.execute("PRAGMA synchronous=FULL")
-        con.execute("CREATE TABLE IF NOT EXISTS approvals (id TEXT PRIMARY KEY, agent TEXT, task TEXT, digest TEXT, expires REAL, uses INTEGER, reference TEXT)")
+        # Separate v2 records from legacy unbound approvals. Legacy rows are
+        # deliberately not migrated or silently accepted after this upgrade.
+        con.execute("CREATE TABLE IF NOT EXISTS approvals_v2 (id TEXT PRIMARY KEY, agent TEXT, task TEXT, digest TEXT, device TEXT NOT NULL, expires REAL, uses INTEGER, reference TEXT, revoked INTEGER NOT NULL DEFAULT 0)")
         return con
 
     def provision(self, *, signed_approval):
@@ -126,21 +134,40 @@ class AuthorityStore:
     def _record_approval(self, payload):
         agent, task, request = payload.get("agent"), payload.get("task"), payload.get("request")
         if not isinstance(request, dict): raise AuthorityError("OWNER_APPROVAL_SCOPE_INVALID")
+        # Device is covered by the exact signed payload (or trusted local
+        # delegation). An omitted or forged agent-supplied device flag fails.
+        device = payload.get("device")
+        if not isinstance(device, str) or not device:
+            raise AuthorityError("OWNER_APPROVAL_DEVICE_REQUIRED")
+        identity(device)
+        if device != self.device_id:
+            raise AuthorityError("OWNER_APPROVAL_DEVICE_MISMATCH")
         approval_reference, expires, uses = payload.get("approval_reference"), payload.get("expires"), payload.get("uses")
         identity(agent); identity(task); identity(payload.get("nonce"))
         if not isinstance(approval_reference, str) or not approval_reference.strip():
             raise AuthorityError("OWNER_APPROVAL_REFERENCE_REQUIRED")
         now = time.time()
-        if type(expires) not in {int,float} or not now < expires <= now+3600 or type(uses) is not int or not 1 <= uses <= 100 or payload.get("not_before", now) > now:
+        not_before = payload.get("not_before", now)
+        if (type(expires) not in {int, float} or not now < expires <= now + 3600
+                or type(uses) is not int or not 1 <= uses <= 100
+                or type(not_before) not in {int, float}
+                or not_before > now or not_before > expires):
             raise AuthorityError("APPROVAL_LIMIT_INVALID")
         digest = hashlib.sha256(canonical(request).encode()).hexdigest()
         grant = hashlib.sha256(canonical(payload).encode()).hexdigest()
         with closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE")
-            con.execute("DELETE FROM approvals WHERE expires<?", (time.time()-86400,))
-            if con.execute("SELECT count(*) FROM approvals").fetchone()[0] >= 10000 and not con.execute("SELECT 1 FROM approvals WHERE id=?",(grant,)).fetchone():
+            con.execute("DELETE FROM approvals_v2 WHERE expires<?", (time.time()-86400,))
+            if (con.execute("SELECT count(*) FROM approvals_v2").fetchone()[0] >= 10000
+                    and not con.execute("SELECT 1 FROM approvals_v2 WHERE id=?", (grant,)).fetchone()):
                 raise AuthorityError("OWNER_APPROVAL_CAPACITY_EXHAUSTED")
-            con.execute("INSERT OR IGNORE INTO approvals VALUES (?,?,?,?,?,?,?)", (grant, agent, task, digest, expires, uses, approval_reference))
+            # Conflict means this exact receipt was already provisioned:
+            # no uses/expiry reset, even after full consumption or revocation.
+            con.execute(
+                "INSERT OR IGNORE INTO approvals_v2 "
+                "(id,agent,task,digest,device,expires,uses,reference) VALUES (?,?,?,?,?,?,?,?)",
+                (grant, agent, task, digest, device, expires, uses, approval_reference),
+            )
             con.commit()
         return grant
 
@@ -149,16 +176,38 @@ class AuthorityStore:
         digest = hashlib.sha256(canonical(request).encode()).hexdigest()
         with closing(self._connect()) as con:
             con.execute("BEGIN IMMEDIATE")
-            row = con.execute("SELECT agent,task,digest,expires,uses FROM approvals WHERE id=?", (grant,)).fetchone()
+            row = con.execute(
+                "SELECT agent,task,digest,device,expires,uses,revoked FROM approvals_v2 WHERE id=?",
+                (grant,),
+            ).fetchone()
             if not row:
                 raise AuthorityError("OWNER_APPROVAL_REQUIRED")
+            if row[3] != self.device_id:
+                raise AuthorityError("OWNER_APPROVAL_DEVICE_MISMATCH")
             if row[:3] != (agent, task, digest):
                 raise AuthorityError("OWNER_APPROVAL_SCOPE_MISMATCH")
-            if row[3] <= time.time() or row[4] < 1:
+            if row[6]:
+                raise AuthorityError("OWNER_APPROVAL_REVOKED")
+            if row[4] <= time.time() or row[5] < 1:
                 raise AuthorityError("OWNER_APPROVAL_EXPIRED_OR_CONSUMED")
-            con.execute("UPDATE approvals SET uses=uses-1 WHERE id=?", (grant,))
+            con.execute("UPDATE approvals_v2 SET uses=uses-1 WHERE id=?", (grant,))
             con.commit()
-        return row[3]
+        return row[4]
+
+    def revoke(self, grant):
+        """Trusted local-controller revocation; intentionally not an RPC op."""
+        if not isinstance(grant, str) or not re.fullmatch(r"[0-9a-f]{64}", grant):
+            raise AuthorityError("OWNER_APPROVAL_ID_INVALID")
+        with closing(self._connect()) as con:
+            con.execute("BEGIN IMMEDIATE")
+            con.execute(
+                "UPDATE approvals_v2 SET revoked=1, uses=0 "
+                "WHERE id=? AND device=?",
+                (grant, self.device_id),
+            )
+            changed = con.execute("SELECT changes()").fetchone()[0]
+            con.commit()
+        return bool(changed)
 
 def guard_effect(core, store, op, original):
     def guarded(args):
@@ -296,14 +345,19 @@ class DesktopModes:
 def main():
     parser = argparse.ArgumentParser(description="Trusted LOCAL owner/controller approval provisioning; never an RPC operation")
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--device-id", help="Expected signed target device; defaults to this host")
     source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--revoke", help="Revoke an existing exact grant ID, trusted local controller only")
     source.add_argument("--request", type=Path, help="JSON containing signed_approval from the authenticated owner/controller")
     source.add_argument("--local-desktop-delegation", type=Path,
                         help="Exact desktop transition or app launch already authorized by the owner; local trusted controller only")
     args = parser.parse_args()
+    store = AuthorityStore(args.root, device_id=args.device_id)
+    if args.revoke:
+        print(json.dumps({"revoked": store.revoke(args.revoke)}))
+        return
     path = args.local_desktop_delegation or args.request
     data = json.loads(path.read_text(encoding="utf-8-sig"))
-    store = AuthorityStore(args.root)
     grant = store.provision_local_desktop(data) if args.local_desktop_delegation else store.provision(**data)
     print(grant)
 

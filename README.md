@@ -40,3 +40,7 @@ See [CI_POLICY.md](CI_POLICY.md) for free GitHub-hosted Windows/Linux checks, cl
 ## P0: Verified agent orchestration and ChatGPT skill
 
 Read [P0_AGENT_PLATFORM.md](P0_AGENT_PLATFORM.md) for verified three-way runtime audit, new no-effect route preflight (computer_use.command=plan_action), the [Windows Bridge Skill source](skills/windows-bridge/SKILL.md), missing host-side permission attestation and explicit acceptance gates. Skill source committed in GitHub is not proof it auto-activates in ChatGPT. The installed home Bridge is intentionally unchanged.
+
+### P0 — Device-bound owner consent
+
+[Permission Broker design and test status](P0_PERMISSION_BROKER.md): signed approvals bind the exact device/agent/task/action/TTL, reject legacy unbound grants and provide local revocation. This is a local authorization foundation, **not** a claim that ChatGPT host-attested consent is integrated.
