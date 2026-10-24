@@ -3,7 +3,8 @@ param(
     [string]$InstallRoot = (Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge'), [int]$RpcPort = 39073,
     [string]$Device = '', [string]$ResultsBranch = 'ff-transport-results', [switch]$StageOnly, [switch]$NonInteractive,
     [switch]$RuntimeOnly, [switch]$NoStartup,
-    [ValidateSet('Local','GitHub')][string]$Transport = 'Local'
+    [ValidateSet('Local','GitHub')][string]$Transport = 'Local',
+    [string]$TrustedOperator = ''
 )
 $originalLocalAppData = $env:LOCALAPPDATA
 $originalPath = $env:PATH
@@ -181,6 +182,13 @@ exit $exitCode
     return
 }
 Import-Module ScheduledTasks
+# The operator is explicitly named and is never guessed from the laptop owner's local GitHub login.
+# Never turn a public repo into a remote execution/control channel.
+if ($Repository -notmatch '^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$') { throw 'REMOTE_REPOSITORY_INVALID' }
+$repositoryOwner = ($Repository -split '/')[0]
+if (-not $TrustedOperator) { $TrustedOperator = $repositoryOwner }
+if ($TrustedOperator -notmatch '^[A-Za-z0-9-]{1,39}$') { throw 'REMOTE_TRUSTED_OPERATOR_INVALID' }
+if ($TrustedOperator -ine $repositoryOwner) { throw 'REMOTE_OPERATOR_MUST_BE_REPOSITORY_OWNER' }
 $token = $env:GH_TOKEN
 if (-not $token) { try { $token = (& $gh auth token 2>$null | Out-String).Trim() } catch { $token = '' } }
 if (-not $token) {
@@ -197,6 +205,7 @@ function Invoke-Repo($Method, $Suffix, $Body = $null) {
     Invoke-RestMethod @params
 }
 $repoInfo = Invoke-Repo GET ''
+if (-not $repoInfo.private) { throw 'REMOTE_GITHUB_REPOSITORY_MUST_BE_PRIVATE' }
 if (-not $repoInfo.permissions.push) { throw 'GITHUB_REPOSITORY_WRITE_ACCESS_REQUIRED' }
 $userInfo = Invoke-RestMethod -Uri 'https://api.github.com/user' -Headers $headers -UseBasicParsing
 $device = $Device
@@ -269,7 +278,7 @@ if ($managedV3) {
 }
 $config = [ordered]@{schema='ff-win-github-transport-config-v2';repository=$Repository;branch=$Branch;device=$device;
     inbox_issue=$InboxIssue;results_branch=$ResultsBranch;python_path=$python;gh_path=$gh;
-    rpc_url=('http://127.0.0.1:' + $RpcPort + '/rpc');allowed_senders=@([string]$userInfo.login);
+    rpc_url=('http://127.0.0.1:' + $RpcPort + '/rpc');allowed_senders=@([string]$TrustedOperator);
     source_commit=$manifest.source_commit;rotation_comments=1000;installed_at=[DateTimeOffset]::UtcNow.ToString('o')}
 if ($previous -and $previous.PSObject.Properties['archived_inboxes']) { $config.archived_inboxes=$previous.archived_inboxes }
 Write-JsonAtomic $configPath $config

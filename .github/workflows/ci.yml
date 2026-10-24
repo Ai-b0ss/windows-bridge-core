@@ -16,6 +16,9 @@ jobs:
       - name: Python sources compile
         shell: pwsh
         run: python -m compileall -q runtime
+      - name: Pairing permission and consent regression
+        shell: pwsh
+        run: python -m unittest discover -s tests -v
       - name: PowerShell parsing
         shell: pwsh
         run: |
