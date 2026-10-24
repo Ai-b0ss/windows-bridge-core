@@ -28,3 +28,7 @@ For a **separate private GitHub transport**, see [REMOTE-PAIRING.md](REMOTE-PAIR
 ## Managing paired devices from ChatGPT
 
 [CHATGPT-REMOTE-CONTROL.md](CHATGPT-REMOTE-CONTROL.md) documents exact device discovery, private GitHub transport command/results, owner authentication, required friend consent and safe shutdown. Optional no-token CLI: `python tools/bridge_remote_gh.py --list`.
+
+## Public free CI and private-source separation
+
+See [CI_POLICY.md](CI_POLICY.md) for free GitHub-hosted Windows/Linux checks, clean-release smoke runs, private repository safety and the rule against using personal Windows runners for untrusted public pull requests.
