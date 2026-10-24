@@ -518,6 +518,8 @@ class CuaBridgeControlPlane:
                 return prepare_windows_mcp()
             except ToolPreparationError as exc:
                 raise CuaBridgeError(exc.code) from exc
+        if command == "task_preflight":
+            return self._task_preflight(args)
         if command == "plan_action":
             # Uses the existing surface registry and route adapters, not a
             # second parallel router. Planning never performs adapter.act().
@@ -1437,6 +1439,73 @@ class CuaBridgeControlPlane:
             if command == "list_tabs" and bool(response.get("ok", False)) and isinstance(response.get("result"), list):
                 return {"tabs": [dict(item) if isinstance(item, Mapping) else item for item in response["result"]]}
             return _unwrap(response, browser=True)
+
+    def _task_preflight(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Read-only unified capability investigation before any real action.
+
+        Uses the SAME programmatic discovery and route planner already serving
+        normal computer_use calls. It does not run a model, mint owner consent,
+        install tools, mutate a file or issue an adapter.act request.
+        """
+        app = str(args.get("app") or "").strip()
+        task = str(args.get("task") or "").strip()
+        if not app:
+            raise CuaBridgeError("APP_REQUIRED")
+        if not task:
+            raise CuaBridgeError("TASK_REQUIRED")
+        # Request-side flags cannot silently opt into CLI probes that may
+        # launch a GUI executable, nor override foreground authorization.
+        candidates = self.dispatch({
+            "command": "programmatic_plan", "app": app, "task": task,
+            "probe_versions": False,
+        })
+        cli = list(candidates.get("candidates") or [])
+        route_preflight = None
+        surface_id = args.get("surface_id")
+        if surface_id is not None:
+            if not isinstance(surface_id, str) or not surface_id:
+                raise CuaBridgeError("SURFACE_NOT_FOUND")
+            operation = args.get("operation")
+            if not isinstance(operation, str) or not operation:
+                raise CuaBridgeError("OPERATION_REQUIRED")
+            route_preflight = self.dispatch({
+                "command": "plan_action", "surface_id": surface_id,
+                "operation": operation, "action_args": dict(args.get("action_args") or {}),
+                "policy": {
+                    "background_required": True,
+                    "foreground_allowed": False,
+                    "physical_input_allowed": False,
+                    "require_verified": True,
+                },
+            })
+        task_compatible = candidates.get("task_compatibility")
+        route = route_preflight.get("selected_route") if isinstance(route_preflight, Mapping) else None
+        best_task = candidates.get("preferred_task_route")
+        if isinstance(best_task, Mapping):
+            step = "validate_entitlement_and_execute_verified_programmatic_task"
+        elif route:
+            step = "verify_background_route_matches_task_then_act_with_postcondition"
+        elif cli:
+            step = "check_task_specific_cli_support_auth_and_pricing"
+        else:
+            step = "research_official_api_sdk_mcp_and_optional_hidden_paths"
+        return {
+            "schema": "ff-cua-task-preflight-v1",
+            "app": app, "task": task,
+            "programmatic": candidates,
+            "semantic_preflight": route_preflight,
+            "task_compatibility": task_compatible,
+            "has_programmatic_candidates": bool(cli),
+            "action_executed": False,
+            "task_completed": False,
+            "verified_task_result": False,
+            "foreground_used": False,
+            "owner_authorization_verified": False,
+            "model_called": False,
+            "billing_or_purchase_executed": False,
+            "tools_installed": False,
+            "next_step": step,
+        }
 
     def _act(self, args: Mapping[str, Any]) -> dict[str, Any]:
         surface_id, surface = self._surface(args)

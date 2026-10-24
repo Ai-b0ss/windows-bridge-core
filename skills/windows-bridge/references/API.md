@@ -3,7 +3,8 @@
 Inspect capabilities from the live connected Bridge; no static README proves current support.
 
 - Device identity: `device_status`, `device_ping`, `bridge_capabilities`, `bridge_call(op="device_info", args={})`.
-- Main programmatic investigation: `bridge_call(op="computer_use",args={"command":"programmatic_plan","app":"cursor","task":"<actual task>","probe_versions":true})`.
+- Unified no-effect task investigation (newer source/runtime only): `bridge_call(op="computer_use",args={"command":"task_preflight","app":"cursor","task":"<actual task>"})`. Returns programmatic candidates, task compatibility (not guaranteed success), optional existing-surface route preflight, and explicit next steps. Never launches a model or buys an API call.
+- Older runtime fallback: `bridge_call(op="computer_use",args={"command":"programmatic_plan","app":"cursor","task":"<actual task>","probe_versions":false})`. Candidate discovery alone is not real task verification.
 - Exact action plan on a registered surface (newer runtime only): `computer_use({"command":"plan_action","surface_id":"<id>","operation":"<op>","policy":{"background_required":true}})`. This NEVER executes an action.
 - Existing route executor: `computer_use({"command":"act","surface_id":"<id>","operation":"<op>","action_args":{},"postcondition":{},"policy":{"background_required":true}})` only after task suitability evidence; use the live contract for required arguments.
 - Evidence/recovery: `durable_call`, `request_status`, and relevant owner-scoped session APIs if advertised by the connected Bridge.
