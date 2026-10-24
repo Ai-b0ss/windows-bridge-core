@@ -20,3 +20,7 @@ Remote support: the device owner must explicitly pair an approved secure remote-
 GitHub Actions must use GitHub-hosted standard runners only. Never run untrusted fork pull requests on private self-hosted Windows machines.
 
 This core was derived from the archived, checked source snapshot `c034e527a77b737b266c3c7df8b8521032be6f8a` and repackaged for optional heavy dependencies. The original full archive is not part of the public history.
+
+## Optional consented remote pairing
+
+For a **separate private GitHub transport**, see [REMOTE-PAIRING.md](REMOTE-PAIRING.md). The friend must accept the repository collaboration invitation and explicitly run `PAIR-REMOTE-SUPPORT.cmd` from a release ZIP. **Do not use the public source repository as the remote execution inbox.**
