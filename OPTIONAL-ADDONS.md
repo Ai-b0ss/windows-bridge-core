@@ -1,5 +1,88 @@
-# Optional browser and visual assets
-The public Full Core build deliberately excludes two VERY LARGE prebuilt ZIP assets. The Python GUI/Win32/native UIA path is retained.
-For bundled Playwright Chromium/browser tooling, use a separate verified browser asset distribution based on the pinned SHA-256 in release-manifest.json, then reinstall with a manifest that includes browser_asset and its matching file hash. This is NOT necessary for PowerShell, file management, system repair or native GUI input.
-For optional OmniParser / PyTorch and GPU models, install a separately audited visual addon with its dependency lock (original release-manifest.json retained in the core under visual_dependency_lock). No model binaries are shipped in the core.
-The existing public package deliberately makes no external auto-downloads and never accesses the owner's accounts or existing laptop.
+# Windows Bridge Core — подключаемые браузер и визуальная модель
+
+**Задача:** ядро Bridge остаётся около 62 МБ. Полноценный Playwright/Chromium и
+визуальный PyTorch/OmniParser-runtime можно доставить **отдельными архивами**,
+не меняя код Bridge и не трогая чужие данные.
+
+## Что уже проверено 25.10.2026
+
+В отдельном тестовом Windows Bridge (НЕ в рабочей установленной версии пользователя):
+
+| Опция | Архив | Реальная проверка |
+| --- | --- | --- |
+| Базовый Windows Bridge | Remote Beta 2, 61 770 753 байта | Clean Windows Actions runner: установка и localhost listener PASS |
+| Browser addon | 331 067 576 байт | 809 записей; SHA-256 PASS; установка PASS; Chromium 1243 запущен Playwright, data: HTML smoke PASS; точное удаление PASS |
+| Visual addon | 443 752 886 байт | 6 557 записей; SHA-256 PASS; установка PASS; PyTorch 2.8.0+cpu, TorchVision 0.23.0+cpu, модель TorchScript открылась, точное удаление PASS, включая 1 686 автоматически созданных Python-кэшей |
+
+**Не проверено:** полная GUI-инференция OmniParser на реальном дисплее второго ноутбука; GPU/CUDA;
+UAC/elevation; версия чужого ноутбука. Установка пакета не означает, что все маршруты его использовали.
+
+## Как пользоваться
+
+1. Установите **Full Core** из GitHub Releases обычным `INSTALL-FRIEND.cmd`.
+2. Получите отдельно **проверенный** `browser-runtime.zip` или
+   `visual-runtime.zip` из исходного пакета `FFBridge-ready-c034e52.zip`
+   (у владельца проекта); эти тяжёлые ZIP **не включены в открытый Core**
+   и не загружаются автоматически. Не скачивайте случайные репаки.
+3. В каталоге распакованной версии Bridge откройте `ADDONS.cmd status`.
+4. Установите дополнение:
+
+```cmd
+ADDONS.cmd install --name browser --archive "C:\path\browser-runtime.zip"
+ADDONS.cmd install --name visual --archive "C:\path\visual-runtime.zip"
+```
+
+5. При необходимости удалите только то, что установлено нашим менеджером:
+
+```cmd
+ADDONS.cmd remove --name browser
+ADDONS.cmd remove --name visual
+```
+
+Дополнительный CLI для другой тестовой директории:
+`python tools/optional_addons.py status --install-root "C:\path\isolated-core"`.
+Нужен Python 3.11+ для `hashlib.file_digest`; в Full Core включён Python 3.13.9.
+
+## Проверяемые хеши исходных addon ZIP
+
+| Addon | SHA-256 |
+| --- | --- |
+| browser | `2a29191d66c9fc08a5d62363875b683ab0e4e94f71bea3620fe60730a2a0a45f` |
+| visual | `a79c9402e78fcf6513468f8868c9b315111c3bac7de07f1d36c40e2b3a1308ef` |
+
+Менеджер требует точное совпадение размера, SHA-256 и количества элементов.
+После этого проверяет каждый ZIP-путь (запрет обхода директорий, ссылок, специальных
+файлов, неразрешённых корней, Windows reserved paths и коллизий регистра).
+Архив распаковывается в **отдельную staging-директорию**; каталог программы
+не трогается, пока проверка и распаковка не завершены.
+
+При удалении сверяется каждый установленный файл с сохранённым собственным
+манифестом SHA-256. Если кто-то добавил или изменил неизвестный файл, удаление
+**останавливается без очистки данных**. Исключение: автоматически созданные Python
+3.13 `__pycache__/*.pyc` строго внутри vendored visual Python site-packages.
+Эти кэши удаляются вместе с дополнением.
+
+Менеджер отказывается перезаписывать существующие `node_modules`, `browsers`
+или `native`, даже если их происхождение неизвестно. Для других версий дополнений
+нужно сначала явно удалить или сохранить исходную установку. Никакие Windows
+права администратора для этого не обходятся. Статус `installed_marker_present_not_deep_verified`
+означает наличие записи собственности, а не полную повторную проверку содержимого.
+
+## Что делать при ошибках
+
+- `ADDON_ARCHIVE_SIZE_MISMATCH` / `ADDON_SHA256_MISMATCH`: неподходящий архив.
+- `ADDON_TARGET_EXISTS_NOT_OWNED`: директория существует, установщик её не трогает.
+- `ADDON_CONTENT_MODIFIED_OR_FOREIGN_FILES`: дополнительные или изменённые файлы.
+  Сохраните их вручную перед повторной попыткой; менеджер не будет их удалять.
+- `CORE_NOT_INSTALLED`: не найдено действующее ядро по указанному пути.
+- `missing_optional_dependency`: конкретный addon отсутствует, системные команды и native GUI ядра продолжают работать.
+- `permissions_required`: прав Windows недостаточно для выбранного действия;
+  требуется обычное согласие администратора/владельца через Windows UAC, а не обход.
+
+## Ограничения распространения
+
+Публично распространяется лишь **код установки** и pinned SHA. Сами браузерные
+бинарники и веса модели пока остаются в исходном архиве. Перед публичной публикацией
+каждого addon нужно отдельно проверить лицензии, содержимое и отсутствие приватных
+профилей/журналов. Предыдущий `Windows-Bridge-Full-Core-Remote-20261024-v2.zip`
+не включает `ADDONS.cmd`; новый релиз должен быть собран и проверен отдельно.
