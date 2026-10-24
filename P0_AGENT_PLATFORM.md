@@ -68,3 +68,6 @@ A public source integration now:
 - retains the **stricter public** security redaction. Do not copy the less-redacted live `ff_win_v3_security.py` over public code or publish live logs.
 
 This code still requires a clean Windows runtime smoke and release compatibility proof before deployment to an existing machine. The user-mode CLI-first policy cannot sandbox arbitrary scripts launched outside Bridge and is not a substitute for the trusted Permission Broker.
+## AuthorityStore device-binding follow-up
+
+The authority foundation now explicitly requires signed local-device binding and uses a separate `approvals_v2` table instead of trusting unbound legacy rows. Added local revocation and signed-receipt replay/wrong-device regression tests. **Host-issued chat attestation remains unimplemented**, and this source-only change has not been deployed to the currently running owner's Bridge. Details: [P0_PERMISSION_BROKER.md](P0_PERMISSION_BROKER.md).
