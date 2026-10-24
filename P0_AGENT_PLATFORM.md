@@ -55,3 +55,16 @@ Until the trusted host integration is proven, visible control requiring such con
 6. Finally repackage and update distribution/Drive with the tested exact source, not before.
 
 References: [skill](skills/windows-bridge/SKILL.md), [remote device guide](CHATGPT-REMOTE-CONTROL.md), [CI policy](CI_POLICY.md).
+
+## P0 parity follow-up: restoring the known-app CLI-first policy
+
+The live runtime contained a ~20 KB `cua_cli_first_policy.py` implementation that was absent from public source and all lightweight release ZIPs. It guards known application GUI entry paths and verifies exact owner-signed exceptions instead of agent-supplied booleans.
+
+A public source integration now:
+- restores that standalone policy module, after static credential-pattern inspection;
+- binds policy to the existing `_computer_use` RPC dispatch, including nested workflows, and identifies known app targets through the live CUA surface registry;
+- exposes explicit capability status; `plan_action` is read-only and exempt from mutation blocking;
+- repairs recognition of human-facing `Cursor`, `Antigravity`, and `VS Code` display names (previously the guard primarily recognized executable names);
+- retains the **stricter public** security redaction. Do not copy the less-redacted live `ff_win_v3_security.py` over public code or publish live logs.
+
+This code still requires a clean Windows runtime smoke and release compatibility proof before deployment to an existing machine. The user-mode CLI-first policy cannot sandbox arbitrary scripts launched outside Bridge and is not a substitute for the trusted Permission Broker.

@@ -35,6 +35,8 @@ _TASK_AUTHORITY = AuthorityStore(core.BRIDGE_ROOT / "state" / "task-authority")
 cua_restricted_rpc.install(core, shell_policy="user", authority=_TASK_AUTHORITY)
 
 _CUA_CONTROL_PLANE = cua_bridge_v3.CuaBridgeControlPlane(Path(__file__).resolve().parent)
+# Register exact owned CUA surface targets for CLI-first policy; no title guessing.
+core.cli_first_surfaces = _CUA_CONTROL_PLANE._surfaces
 
 _INTERACTIVE_GUI_OVERRIDE_ENV = "FF_WIN_INTERACTIVE_GUI_OVERRIDE"
 _INTERACTIVE_GUI_TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
@@ -148,6 +150,8 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
         raise core.RPCError(exc.code, details={**exc.details,"retry_safe": False}) from exc
 
 def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
+    from cua_cli_first_policy import enforce as enforce_cli_first
+    enforce_cli_first(core, "computer_use", args)
     if args.get("command") in {"assistant_step", "assistant_task"}:
         from cua_assistant_workflow import AssistantWorkflow, AssistantError
         try:
@@ -413,6 +417,8 @@ def _install_gui_guards() -> None:
         result = original_capabilities(args) if original_capabilities else {}
         features = result.setdefault("features", {})
         features["gui_target_guard"] = True
+        features["cli_first_policy"] = {"version": 2, "active": True, "scope": "bridge_rpc",
+                                        "gui_exception": "exact_owner_signed_approval"}
         features["gui_window_relative_coordinates"] = True
         features["gui_atomic_action_sequence"] = True
         features["cua_semantic_control_plane"] = True
