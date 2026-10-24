@@ -32,3 +32,7 @@ For a **separate private GitHub transport**, see [REMOTE-PAIRING.md](REMOTE-PAIR
 ## Public free CI and private-source separation
 
 See [CI_POLICY.md](CI_POLICY.md) for free GitHub-hosted Windows/Linux checks, clean-release smoke runs, private repository safety and the rule against using personal Windows runners for untrusted public pull requests.
+
+## Current lightweight release — Remote Beta 3
+
+[Download Windows Bridge Full Core Remote Beta 3](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3) (61.79 MB). It includes `ADDONS.cmd` for optional offline, pinned browser/vision installs; it does not bundle the heavy binaries. Follow [OPTIONAL-ADDONS.md](OPTIONAL-ADDONS.md). The pairing flow still requires explicit consent and a private GitHub transport.
