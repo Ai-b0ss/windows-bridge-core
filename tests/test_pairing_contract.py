@@ -14,6 +14,7 @@ class TestPairingContract(unittest.TestCase):
         self.assertIn("Disable-ScheduledTask",s)
         self.assertIn("Get-CimInstance Win32_Process",s)
         self.assertIn("IndexOf($expected",s)
+        self.assertIn("ff-gh-owned-runtime.json",s)
     def test_consent_before_remote(self):
         s=(ROOT/"PAIR-REMOTE-SUPPORT.cmd").read_text(encoding="utf-8")
         self.assertIn("choice /C YN",s)

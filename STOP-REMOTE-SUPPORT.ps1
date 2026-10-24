@@ -40,6 +40,9 @@ foreach ($task in $matched) {
     Disable-ScheduledTask -TaskName $task.TaskName -TaskPath $task.TaskPath -ErrorAction Stop | Out-Null
 }
 # Stop only processes whose command lines identify this precise owned transport runtime.
+# A GitHub-managed-only Bridge v3 agent must stop when remote support is disabled.
+# If a separately-installed local agent exists, leave it running on loopback.
+$ghV3Marker = Join-Path $InstallRoot 'bridge-v3\ff-gh-owned-runtime.json'
 $ownedPaths = @(
     (Join-Path $transportRoot 'ff_win_github_comment_daemon.py'),
     (Join-Path $transportRoot 'ff_win_github_transport_keeper.ps1'),
@@ -47,6 +50,9 @@ $ownedPaths = @(
     (Join-Path $transportRoot 'ff_win_github_background_keeper.ps1'),
     (Join-Path $transportRoot 'ff_win_github_v3_keeper.ps1')
 )
+if (Test-Path -LiteralPath $ghV3Marker -PathType Leaf) {
+    $ownedPaths += (Join-Path $InstallRoot 'bridge-v3\ff_win_v3_main.py')
+}
 foreach ($proc in @(Get-CimInstance Win32_Process)) {
     if ($proc.ProcessId -eq $PID -or -not $proc.CommandLine) { continue }
     if ($proc.Name -notin @('python.exe','pythonw.exe','powershell.exe','pwsh.exe')) { continue }
