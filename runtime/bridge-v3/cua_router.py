@@ -378,6 +378,93 @@ class ControlRouter:
             raise ControlRouterError("NEEDS_FOREGROUND_LEASE", details={"route_attempts": attempts})
         raise ControlRouterError("ROUTE_UNAVAILABLE", details={"route_attempts": attempts})
 
+    def inspect(
+        self,
+        request: Mapping[str, Any],
+        *,
+        policy: RoutePolicy | None = None,
+        lease: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Read-only route suitability PRE-FLIGHT, never adapter.act().
+
+        The caller must treat this as an observation, not an authorization.
+        can_handle() is required to be a pure probe; selected runtime adapters
+        implement it without executing the requested user action.
+        """
+        policy = policy or RoutePolicy(background_required=True, foreground_allowed=False, physical_input_allowed=False)
+        attempts: list[dict[str, Any]] = []
+        selected = None
+        for route in ROUTE_ORDER:
+            registration = self.routes.get(route)
+            if registration is None:
+                continue
+            if policy.background_required and not registration.background_safe:
+                attempts.append({"route": route, "status": "policy_rejected",
+                                 "reason": "route_not_background_safe"})
+                continue
+            if registration.physical_input:
+                if (policy.background_required or not policy.foreground_allowed
+                        or not policy.physical_input_allowed):
+                    attempts.append({"route": route, "status": "policy_rejected",
+                                     "reason": "physical_input_disallowed"})
+                else:
+                    # This preflight MUST NOT mint or validate authority from an
+                    # agent-controlled flag. Execution requires verified lease.
+                    attempts.append({"route": route, "status": "requires_verified_lease",
+                                     "reason": "authenticated_foreground_authority_required"})
+                continue
+            try:
+                probe = registration.adapter.can_handle(request)
+            except Exception as exc:
+                attempts.append({"route": route, "status": "probe_failed",
+                                 "reason": "adapter_probe_failed",
+                                 "exception_type": type(exc).__name__})
+                continue
+            if isinstance(probe, Mapping):
+                supported = probe.get("supported") is True
+                background_safe = probe.get("background_safe")
+                desktop_exclusive = probe.get("desktop_exclusive")
+                reason = probe.get("reason")
+            else:
+                supported = probe is True
+                background_safe = None
+                desktop_exclusive = None
+                reason = None
+            if not supported:
+                attempts.append({"route": route, "status": "unsupported",
+                                 "reason": str(reason or "adapter_unavailable")})
+                continue
+            if policy.background_required and (
+                background_safe is not True or desktop_exclusive is not False
+            ):
+                attempts.append({"route": route, "status": "policy_rejected",
+                                 "reason": "background_safety_not_proven"})
+                continue
+            attempts.append({"route": route, "status": "ready",
+                             "background_safe": background_safe,
+                             "desktop_exclusive": desktop_exclusive})
+            if selected is None:
+                selected = route
+        return {
+            "schema": "ff-cua-route-preflight-v1",
+            "operation": request.get("operation"),
+            "selected_route": selected,
+            "action_executed": False,
+            "verified_result": False,
+            "owner_authorization_verified": False,
+            "requires_verified_foreground_approval": (
+                selected is None and any(x["status"] == "requires_verified_lease"
+                                         for x in attempts)
+            ),
+            "route_attempts": attempts,
+            "next_step": (
+                "execute_selected_route_and_verify" if selected is not None
+                else "obtain_trusted_foreground_authorization" if any(
+                    x["status"] == "requires_verified_lease" for x in attempts)
+                else "research_or_prepare_missing_programmatic_routes"
+            ),
+        }
+
     def _handle_route_error(
         self,
         route: str,
