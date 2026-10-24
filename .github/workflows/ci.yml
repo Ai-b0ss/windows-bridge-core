@@ -1,0 +1,34 @@
+name: Safe public core CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  portable-syntax:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Python sources compile
+        shell: pwsh
+        run: python -m compileall -q runtime
+      - name: PowerShell parsing
+        shell: pwsh
+        run: |
+          $errorCount = 0
+          Get-ChildItem -Recurse -File -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errs = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errs) | Out-Null
+            $errorCount += @($errs).Count
+          }
+          if ($errorCount -gt 0) { throw "PowerShell parse failed: $errorCount" }
+      - name: No bundled visual or browser assets
+        shell: pwsh
+        run: |
+          if (Test-Path 'assets') { throw 'Unexpected vendor binary assets committed to public source' }
+          if (-not (Test-Path 'runtime/bridge-v3/ff_win_v3_main.py')) { throw 'Missing core runtime' }

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.log
+*.env
+*.db
+*.sqlite*
+*.key
+*.pem
+*.pfx
+.DS_Store
+assets/

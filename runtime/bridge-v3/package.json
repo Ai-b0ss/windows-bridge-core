@@ -1,0 +1,11 @@
+{
+  "name": "ff-windows-bridge-browser-runtime",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Pinned browser runtime for the FF Windows Bridge computer-use sidecar",
+  "dependencies": {
+    "@playwright/cli": "0.1.19",
+    "playwright": "1.63.0-alpha-2026-08-31",
+    "playwright-core": "1.63.0-alpha-2026-08-31"
+  }
+}

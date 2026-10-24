@@ -1,0 +1,449 @@
+{
+  "schema": "ff-gh-release-v1",
+  "source_commit": "c034e527a77b737b266c3c7df8b8521032be6f8a",
+  "source_dirty": false,
+  "python_version": "3.13.9",
+  "python_asset": "python-3.13.9-embed-amd64.zip",
+  "gh_asset": "gh_2.101.0_windows_amd64.zip",
+  "gh_version": "v2.101.0",
+  "node_asset": "node-v22.14.0-win-x64.zip",
+  "node_version": "22.14.0",
+  "browser_asset": null,
+  "runtime_contract": "ff-full-user-v1",
+  "visual_asset": null,
+  "visual_dependency_lock": {
+    "sdk": {
+      "version": "8.0.425",
+      "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/8.0.425/dotnet-sdk-8.0.425-win-x64.zip",
+      "sha512": "f0b6f15bf6f1a0507205c0cb102ab99e1dee875c4682c8ed94665be1d580186a06b21455e83b3a01a0ff7f4cd887b67420f2e2fe09ed985534a4cea488ae1af9",
+      "sha256": "cd6eb1df826dd168108e2c427673f9d627b7e0631963eeedf0fa7aef0913c53f",
+      "bytes": 285157731,
+      "metadata_source": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/8.0/releases.json",
+      "asset": "dotnet-sdk-8.0.425-win-x64.zip"
+    },
+    "runtime": {
+      "version": "8.0.31",
+      "url": "https://builds.dotnet.microsoft.com/dotnet/Runtime/8.0.31/dotnet-runtime-8.0.31-win-x64.zip",
+      "sha512": "9c55c58694676ee64b0eed2cd6d8cbf58b9aa8288420acc66841e15ca0099c75d4af0182d23a641c2342e5a151a325df4a12fa0bde2e47c0fb7e9a33e7b09896",
+      "sha256": "7deabbefdc83e378b343c551fe447b86002680eea91355b1f6f81d0c9ab0dcaa",
+      "bytes": 33322727,
+      "metadata_source": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/8.0/releases.json",
+      "asset": "dotnet-runtime-8.0.31-win-x64.zip"
+    },
+    "schema": "ff-visual-dependencies-v1",
+    "model": {
+      "asset": "omniparser-yolov9e.pt",
+      "version": "d10c4687d4af8245d67780ae59900f09660aad3a",
+      "url": "https://huggingface.co/microsoft/OmniParser-v2.0/resolve/d10c4687d4af8245d67780ae59900f09660aad3a/icon_detect_v3/model.pt",
+      "sha256": "11c6cbb77f22569fab22d86c76407a83ec81ab89dbfe28279854822d6e3fb00c",
+      "bytes": 281182680,
+      "digest_source": "https://huggingface.co/api/models/microsoft/OmniParser-v2.0/revision/refs%2Fpr%2F37?blobs=true",
+      "licence_url": "https://huggingface.co/microsoft/OmniParser-v2.0/resolve/d10c4687d4af8245d67780ae59900f09660aad3a/icon_detect_v3/LICENSE"
+    },
+    "wheels": [
+      {
+        "package": "filelock",
+        "version": "3.32.3",
+        "asset": "filelock-3.32.3-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/a7/8e/50f46a9c0ce8d2861a394c1347caae037ea0431d2f67d7feb151cbc4649a/filelock-3.32.3-py3-none-any.whl",
+        "sha256": "7f0ca4bcc0e181c60dbbd8aa9ab5b120ebb99e4e064e83636340056f833a1f09",
+        "digest_source": "https://download.pytorch.org/whl/cpu/filelock/",
+        "bytes": 98901
+      },
+      {
+        "package": "fsspec",
+        "version": "2026.7.0",
+        "asset": "fsspec-2026.7.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/fd/3c/6a2bf344106328fd04963664a60b9bb6496fc25df8e962fcdc1367285fb9/fsspec-2026.7.0-py3-none-any.whl",
+        "sha256": "b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279",
+        "digest_source": "https://download.pytorch.org/whl/cpu/fsspec/",
+        "bytes": 206583
+      },
+      {
+        "package": "jinja2",
+        "version": "3.1.6",
+        "asset": "jinja2-3.1.6-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/62/a1/3d680cbfd5f4b8f15abc1d571870c5fc3e594bb582bc3b64ea099db13e56/jinja2-3.1.6-py3-none-any.whl",
+        "sha256": "85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67",
+        "digest_source": "https://pypi.org/pypi/jinja2/3.1.6/json",
+        "bytes": 134899
+      },
+      {
+        "package": "markupsafe",
+        "version": "3.0.3",
+        "asset": "markupsafe-3.0.3-cp313-cp313-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/05/73/c4abe620b841b6b791f2edc248f556900667a5a1cf023a6646967ae98335/markupsafe-3.0.3-cp313-cp313-win_amd64.whl",
+        "sha256": "9a1abfdc021a164803f4d485104931fb8f8c1efd55bc6b748d2f5774e78b62c5",
+        "digest_source": "https://pypi.org/pypi/markupsafe/3.0.3/json",
+        "bytes": 15113
+      },
+      {
+        "package": "mpmath",
+        "version": "1.3.0",
+        "asset": "mpmath-1.3.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/43/e3/7d92a15f894aa0c9c4b49b8ee9ac9850d6e63b03c9c32c0367a13ae62209/mpmath-1.3.0-py3-none-any.whl",
+        "sha256": "a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c",
+        "digest_source": "https://download.pytorch.org/whl/cpu/mpmath/",
+        "bytes": 536198
+      },
+      {
+        "package": "networkx",
+        "version": "3.6.1",
+        "asset": "networkx-3.6.1-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl",
+        "sha256": "d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762",
+        "digest_source": "https://download.pytorch.org/whl/cpu/networkx/",
+        "bytes": 2068504
+      },
+      {
+        "package": "numpy",
+        "version": "2.2.6",
+        "asset": "numpy-2.2.6-cp313-cp313-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/cb/3b/d58c12eafcb298d4e6d0d40216866ab15f59e55d148a5658bb3132311fcf/numpy-2.2.6-cp313-cp313-win_amd64.whl",
+        "sha256": "b0544343a702fa80c95ad5d3d608ea3599dd54d4632df855e4c8d24eb6ecfa1c",
+        "digest_source": "https://download.pytorch.org/whl/cpu/numpy/",
+        "bytes": 12610885
+      },
+      {
+        "package": "pillow",
+        "version": "11.3.0",
+        "asset": "pillow-11.3.0-cp313-cp313-win_amd64.whl",
+        "url": "https://files.pythonhosted.org/packages/23/85/397c73524e0cd212067e0c969aa245b01d50183439550d24d9f55781b776/pillow-11.3.0-cp313-cp313-win_amd64.whl",
+        "sha256": "0bce5c4fd0921f99d2e858dc4d4d64193407e1b99478bc5cacecba2311abde51",
+        "digest_source": "https://download.pytorch.org/whl/cpu/pillow/",
+        "bytes": 6978450
+      },
+      {
+        "package": "setuptools",
+        "version": "78.1.0",
+        "asset": "setuptools-78.1.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/54/21/f43f0a1fa8b06b32812e0975981f4677d28e0f3271601dc88ac5a5b83220/setuptools-78.1.0-py3-none-any.whl",
+        "sha256": "3e386e96793c8702ae83d17b853fb93d3e09ef82ec62722e61da5cd22376dcd8",
+        "digest_source": "https://pypi.org/pypi/setuptools/78.1.0/json",
+        "bytes": 1256108
+      },
+      {
+        "package": "sympy",
+        "version": "1.14.0",
+        "asset": "sympy-1.14.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/a2/09/77d55d46fd61b4a135c444fc97158ef34a095e5681d0a6c10b75bf356191/sympy-1.14.0-py3-none-any.whl",
+        "sha256": "e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5",
+        "digest_source": "https://download.pytorch.org/whl/cpu/sympy/",
+        "bytes": 6299353
+      },
+      {
+        "package": "torch",
+        "version": "2.8.0+cpu",
+        "asset": "torch-2.8.0+cpu-cp313-cp313-win_amd64.whl",
+        "url": "https://download.pytorch.org/whl/cpu/torch-2.8.0%2Bcpu-cp313-cp313-win_amd64.whl",
+        "sha256": "e1ee1b2346ade3ea90306dfbec7e8ff17bc220d344109d189ae09078333b0856",
+        "digest_source": "https://download.pytorch.org/whl/cpu/torch/",
+        "bytes": 619356958
+      },
+      {
+        "package": "torchvision",
+        "version": "0.23.0+cpu",
+        "asset": "torchvision-0.23.0+cpu-cp313-cp313-win_amd64.whl",
+        "url": "https://download.pytorch.org/whl/cpu/torchvision-0.23.0%2Bcpu-cp313-cp313-win_amd64.whl",
+        "sha256": "82928788025170c62e7df1120dcdc0cd175bfc31c08374613ce6d1a040bc0cda",
+        "digest_source": "https://download.pytorch.org/whl/cpu/torchvision/",
+        "bytes": 1600873
+      },
+      {
+        "package": "typing-extensions",
+        "version": "4.16.0",
+        "asset": "typing_extensions-4.16.0-py3-none-any.whl",
+        "url": "https://files.pythonhosted.org/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl",
+        "sha256": "481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8",
+        "digest_source": "https://download.pytorch.org/whl/cpu/typing-extensions/",
+        "bytes": 45571
+      }
+    ],
+    "nuget": [
+      {
+        "name": "Vortice.Direct3D11",
+        "version": "3.8.2",
+        "url": "https://api.nuget.org/v3-flatcontainer/vortice.direct3d11/3.8.2/vortice.direct3d11.3.8.2.nupkg",
+        "sha256": "3021abc9f194f4c3295718a40bcc05056700409e039b25cfe7f82c0f654434bb",
+        "bytes": 947952
+      },
+      {
+        "name": "Vortice.Win32",
+        "version": "2.3.0",
+        "url": "https://api.nuget.org/v3-flatcontainer/vortice.win32/2.3.0/vortice.win32.2.3.0.nupkg",
+        "sha256": "40d07cac9f0f979fd29ae541ceb0f3ee36b528bc6aadaa99bc66365c9628fd1e",
+        "bytes": 173668
+      },
+      {
+        "name": "Microsoft.Windows.SDK.NET.Ref",
+        "version": "10.0.19041.56",
+        "url": "https://api.nuget.org/v3-flatcontainer/microsoft.windows.sdk.net.ref/10.0.19041.56/microsoft.windows.sdk.net.ref.10.0.19041.56.nupkg",
+        "sha256": "8bdaf0e73af48b4426413a84369091d93b4ea63b8afdf6b4336fd2e941175c1c",
+        "bytes": 9403477
+      },
+      {
+        "name": "Vortice.DXGI",
+        "version": "3.8.2",
+        "url": "https://api.nuget.org/v3-flatcontainer/vortice.dxgi/3.8.2/vortice.dxgi.3.8.2.nupkg",
+        "sha256": "91d6df24ba8184d4387b82905ddc128564d1884462a6927ad223370fe9bbcfff",
+        "bytes": 566140
+      },
+      {
+        "name": "SharpGen.Runtime",
+        "version": "2.4.2-beta",
+        "url": "https://api.nuget.org/v3-flatcontainer/sharpgen.runtime/2.4.2-beta/sharpgen.runtime.2.4.2-beta.nupkg",
+        "sha256": "5bdcebee0bdc3c15dc6e9b73f82faa98575ea749b92d6ae30106feb44bd23f18",
+        "bytes": 173245
+      },
+      {
+        "name": "Vortice.DirectX",
+        "version": "3.8.2",
+        "url": "https://api.nuget.org/v3-flatcontainer/vortice.directx/3.8.2/vortice.directx.3.8.2.nupkg",
+        "sha256": "426c35399ae7fa15b89541a0137cadfd06cece2edfe810c568530915372e159e",
+        "bytes": 1856615
+      },
+      {
+        "name": "System.Text.Json",
+        "version": "9.0.1",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.text.json/9.0.1/system.text.json.9.0.1.nupkg",
+        "sha256": "d9da84f8cc7978967c75bef8a1f5225171ce4b10c2997c399fd542f70e1f52bd",
+        "bytes": 1876612
+      },
+      {
+        "name": "SharpGen.Runtime.COM",
+        "version": "2.4.2-beta",
+        "url": "https://api.nuget.org/v3-flatcontainer/sharpgen.runtime.com/2.4.2-beta/sharpgen.runtime.com.2.4.2-beta.nupkg",
+        "sha256": "32a81aec51f9ffee3376a29db7f9a2447e250cf1cccd352ea02fc4dc49fd046c",
+        "bytes": 456675
+      },
+      {
+        "name": "Vortice.Mathematics",
+        "version": "2.1.0",
+        "url": "https://api.nuget.org/v3-flatcontainer/vortice.mathematics/2.1.0/vortice.mathematics.2.1.0.nupkg",
+        "sha256": "15faefe786bc5bb8a2e0fe1e73fae7038f1aa2204ff711c3581944cd77ffadae",
+        "bytes": 536566
+      },
+      {
+        "name": "System.IO.Pipelines",
+        "version": "9.0.1",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.io.pipelines/9.0.1/system.io.pipelines.9.0.1.nupkg",
+        "sha256": "0a79836a79270866cd9e80e3819c3ad8cfc6ae0f083132436bcc773f4ed44760",
+        "bytes": 223531
+      },
+      {
+        "name": "System.Text.Encodings.Web",
+        "version": "9.0.1",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.text.encodings.web/9.0.1/system.text.encodings.web.9.0.1.nupkg",
+        "sha256": "8ae0157138a26502c26630df0ea74b2cf1ea65d66abc569bc0b14789561d449a",
+        "bytes": 293375
+      },
+      {
+        "name": "System.Buffers",
+        "version": "4.5.1",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.buffers/4.5.1/system.buffers.4.5.1.nupkg",
+        "sha256": "c30b3dd2c7e2f4cee4b823d692fd42118309b42ab1f5007f923d329a5b0d6b12",
+        "bytes": 93737
+      },
+      {
+        "name": "System.Memory",
+        "version": "4.5.5",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.memory/4.5.5/system.memory.4.5.5.nupkg",
+        "sha256": "10f43da352a29fb2b3188e4edd4dcf5100194c8b526e4f61fe2e2b5623775a22",
+        "bytes": 208978
+      },
+      {
+        "name": "System.Threading.Tasks.Extensions",
+        "version": "4.5.4",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.threading.tasks.extensions/4.5.4/system.threading.tasks.extensions.4.5.4.nupkg",
+        "sha256": "a304a963cc0796c5179f9c6b7d8022bbce3b2fa7c029eb6196f631f7b462d678",
+        "bytes": 89582
+      },
+      {
+        "name": "System.Runtime.CompilerServices.Unsafe",
+        "version": "6.0.0",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.runtime.compilerservices.unsafe/6.0.0/system.runtime.compilerservices.unsafe.6.0.0.nupkg",
+        "sha256": "6c41b53e70e9eee298cff3a02ce5acdd15b04125589be0273f0566026720a762",
+        "bytes": 84343
+      },
+      {
+        "name": "System.Numerics.Vectors",
+        "version": "4.4.0",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.numerics.vectors/4.4.0/system.numerics.vectors.4.4.0.nupkg",
+        "sha256": "6ae5d02b67e52ff2699c1feb11c01c526e2f60c09830432258e0809486aabb65",
+        "bytes": 337043
+      },
+      {
+        "name": "System.Runtime.CompilerServices.Unsafe",
+        "version": "4.5.3",
+        "url": "https://api.nuget.org/v3-flatcontainer/system.runtime.compilerservices.unsafe/4.5.3/system.runtime.compilerservices.unsafe.4.5.3.nupkg",
+        "sha256": "96764c52a44ee1161151e48ef07489f72047a851cb55b99e9f01d6908536d1a9",
+        "bytes": 102160
+      }
+    ],
+    "model_licence": {
+      "url": "https://huggingface.co/microsoft/OmniParser-v2.0/resolve/d10c4687d4af8245d67780ae59900f09660aad3a/icon_detect_v3/LICENSE",
+      "asset": "MODEL-LICENSE.txt",
+      "bytes": 1073,
+      "sha256": "646f8936b8ddcd14e13e578ff6857e368780b0d1a4f6066bee89211923a373e2",
+      "provenance": "Microsoft OmniParser immutable revision d10c4687d4af8245d67780ae59900f09660aad3a"
+    },
+    "app_local_crt": {
+      "source_asset": "numpy-2.2.6-cp313-cp313-win_amd64.whl",
+      "wheel_member": "numpy.libs/msvcp140-263139962577ecda4cd9469ca360a746.dll",
+      "sha256": "a4c2229bdc2a2a630acdc095b4d86008e5c3e3bc7773174354f3da4f5beb9cde",
+      "target": "native/detector/python/msvcp140.dll",
+      "licence_notice": "numpy-2.2.6.dist-info/LICENSE.txt",
+      "provenance": "unchanged MSVC redistributable bytes from hash-locked official NumPy PyPI wheel"
+    }
+  },
+  "dependency_lock": {
+    "schema": "ff-gh-dependencies-v1",
+    "python": {
+      "version": "3.13.9",
+      "asset": "python-3.13.9-embed-amd64.zip",
+      "url": "https://www.python.org/ftp/python/3.13.9/python-3.13.9-embed-amd64.zip",
+      "sha256": "91d828c2da3a029b41699e918674a0cb379c02cf20dab9c501306885f837402a"
+    },
+    "node": {
+      "version": "22.14.0",
+      "asset": "node-v22.14.0-win-x64.zip",
+      "url": "https://nodejs.org/dist/v22.14.0/node-v22.14.0-win-x64.zip",
+      "sha256": "55b639295920b219bb2acbcfa00f90393a2789095b7323f79475c9f34795f217",
+      "digest_source": "https://nodejs.org/dist/v22.14.0/SHASUMS256.txt"
+    },
+    "github_cli": {
+      "version": "v2.101.0",
+      "asset": "gh_2.101.0_windows_amd64.zip",
+      "url": "https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_windows_amd64.zip",
+      "sha256": "bc6c814367b193cd8e713611d61e36013c0ef843b8f516458fe3eda039192794",
+      "published_digest": "sha256:bc6c814367b193cd8e713611d61e36013c0ef843b8f516458fe3eda039192794"
+    }
+  },
+  "sources": {
+    "python-3.13.9-embed-amd64.zip": "https://www.python.org/ftp/python/3.13.9/python-3.13.9-embed-amd64.zip",
+    "gh_2.101.0_windows_amd64.zip": "https://github.com/cli/cli/releases/download/v2.101.0/gh_2.101.0_windows_amd64.zip"
+  },
+  "core_profile": "full-win32-core-optional-visual-and-browser",
+  "files": {
+    "CHECK-BRIDGE.cmd": "98c1761d39063c275026e782a2bcf2cf2372c99beb0b17db637ab783868a1604",
+    "INSTALL-FRIEND.cmd": "cacd8aa4c8c2bacce3a7cbb1b8d669613afc528974e411463b6d52bf86024004",
+    "OPTIONAL-ADDONS.md": "75cfbc5a4e240a1ed8f459eb851ff43930a57d19890c555f572511eec6dbcf05",
+    "README-FIRST.md": "3974bc5a85e93893801cf11c9c85932eb4a6f4442425569cb1b6ce1967179433",
+    "START-HERE.cmd": "9b19296105ebda1baabd76ff2c90ea2970c8735ce0c1ea993640cc5394e40598",
+    "assets/gh_2.101.0_windows_amd64.zip": "bc6c814367b193cd8e713611d61e36013c0ef843b8f516458fe3eda039192794",
+    "assets/node-v22.14.0-win-x64.zip": "55b639295920b219bb2acbcfa00f90393a2789095b7323f79475c9f34795f217",
+    "assets/python-3.13.9-embed-amd64.zip": "91d828c2da3a029b41699e918674a0cb379c02cf20dab9c501306885f837402a",
+    "ff-release-common.ps1": "3e5b023b312fd40a665f2b3526a2c74363fc6da30ed3f3acc2b1ec5098877d79",
+    "install.ps1": "6ecf70e439e44a134b73fbbd30c5b7ff2b0e485914e7b17e51c32fd8fe37ae15",
+    "runtime/bridge-v3/HIDDEN-PANEL-GUIDE.md": "150f2b84e0faf68eaf8d54740dd72e9b78e8f599824b3afa1c1b44319a5735dd",
+    "runtime/bridge-v3/browser_companion/download_state.mjs": "4d89ee49233dbbf806af17d61d3b25d5b90bac5d4f0b6ec369b1b58d140e56ce",
+    "runtime/bridge-v3/browser_companion/manifest.json": "2b1467011002bdd84f12e22460b14d42d5064b6719d2712c1ada07258d02e12b",
+    "runtime/bridge-v3/browser_companion/service_worker.js": "dd19d5e3255a3c7a6eb8d6d104e17f8fbeb919d842975d1521594b16a532ff60",
+    "runtime/bridge-v3/build_cua_native_uia3_sidecar.ps1": "613bf5c7fd383258e08d1e9e9b7080f66be05ae1a678bdca4a00c1a58d8f8762",
+    "runtime/bridge-v3/cua_app_api.py": "8220cb57ee19cc920a3b1c1d39f2ad974333b129e0873fedaf522f8133b2fb87",
+    "runtime/bridge-v3/cua_app_resolver.py": "e04f2a55261cd4f2872a39140fb3afa64544422fe901ee74ab28b00b22fa880b",
+    "runtime/bridge-v3/cua_assistant_workflow.py": "b37880ad58b37d4f6433dc03915cb3d5626d00f69b71138c9f10d182c59a7351",
+    "runtime/bridge-v3/cua_bridge_v3.py": "c9f85c0a93cd4837088ab9f9ef8f836513345015eae7612614fbdd77ea2fda06",
+    "runtime/bridge-v3/cua_browser_companion.py": "c0543daf6003c3bfb6c90ba7126ced0e0c03f54a285f49b0f1cfe8550e210e5e",
+    "runtime/bridge-v3/cua_browser_companion_host.cs": "19f798aac1f4b85d23b0c6857f00428ffbf8a1990ad9c7222e2dd03a2ea1042f",
+    "runtime/bridge-v3/cua_browser_companion_install.ps1": "43cc790cc7b0a0ca2d3c4434476646e22e63f8c06f6ca2afcd2f7faea7a56d6c",
+    "runtime/bridge-v3/cua_browser_extension_rpc.ps1": "491b5df346e6a2b9725106bd49d1101bd1360522c081c14f7d586016334e3489",
+    "runtime/bridge-v3/cua_browser_playwright.mjs": "050e7e888dd9914d32a69dd57d5d946a062a00cc8525d682d5a474831ca20da0",
+    "runtime/bridge-v3/cua_browser_profiles.py": "13353e1724565d1419e7e424e70129568efd35a969fdc926ef9e18a2e76862ae",
+    "runtime/bridge-v3/cua_browser_rpc.mjs": "3876f2e51a3a1d568e458e74e0c44d21b92fd3fc574f02aa387f6044c9e4cb2c",
+    "runtime/bridge-v3/cua_browser_sidecar.mjs": "3cddd919a58fc1d206168f9400b186069d5889739e23a7e5c0837569ae758eee",
+    "runtime/bridge-v3/cua_capture_contract.py": "b1d0f52861605dcba3d25347c1da42294a03c73d4a429a8c99c65213309972dd",
+    "runtime/bridge-v3/cua_cli_discovery.py": "dde3c0499f431203a542d935ddf62ed1ab8c26cf251ba4af23e7b1eb1a924a24",
+    "runtime/bridge-v3/cua_desktop_identity.py": "f81768098bd2e4a5cc96c3328a081d17d557911d50cbd1f00ab13940d102b8b3",
+    "runtime/bridge-v3/cua_experience_cache.py": "3c7dd86e5f4411834c50dfa7cef8d3f14eecd9f9a486b47d22255a9ed9db1157",
+    "runtime/bridge-v3/cua_g0_post_reboot_validate.py": "f6a425fe9fb06ac408886d29da544f3d2461f3b02b9768f240e9cfd6714778ab",
+    "runtime/bridge-v3/cua_global_resources.py": "f6c8ee2166d5134fb3df58e699e20485ea988cb20f86d08bdc1a531a26ff730f",
+    "runtime/bridge-v3/cua_hidden_apps.py": "3142a6b169afe4fb631f62f3d35a8cf6b51a976b38c7982f9f41a649021561ba",
+    "runtime/bridge-v3/cua_hidden_capture.py": "f8cd57985b0b45f3fa23ecfac231bb2d774339dfe06e0bcd839c1eefb905b462",
+    "runtime/bridge-v3/cua_hidden_desktop.py": "564122fe78fd91a8134b02c1ecbe5d18fc2bbbc5af99fe31b9e1d6ad089035cf",
+    "runtime/bridge-v3/cua_hidden_worker.py": "0cdde0c908f91362560c10261e663cf661d15ccd4cff620400ffb9edd324943d",
+    "runtime/bridge-v3/cua_input_arbiter.py": "97043d5303ab47692924fbfe0de5f7971fdb2151683fb5e94cb906ee03b5babe",
+    "runtime/bridge-v3/cua_input_router_adapter.py": "0498ea229fa5ab812f523172e0f50976bf95dffcdbeb8090691143356be78d05",
+    "runtime/bridge-v3/cua_input_windows.py": "6cd3f209d027d1f776b856bc0085eb9743b19effb942e6241f1eef3147393b58",
+    "runtime/bridge-v3/cua_lifecycle.py": "8ce3a96f0b50da83a52bbfbe33d79edd956c70f3a100d8b35b68787c04fafdaf",
+    "runtime/bridge-v3/cua_native_core.py": "6f4b3e83397a40bab9413076f312ae33eaeb6e191029ed63ea17c6ae0dc08cff",
+    "runtime/bridge-v3/cua_native_hwnd.py": "3e862c6927e895ea27dbb3da75a71050750c44c9ae1415f30db1171198368b17",
+    "runtime/bridge-v3/cua_native_router_adapter.py": "a1b418358c8d03ef643e47a5cf536329f6dad24ffd4abee8caa289407a48968e",
+    "runtime/bridge-v3/cua_native_sidecar.py": "cce0126344735ad5d6267079a06a22f83388e4925640c39f6702b0ccb7eb9810",
+    "runtime/bridge-v3/cua_native_supervisor.py": "477ff10289d7d3d37bd9dcac428616b7f488aba1edeea18b7d415de65d60573f",
+    "runtime/bridge-v3/cua_native_uia3.py": "f69078fc1325ae3ee330e4c02feb8ae24ea83ab41905da4e57d7be6686a9effe",
+    "runtime/bridge-v3/cua_native_uia3_sidecar.cs": "d02faa6c91cfe5d8826c7eb6d62715c5018bac6821f9690faf1fac0dc549bd2b",
+    "runtime/bridge-v3/cua_native_waits.py": "fb04abaa61da21ccfda37ef854311b968e8b7f810a3b64ac937d981eccf5b54a",
+    "runtime/bridge-v3/cua_native_winapp.py": "7b7c59d1c0b0d9007c1b6c0da8eb2d13363d5505fc26ba49ca0892f901e87560",
+    "runtime/bridge-v3/cua_office_artifacts.py": "fb65c68e387b23e3f67667843cdbdaf5b72ceba6e1b85b8f412e3323a0ccf611",
+    "runtime/bridge-v3/cua_owned_editor_launch.py": "26e302db85ad5ff180456aacf2dcf30ce8d519dd3fd708356e1b342a02c171e8",
+    "runtime/bridge-v3/cua_owner_approval_controller/Program.cs": "979b602e6576a7e7d7bc9bbb901bde5e123282372725716d677a1d5ae3034b2a",
+    "runtime/bridge-v3/cua_owner_approval_controller/cua_owner_approval_controller.csproj": "65ac25de71c15e3f3544914ea4e8bd56265e72bb2798a13a2bcaf11bf81f3d75",
+    "runtime/bridge-v3/cua_owner_chrome_logon.ps1": "0a72ff974bc291d6e6bb6d6689b0176f045dce6b1d7bac9101e950d4ce88405d",
+    "runtime/bridge-v3/cua_physical_input_windows.py": "b2cb9b063fbff1ac358eee7b95dfa7f2199f5ff74cf23ddb989ef9a2b0caa516",
+    "runtime/bridge-v3/cua_physical_runtime.py": "83ac87aa70a254328b502337c01cf67358728f8d0d73da1c5b1b3a0ad1d6db78",
+    "runtime/bridge-v3/cua_programmatic_discovery.py": "6849e3ad8e27407fcb3aa8497a1a05082e43130e3b0f1937fd04f596247b097d",
+    "runtime/bridge-v3/cua_release_manifest.py": "920383638650c71b004b9ecd729cdaad773eaeac02f00799caf36fae48107cbc",
+    "runtime/bridge-v3/cua_restricted_execution.py": "1db62c66f546ab9bd347ad5b2bcdeb6b40e59c1e4070ebcabc005607ce7dbea1",
+    "runtime/bridge-v3/cua_restricted_rpc.py": "27add71b607f44091763c19e85ae4ffcf1869039badc7f0ad10fff24d128642f",
+    "runtime/bridge-v3/cua_router.py": "c754d0c3ebf8b76756a3ecad6962f1cfe87c6fcbaced830e1d72f670d42b3869",
+    "runtime/bridge-v3/cua_runtime_deploy.py": "dcadb2831058329918e642311c125a7056c6138c96e3ba6e2299ad0eb59783e4",
+    "runtime/bridge-v3/cua_semantic_resources.py": "05a8d47bdab8a9c48015742703d74c33468fdffa8b9caf9dd4d251036a525646",
+    "runtime/bridge-v3/cua_session_continuation.py": "eda8a607cb44dec24d88a5d4d895b763a7d43f58f964d950008429901c351e20",
+    "runtime/bridge-v3/cua_sidecar_supervisor.py": "a1b751af113aa5db5834b6976e11d00363e0342ee07c4bcc2b941041a7234eb1",
+    "runtime/bridge-v3/cua_task_authority.py": "5baf27e4f1073e79d4aed78e77dc30d7802e8d1c4fbf04568428be0750c21e31",
+    "runtime/bridge-v3/cua_task_routes.py": "2a94d35357b3d7dbe7b3422a027a94f2dcf1cb1d6e9914c76d56fe2ff2595692",
+    "runtime/bridge-v3/cua_tool_preparation.py": "e890e4f851ec1a5d461bbfb306d55778611f2a7f192f296e05260db4b2793085",
+    "runtime/bridge-v3/cua_universal_fastpath.py": "ea896157e9afc2ba45beb0a6bf45416240e77d13d1974daa04589443c3161f57",
+    "runtime/bridge-v3/cua_vision_runtime.py": "09d419e09cfbd0118eaa79c59aa591fcbf74f3694b5696ae247f1b070c97cc99",
+    "runtime/bridge-v3/cua_visual_action_gate.py": "6f55e5098e0afd814f08a769c184ec46b409a5f439bc3105787372a8e63bf316",
+    "runtime/bridge-v3/cua_visual_detector_sidecar.py": "ab4baeff5f970188a463508be65f6d5346c2fe1e2081e03e5f7a78be9c350a7b",
+    "runtime/bridge-v3/cua_vscode_extension.cjs": "a64d643f6523f60ebdc3e3f2057abe4aaa6606cca6d7ba1a5cff8239f5c00e75",
+    "runtime/bridge-v3/cua_vscode_native.py": "02b8bdf159cb95bcedd9806d5866267c062bcf1a05b143fd46c09e6e9ce320b7",
+    "runtime/bridge-v3/cua_wgc_native_probe/DxgiProbe.cs": "0b412ce49e1da8153a5875a97023847e43976f70441e6a133469ab934d3f1b65",
+    "runtime/bridge-v3/cua_wgc_native_probe/PixelReadback.cs": "2422823339b07a2cde8ba7b0b518ae5c899edf95916e0b9692486e6bfd139a99",
+    "runtime/bridge-v3/cua_wgc_native_probe/Program.cs": "eed3aca089244eb107708fcf35dcb645f964265fc24116a6121a63a403cf26b9",
+    "runtime/bridge-v3/cua_wgc_native_probe/SidecarHost.cs": "eed222dd6c8d85a7f5182112bb3e2c5ffb12ef498c3a86146c75a749c11137d9",
+    "runtime/bridge-v3/cua_wgc_native_probe/cua_wgc_native_probe.csproj": "b5e4980b4a491e9a1afea448b266b6bf860c2e88333adb0cbe6d56806a0adb91",
+    "runtime/bridge-v3/cua_wgc_native_probe/packages.lock.json": "fd00fe1a726555ace15a148e7fd81f9ab4b78032017ee3ef3defb4b2fdaa87b6",
+    "runtime/bridge-v3/cua_wgc_native_probe/run_probe.ps1": "81896f47f96173ae2aad24299ce11f907d493cee44e21f162c336a03d277bbe6",
+    "runtime/bridge-v3/cua_winapp_persistent.py": "c612897c309357ddf3499f12fe0faf443b659d519e6dd660a68767a36b5594d1",
+    "runtime/bridge-v3/cua_windows_mcp.py": "0bb1659fc81c7d1569c85ca4d254657d152025c83f5d11898e628ee56ca3fea7",
+    "runtime/bridge-v3/cua_windows_ocr_sidecar.ps1": "f671328843086283d1f5cabb504fc191ff2b7ca7acef48beb7efc973324ba842",
+    "runtime/bridge-v3/cua_windows_paths.py": "27c063181c48462f21c77c510eff88575b050a84cbbaeb1ad5d3524df060220f",
+    "runtime/bridge-v3/ff_win_evidence.py": "d9f539428d94d1c202ff9b87e9046bf5fa8c367624197fbd0cd5d2db24e32f05",
+    "runtime/bridge-v3/ff_win_keeper_restore.ps1": "3b04299652968b6553371e5d3ea7f0efffd0b7b4f03cae1dbdab6caa1dc8dcce",
+    "runtime/bridge-v3/ff_win_request_journal.py": "8dec163fbb66101b655a7fdaf9d84485dde7bc71e2ca931d3a1cdadb1341367f",
+    "runtime/bridge-v3/ff_win_stop_bridge.ps1": "2891c0d004ae2d02f8761820b3b9e6a34c33ccd8e18fc8f3583aa8b21e6d9fdb",
+    "runtime/bridge-v3/ff_win_v3_agent.py": "3c3b29b1e5b314a71b4c93351acd7aee59eb27df0aceb05f2b59998e20034064",
+    "runtime/bridge-v3/ff_win_v3_direct.py": "eec71c6207fd77b11875025d042010b3af17c6b0ad7ecbe3348a4192aaca91e6",
+    "runtime/bridge-v3/ff_win_v3_documents.py": "95c7ec5fe6b35541e0d2e2235ad5d7ab668c8cece2a6587d85cd05c2a6afe00e",
+    "runtime/bridge-v3/ff_win_v3_extras.py": "ecf92375e6eec6bffb23cd45f4f31827bbb920b45d672eda4496163436f6e3b0",
+    "runtime/bridge-v3/ff_win_v3_gui.py": "2c40a0f724d88ef8903e074a5d54442f54425c98a1f880f5d827eedbdb0a555f",
+    "runtime/bridge-v3/ff_win_v3_keeper.ps1": "9bcd741c93ec762969100a6b8a97642bf14d0599f737970dc058d6d796e0c70c",
+    "runtime/bridge-v3/ff_win_v3_main.py": "8218e1f2b4b4482c002df8a87db003db6e57527eddfcc96581a91d4bdeb8f0a2",
+    "runtime/bridge-v3/ff_win_v3_security.py": "f8d38cf578860ffe8f2e8578cd9c645d6e20fb51ad16be7976df921ed7ff8a7e",
+    "runtime/bridge-v3/ff_win_v3_upgrade.py": "8bf000d2dfe15d55bf0f0050bdae57bcc3933192ea44757941b7f226e69f6085",
+    "runtime/bridge-v3/ff_win_v3_workflow_deploy.ps1": "b87875c45127a1f0024e9ac0d0a20d7104ddcf9c12edbe52414391793717c057",
+    "runtime/bridge-v3/install_cua_browser_runtime.ps1": "5c8b4a689e92139b717e6df82dec77de37ced1d68c9809f15c9624612084ee67",
+    "runtime/bridge-v3/package-lock.json": "cee2cbe097b05a79b1067fe2b1c04fc07a6fae774498cf731a9e53eb82fced21",
+    "runtime/bridge-v3/package.json": "6796c28090bd32a75cd320b154987b30261d4fac4e8674ec2cfc5f49ee73409e",
+    "runtime/github-transport/cua_global_resources.py": "f6c8ee2166d5134fb3df58e699e20485ea988cb20f86d08bdc1a531a26ff730f",
+    "runtime/github-transport/cua_task_authority.py": "5baf27e4f1073e79d4aed78e77dc30d7802e8d1c4fbf04568428be0750c21e31",
+    "runtime/github-transport/ff_win_evidence.py": "d9f539428d94d1c202ff9b87e9046bf5fa8c367624197fbd0cd5d2db24e32f05",
+    "runtime/github-transport/ff_win_github_background_agent.py": "d161f169814b5b44a0a920975c28399292aa56e11d324e068b580b0340837069",
+    "runtime/github-transport/ff_win_github_background_keeper.ps1": "e2afe78ffb71812f7e5d913855f3e9afad8dece6de835d1d35e1009eafaebd10",
+    "runtime/github-transport/ff_win_github_client.py": "db7558a0cb822eb4fb60b0bee4751938a5cb6fab517a4081a529730cc9d35f24",
+    "runtime/github-transport/ff_win_github_comment_daemon.py": "93f7cecb1808a64232eb844d29b8511a48a164203ae1110632fc8b8299897bcf",
+    "runtime/github-transport/ff_win_github_prelogin_probe.ps1": "2d766ea2d1286fb02f55c94c6ef503071aa9fe52389a607b7c3096894cbb74b3",
+    "runtime/github-transport/ff_win_github_smoke_test.ps1": "6cc4178d160b8347ff63d798b375fb479f1a4f6d68b2852b9af5a5ea2b2c94fb",
+    "runtime/github-transport/ff_win_github_transport_health.ps1": "d21191249571d8d8f11f4715ae53bf753f25754232f10f202b9a9603e3b1ef81",
+    "runtime/github-transport/ff_win_github_transport_keeper.ps1": "1828827c475d02af8740730e1060e13a500098a78727fa5e32fcfab3a3eef41b",
+    "runtime/github-transport/ff_win_github_v3_keeper.ps1": "a9c0a96758590159a5d5d1b77faf3dd187a6078562307736c8e2d932c23d4664",
+    "runtime/github-transport/ff_win_transport_core.py": "18d4df6375b1cd0ad08afab8f0c8fafb19463e6e85db4187ec6a7586e72c2ee2",
+    "runtime/github-transport/ff_win_transport_faults.py": "7c62eda716430fbec70dd90945d13aedcc80d20dac91905f6daeaa282f3a2914",
+    "runtime/github-transport/ff_win_v3_agent.py": "3c3b29b1e5b314a71b4c93351acd7aee59eb27df0aceb05f2b59998e20034064",
+    "runtime/github-transport/ff_win_v3_extras.py": "ecf92375e6eec6bffb23cd45f4f31827bbb920b45d672eda4496163436f6e3b0",
+    "runtime/github-transport/ff_win_v3_security.py": "f8d38cf578860ffe8f2e8578cd9c645d6e20fb51ad16be7976df921ed7ff8a7e"
+  }
+}

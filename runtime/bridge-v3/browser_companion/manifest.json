@@ -1,0 +1,12 @@
+{
+  "manifest_version": 3,
+  "name": "FF Browser Companion",
+  "version": "0.1.0",
+  "description": "Minimal privileged browser capabilities for FF Windows Bridge.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqncNNvxM+V3nmpYbs1USTy5tIn+RljbLwI9TQR0bKYDFStoiH2e+QBOgOVfdNcQAG2mE4JxaSwH89zejpdJP4MlR4wssAXSUyYxlZOw5t6+LuTYbButZIJUUIf1mfXnVCrKQXXKRpp5Znyl7WOM7AKanJBfHzoEpQ+KvMKA7fEUGm2XywDDWIRZyYnIj3jyKaRO80do0ajD2BvFez7tsHbWQE5Hbh3PPZM5WDRrS+/OURtFB8r+QuAXVY6A5XCJnZe4bc1yjQiYxLXhtiSgBaEmwgtrQVBEddhoI1UpQAmBbQyn9MEpa5C/cBYaAjfXTT2jLWc1SOtqa6DMsCgAQXwIDAQAB",
+  "permissions": ["downloads", "nativeMessaging"],
+  "background": {
+    "service_worker": "service_worker.js",
+    "type": "module"
+  }
+}
