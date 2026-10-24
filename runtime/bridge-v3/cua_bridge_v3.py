@@ -518,6 +518,10 @@ class CuaBridgeControlPlane:
                 return prepare_windows_mcp()
             except ToolPreparationError as exc:
                 raise CuaBridgeError(exc.code) from exc
+        if command == "plan_action":
+            # Uses the existing surface registry and route adapters, not a
+            # second parallel router. Planning never performs adapter.act().
+            return self._act({**args, "_preflight_only": True})
         if command == "programmatic_plan":
             from cua_tool_preparation import documentation_for
             app = str(args.get("app") or "").strip()
@@ -1484,7 +1488,9 @@ class CuaBridgeControlPlane:
                 background_safe=True,
             )
         physical_runtime = None
-        if surface["kind"] != "app" and policy.physical_input_allowed and policy.foreground_allowed and not policy.background_required:
+        if (surface["kind"] != "app" and policy.physical_input_allowed
+                and policy.foreground_allowed and not policy.background_required
+                and args.get("_preflight_only") is not True):
             try:
                 physical_runtime = self._physical_runtime()
                 router.lease_validator = physical_runtime.validator(surface)
@@ -1507,6 +1513,16 @@ class CuaBridgeControlPlane:
             lease_arg = {"lease_id": args["lease_id"]}
         lease = dict(lease_arg) if lease_arg else None
         lease_id = str((lease or {}).get("lease_id") or "")
+        if args.get("_preflight_only") is True:
+            result = router.inspect(request, policy=policy, lease=lease)
+            # Even if an agent claims to have owner approval, this read-only
+            # observation never converts that claim into a capability.
+            if not policy.background_required and policy.physical_input_allowed:
+                result["foreground_candidate_unverified"] = True
+                if result["selected_route"] is None:
+                    result["requires_verified_foreground_approval"] = True
+                    result["next_step"] = "obtain_trusted_foreground_authorization"
+            return result
         resource_scope = self._resources.write_many(resource_keys)
         if surface["kind"] == "app":
             handle = surface.get("app_api_handle")

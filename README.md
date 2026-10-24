@@ -36,3 +36,7 @@ See [CI_POLICY.md](CI_POLICY.md) for free GitHub-hosted Windows/Linux checks, cl
 ## Current lightweight release — Remote Beta 3
 
 [Download Windows Bridge Full Core Remote Beta 3](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3) (61.79 MB). It includes `ADDONS.cmd` for optional offline, pinned browser/vision installs; it does not bundle the heavy binaries. Follow [OPTIONAL-ADDONS.md](OPTIONAL-ADDONS.md). The pairing flow still requires explicit consent and a private GitHub transport.
+
+## P0: Verified agent orchestration and ChatGPT skill
+
+Read [P0_AGENT_PLATFORM.md](P0_AGENT_PLATFORM.md) for verified three-way runtime audit, new no-effect route preflight (computer_use.command=plan_action), the [Windows Bridge Skill source](skills/windows-bridge/SKILL.md), missing host-side permission attestation and explicit acceptance gates. Skill source committed in GitHub is not proof it auto-activates in ChatGPT. The installed home Bridge is intentionally unchanged.
