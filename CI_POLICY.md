@@ -28,3 +28,12 @@
 - [Remote Beta 2 release](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.24-remote-beta2) was installed on a [clean Windows runner](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40133081227) with success.
 - [Source and pairing CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40133853951): success.
 - GitHub's current source for public standard runner free use: https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job
+
+## Public implementation queue
+
+- [#4 — Real second-device pairing and consent](https://github.com/Ai-b0ss/windows-bridge-core/issues/4) **P0** (remains unverified on real friend hardware).
+- [#5 — Scoped signed approvals for high-impact RPC](https://github.com/Ai-b0ss/windows-bridge-core/issues/5) **P0**.
+- [#6 — Optional browser/vision addons](https://github.com/Ai-b0ss/windows-bridge-core/issues/6) **P1**.
+- [#7 — CLI/API-first and native hidden GUI routing](https://github.com/Ai-b0ss/windows-bridge-core/issues/7) **P1**.
+
+Agents: claim one public issue, branch from current public `main`, implement with evidence and create PR; use free public CI. Keep sensitive device-specific support evidence in the authorized private support channel, never in public issues or public CI logs.
