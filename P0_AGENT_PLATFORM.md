@@ -71,3 +71,13 @@ This code still requires a clean Windows runtime smoke and release compatibility
 ## AuthorityStore device-binding follow-up
 
 The authority foundation now explicitly requires signed local-device binding and uses a separate `approvals_v2` table instead of trusting unbound legacy rows. Added local revocation and signed-receipt replay/wrong-device regression tests. **Host-issued chat attestation remains unimplemented**, and this source-only change has not been deployed to the currently running owner's Bridge. Details: [P0_PERMISSION_BROKER.md](P0_PERMISSION_BROKER.md).
+
+## Unified read-only task preflight (after PR #18)
+
+The existing `CuaBridgeControlPlane` now supports `computer_use.command="task_preflight"`. It reuses the real `programmatic_plan` discovery and optionally the already-integrated `plan_action` for an existing registered surface. It does not call a model, spend API credit, install a tool, mint a grant, or perform an adapter action.
+
+It returns separately: **candidate availability**, **task compatibility**, **semantic route suitability**, **host authorization status** (always unverified in this read-only stage) and the next check before execution. A present CLI or `--help` is not proof of a completed task; an unknown natural-language task must not become `APP_TASK_MISMATCH`.
+
+An isolated real Bridge v3 process on a nonstandard loopback port was exercised via authenticated RPC: ping, CLI-first capability, natural-language programmatic plan, invalid-surface rejection, unified task preflight and rejection of agent-supplied physical-input permission (**6/6 PASS**). The trial used a separate temporary root, never paid for AI inference or took over the desktop, then stopped its owned PID and removed its own temporary files. Owner's live 39073 and 39076 listeners remained healthy. This is genuine **read-only integration evidence**, not proof that an unstructured Cursor/Antigravity/Excel task was executed end-to-end.
+
+Note that a read-only `task_preflight` request carrying `physical_input_allowed=true` is intentionally blocked by the outer Bridge policy before planning. Do **not** bypass or relax that protection to make a malicious test pass.
