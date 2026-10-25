@@ -79,7 +79,7 @@ def main():
             "while (-not (Test-Path -LiteralPath $Release) -and $timer.Elapsed.TotalSeconds -lt 40) "
             "{ Start-Sleep -Milliseconds 100 }; "
             "Write-Output 'AFTER_RESTART'; "
-            "Set-Content -LiteralPath $Done -Value 'DONE'"
+            "Set-Content -LiteralPath $Done -Value 'DONE'; exit 37"
         )
         quote = lambda path: "'" + str(path).replace("'", "''") + "'"
         command = "& { " + script + " } " + " ".join(quote(p) for p in (effect, release, done))
@@ -151,11 +151,14 @@ def main():
             else:
                 raise RuntimeError("RESTORED_OUTPUT_NOT_RECONCILED")
             verify("BEFORE_RESTART" in events, "EARLIER_OUTPUT_LOST")
+            verify(result.get("exit_code") == 37 and result.get("exit_code_known") is True,
+                   "RESTORED_NONZERO_EXIT_CODE_LOST")
             verify(effect.read_text(encoding="utf-8-sig").splitlines() == ["ONCE"],
                    "FINAL_EFFECT_NOT_ONCE")
             print(json.dumps({"schema": "ff-detached-restart-smoke-v1", "all_passed": True,
                               "real_bridge_restart": True, "same_process_restored": True,
                               "output_before_and_after_verified": True,
+                              "actual_nonzero_exit_code_preserved": True,
                               "durable_duplicate_one_effect": True,
                               "scope": "isolated synthetic task; no host consent or GUI proof"}))
         finally:

@@ -52,11 +52,15 @@ def main():
         assert sid in recovered
         assert recovered[sid].is_running()
         assert recovered[sid].poll() is None
-        # The stub must recheck birth time on EVERY poll, not only at restore.
+        # A retained kernel reference prevents later PID lookups selecting a
+        # different process. Lost reference state must never fabricate exit 0.
         from unittest.mock import patch
-        with patch("ff_win_v3_agent.process_identity_matches",return_value=False):
+        with patch.object(recovered[sid].process._reference,"poll",side_effect=OSError("lost reference")):
             assert not recovered[sid].is_running()
-            assert recovered[sid].poll()==0
+            assert recovered[sid].poll()==-1
+            assert recovered[sid].snapshot()["exit_code"] is None
+            assert recovered[sid].snapshot()["exit_code_known"] is False
+        recovered[sid].process._reference.close()
         mismatched={**record,"pid_creation_token":token+1}
         file.write_text(json.dumps({sid:mismatched}),encoding="utf-8")
         assert sid not in agent.recover_detached_sessions()

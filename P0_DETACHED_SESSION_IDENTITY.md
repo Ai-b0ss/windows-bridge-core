@@ -95,3 +95,29 @@ client cursor. Checking paths does not constitute an OS sandbox against a
 concurrent same-account attacker. The legacy PID-based termination path still
 requires a separate handle-bound race review; PID birth checks alone are not
 a proof of race-free tree termination. No active user installation is changed.
+
+## Retained process reference and accurate exit status
+
+The next master-plan candidate retains a read-only Windows process HANDLE after
+birth-token verification. Polling waits on this exact kernel object and reads
+its actual exit code, including nonzero failure and exit 259. A reused numeric
+PID is never substituted for the retained object. A failed observation returns
+`exit_code=null, exit_code_known=false`, rather than a fabricated successful 0.
+
+Session termination now uses Popen's retained HANDLE for fresh processes and
+an identity-verified PROCESS_TERMINATE handle for restored processes. Verification
+and TerminateProcess use the same handle. No taskkill /PID lookup is performed
+after that check. Existing RPC authorization remains enforced. These operations
+explicitly report `termination_scope=owned_root_process` and
+`descendant_cleanup_verified=false`; this is not yet a verified tree-cleanup
+implementation. No user-owned process is touched by its test suite.
+
+Tests cover changed-token termination denial, retained-handle exit 37, actual
+exit 259, Windows termination of only the test's own child, query failures,
+handle release, and real isolated Bridge restart whose detached fixture exits
+37. Windows evidence must be recorded in the PR before acceptance.
+
+Primary Windows contracts:
+- https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-getexitcodeprocess
+- https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-terminateprocess
+- https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-process
