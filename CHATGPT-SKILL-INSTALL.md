@@ -28,3 +28,37 @@ python -m unittest discover -s tests -v
 ```
 
 This is P0 preparation, not proof of app-level task automation, installed skill activation, or secure chat-to-Bridge Permission Broker.
+
+## Update an existing MCP-backed plugin safely
+
+Download the complete original ZIP from the **existing** plugin's menu. Do not
+upload the generic skills-only ZIP over it: that can remove its registered MCP
+mapping. For the supported Codex compatibility layout:
+
+```
+python tools/build_skill_plugin.py --mode existing-plugin --original original.zip --version 1.1.1 --output complete-update.zip
+```
+
+The builder preserves `.app.json` byte-for-byte, the assigned plugin name,
+other components and the original input file. It adds the bundled Windows skill
+and updates only version/skills metadata. Duplicate/unsafe archive members and
+an ambiguous portable override are rejected. The complete output is private
+account-specific configuration; do not publish it with generic release files.
+
+All modes validate bundled links and rewrite links to repository-only documents
+as public GitHub URLs. The standalone skill and complete plugin must not point
+at absent files outside their ZIP.
+
+On 25 October, the existing connected plugin was actually updated through
+ChatGPT's Upload new version UI from 1.0.0 to 1.1.0: one original app remained and
+one Windows skill appeared. A fresh chat with the existing plugin selected
+completed device discovery and Cursor programmatic preflight without GUI/model
+execution. This proves installation and a fresh-chat read-only workflow; it does
+not, by itself, prove five independent automatic trigger phrases or a
+host-attested desktop grant. Further package link fixes and Russian trigger
+metadata are covered by the 1.1.1 build; account-specific installation evidence
+is retained privately.
+
+Sources: https://developers.openai.com/plugins/build/plugins and
+https://developers.openai.com/plugins/deploy/submission . Existing plugin updates
+preserve the current MCP identity and do not require new account permissions.
