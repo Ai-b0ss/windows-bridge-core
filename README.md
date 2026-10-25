@@ -48,3 +48,7 @@ Read [P0_AGENT_PLATFORM.md](P0_AGENT_PLATFORM.md) for verified three-way runtime
 ### P0 — Inspect real Cursor/Antigravity CLI contracts
 
 [Bounded and redacted CLI capability audit](P0_VENDOR_CLI_CONTRACTS.md) is implemented in `task_preflight` as an explicit opt-in. Status/Help/version checks are **not** proof of model entitlement or agent task success.
+
+### P0 — Durable task recovery
+
+[At-most-once request admission and unknown-outcome handling](P0_DURABLE_TASK_RECOVERY.md): actual RPC duplicate suppression; isolated test-root journals; no automatic replay after lost responses. Full live-process restart still pending.
