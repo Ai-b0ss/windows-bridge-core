@@ -125,3 +125,31 @@ RequestJournal keeps a committed command fingerprint before dispatch, deduplicat
 Detached sessions now bind both Windows PID and kernel creation FILETIME before saving and after reattaching. A recycled PID cannot be treated as the task-owned process after restart; old PID-only records fail closed, as do missing or redirected log paths. Tests run real Windows read-only process identity against the test Python PID only. See [P0_DETACHED_SESSION_IDENTITY.md](P0_DETACHED_SESSION_IDENTITY.md).
 ## New-chat agent discovery via existing MCP
 Read-only `agent_workflows` RPC and `capabilities.agent_workflows` expose the core task lifecycle without requiring a standalone ChatGPT Skill; this is not a host installation or proof of automatic tool selection. [Proof and eligibility](P0_AGENT_WORKFLOW_DISCOVERY.md).
+
+## Master-plan Stage 0 / recovery continuation — 25 October 2026
+
+PR [#25](https://github.com/Ai-b0ss/windows-bridge-core/pull/25) was merged as
+`a4274ef280fd7d92f84a1593763d035374af60d6`. Its exact candidate passed
+[public Windows CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40193793205):
+111 unit tests (one optional cryptography dependency skip), 11 isolated RPC
+checks, real Windows creation FILETIME validation, detached Bridge crash/restart
+with output reconciliation and independently verified single-effect durable
+replay, plus the existing hard-crash lost-ACK test. Excel was explicitly skipped
+because the hosted runner has no Excel. The previous detached PowerShell launch
+returned exit 0 without running the fixture; hidden-console startup corrects it.
+No installed user Bridge or published ZIP was upgraded by this merge.
+
+Stage 0 inventory now includes the actual executor `ff_win_v3_agent.py`, process
+identity, journal, RPC scope guard, durable recovery and MCP workflow modules.
+Previously these could differ while the inventory reported equality for its
+smaller module list. The tool identifies the exact input ZIP with SHA-256 and
+size, rejects duplicate members, excessive uncompressed module sizes, empty or
+duplicate selections, and names outside the explicit module allowlist.
+
+Inventory compares **installed files on disk**. It does not inspect an active
+Windows PID or attest that the process loaded those bytes. Every report now
+explicitly returns `running_process_verified=false`; the historical `live_*`
+keys remain compatibility aliases, with clearer `all_installed_*` summaries.
+Source commit, package hash, installed disk files and actual running process
+remain separate evidence. Complete WB-00/public #16 acceptance still requires
+an authorized exact-device process/loaded-source check and release/deploy parity.
