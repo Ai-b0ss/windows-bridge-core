@@ -44,12 +44,15 @@ def main():
             id=sid,pid=pid,log_path=log,
             command=record["command"],cwd=record["cwd"],
             shell=record["shell"],created_at=record["created_at"],
+            owner_scope=("ci-identity-agent", "ci-identity-task"),
         )
         agent.save_detached_session(owned)
         saved=json.loads(file.read_text(encoding="utf-8"))
         assert saved[sid]["pid_creation_token"]==token
+        assert saved[sid]["owner_scope"]==["ci-identity-agent", "ci-identity-task"]
         recovered=agent.recover_detached_sessions()
         assert sid in recovered
+        assert recovered[sid].owner_scope==("ci-identity-agent", "ci-identity-task")
         assert recovered[sid].is_running()
         assert recovered[sid].poll() is None
         # A retained kernel reference prevents later PID lookups selecting a
