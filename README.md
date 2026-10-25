@@ -35,6 +35,17 @@ See [CI_POLICY.md](CI_POLICY.md) for free GitHub-hosted Windows/Linux checks, cl
 
 ## Current lightweight release — Remote Beta 3
 
+Source `main` and the published Beta 3 ZIP have different bytes. A merged fix
+does not update that download or an already running installation.
+
+For maintainer builds, `tools/build_portable_release.py` requires the pinned
+previous asset ZIP and verifies every bundled source file against the selected
+Git commit before writing `public_source_commit`. Modified, missing and
+untracked bundled source is refused, even when the index marks it unchanged.
+Use a clean checkout with `core.autocrlf=false`; line-ending conversion changes
+package bytes. The manifest records source-byte verification separately from
+installation or running-process acceptance, which must still be tested.
+
 [Download Windows Bridge Full Core Remote Beta 3](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3) (61.79 MB). It includes `ADDONS.cmd` for optional offline, pinned browser/vision installs; it does not bundle the heavy binaries. Follow [OPTIONAL-ADDONS.md](OPTIONAL-ADDONS.md). The pairing flow still requires explicit consent and a private GitHub transport.
 
 ## P0: Verified agent orchestration and ChatGPT skill
