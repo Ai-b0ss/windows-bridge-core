@@ -28,7 +28,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
-from ff_win_process_identity import process_creation_token, process_identity_matches
+from ff_win_process_identity import ProcessReference, process_creation_token, process_identity_matches
 
 PROTOCOL_VERSION = 1
 HOST = "127.0.0.1"
@@ -531,12 +531,21 @@ class DetachedProcessStub:
     def __init__(self, pid: int, creation_token: int):
         self.pid = pid
         self.creation_token = creation_token
+        self._reference = ProcessReference(pid, creation_token)
+        self.exit_code_known = True
         self.stdin = None
         self.stdout = None
         self.stderr = None
 
     def poll(self) -> int | None:
-        return None if process_identity_matches(self.pid, self.creation_token) else 0
+        try:
+            return self._reference.poll()
+        except OSError:
+            self.exit_code_known = False
+            return -1  # Internal stopped sentinel; never exposed as a real exit.
+
+    def terminate(self):
+        self._reference.terminate()
 
     def wait(self, timeout: float | None = None) -> int:
         start = time.time()
@@ -544,7 +553,7 @@ class DetachedProcessStub:
             if timeout and time.time() - start > timeout:
                 raise subprocess.TimeoutExpired(["detached", str(self.pid)], timeout)
             time.sleep(0.1)
-        return 0
+        return self.poll()
 
     @property
     def returncode(self) -> int | None:
@@ -626,7 +635,10 @@ class Session:
                 except Exception:
                     pass
                 self.closed_at = now_ms()
-                self.append_event("meta", f"<process exited code={self.poll() or 0}>\n")
+                code = self.poll()
+                if not getattr(self.process, "exit_code_known", True):
+                    code = "unknown"
+                self.append_event("meta", f"<process exited code={code}>\n")
                 break
             time.sleep(0.2)
 
@@ -675,11 +687,14 @@ class Session:
                     break
                 selected.append(event)
                 total += size
+            exit_code = self.poll()
+            known = getattr(self.process, "exit_code_known", True)
             return {
                 "session_id": self.id,
                 "running": self.is_running(),
                 "pid": self.pid,
-                "exit_code": self.poll(),
+                "exit_code": exit_code if known else None,
+                "exit_code_known": known,
                 "created_at": self.created_at,
                 "closed_at": self.closed_at,
                 "detached": self.detached,
@@ -779,7 +794,10 @@ def recover_detached_sessions() -> dict[str, Session]:
             created_at = int(info.get("created_at") or now_ms())
         except (OSError, ValueError, TypeError):
             continue
-        stub = DetachedProcessStub(pid, token)
+        try:
+            stub = DetachedProcessStub(pid, token)
+        except OSError:
+            continue
         s = Session(
             stub,
             command=str(info.get("command") or ""),
@@ -1034,13 +1052,29 @@ def op_force_terminate(args: dict[str, Any]) -> dict[str, Any]:
     session_id = str(args.get("session_id") or "")
     session = get_session(session_id)
     if session.is_running():
-        terminate_pid(session.pid)
+        terminate_owned_session(session)
         try:
             if hasattr(session.process, "wait"):
                 session.process.wait(timeout=10)
         except Exception:
             pass
-    return {"ok": True, "session_id": session_id, "exit_code": session.poll()}
+    code = session.poll()
+    known = getattr(session.process, "exit_code_known", True)
+    return {"ok": True, "session_id": session_id, "exit_code": code if known else None,
+            "exit_code_known": known, "termination_scope": "owned_root_process",
+            "descendant_cleanup_verified": False}
+
+
+def terminate_owned_session(session):
+    if os.name == "nt":
+        try:
+            # Popen retains its exact process handle; restored stubs use the
+            # birth-bound ProcessReference. Never delegate to taskkill /PID.
+            session.process.terminate()
+        except (OSError, AttributeError) as exc:
+            raise RPCError("OWNED_PROCESS_TERMINATION_FAILED", details={"retry_safe": False}) from exc
+    else:
+        terminate_pid(session.pid)
 
 
 def op_list_sessions(args: dict[str, Any]) -> dict[str, Any]:
@@ -1048,11 +1082,14 @@ def op_list_sessions(args: dict[str, Any]) -> dict[str, Any]:
         sessions = list(STATE.sessions.values())
     items = []
     for session in sessions:
+        code = session.poll()
+        known = getattr(session.process, "exit_code_known", True)
         items.append({
             "session_id": session.id,
             "pid": session.pid,
             "running": session.is_running(),
-            "exit_code": session.poll(),
+            "exit_code": code if known else None,
+            "exit_code_known": known,
             "command": redact_string(session.command),
             "cwd": session.cwd,
             "shell": session.shell,
@@ -1095,8 +1132,9 @@ def op_kill_process(args: dict[str, Any]) -> dict[str, Any]:
         raise RPCError("PROCESS_NOT_OWNED", details={"pid": pid})
     if not owned_session.is_running():
         raise RPCError("PROCESS_NOT_RUNNING", details={"pid": pid, "session_id": owned_session_id})
-    terminate_pid(pid)
-    return {"ok": True, "pid": pid, "ownership": "bridge_session", "session_id": owned_session_id}
+    terminate_owned_session(owned_session)
+    return {"ok": True, "pid": pid, "ownership": "bridge_session", "session_id": owned_session_id,
+            "termination_scope": "owned_root_process", "descendant_cleanup_verified": False}
 
 
 def read_text_file(path: Path) -> tuple[str, str]:
