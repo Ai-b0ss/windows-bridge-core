@@ -35,10 +35,12 @@ and runs on free public Windows CI.
 
 ## Caveats and integration
 
-`RecoveryCoordinator(journal).plan(key)` is ready for a trusted
-`request_status` / `task_recovery_plan` endpoint and omits private recorded
-response content. **Do not claim this is wired into live RPC until a real
-authenticated test proves it**. It intentionally has no `execute` method.
+`RecoveryCoordinator(journal).plan(key)` is wired as `task_recovery_plan` in the existing Bridge RPC registry.
+The server reads trusted local RequestJournal status directly: no agent-supplied
+status objects, no automatic retry, and no private recorded response content.
+An isolated **real authenticated RPC** test checks the new command on a
+persisted completed journal entry. This is source/CI acceptance only;
+the owner's existing installed Bridge is not automatically upgraded. It intentionally has no `execute` method.
 
 The separate concurrent P0 change to choose the journal path under an
 explicit isolated `FF_BRIDGE_ROOT` must be merged without losing the existing

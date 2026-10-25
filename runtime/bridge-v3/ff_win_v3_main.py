@@ -518,6 +518,15 @@ def _install_durable_requests() -> None:
             return result
         except RequestJournalError as exc:
             raise core.RPCError(exc.code, details={"retry_safe": False}) from exc
+    def task_recovery_plan(args: dict[str, Any]) -> dict[str, Any]:
+        # Trusted journal state is consulted server-side. Caller cannot pass
+        # forged completion flags or stored response contents.
+        from cua_durable_recovery import RecoveryCoordinator
+        try:
+            return RecoveryCoordinator(journal).plan(args.get("request_key"))
+        except RequestJournalError as exc:
+            raise core.RPCError(exc.code, details={"retry_safe": False}) from exc
+    core.OPS["task_recovery_plan"] = task_recovery_plan
     core.OPS["durable_call"] = durable_call
     core.OPS["request_status"] = request_status
     core.OPS["request_journal_maintenance"] = lambda args: journal.maintain()
