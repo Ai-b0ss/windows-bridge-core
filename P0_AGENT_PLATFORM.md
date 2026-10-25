@@ -102,3 +102,15 @@ Note that a read-only `task_preflight` request carrying `physical_input_allowed=
 `task_preflight(verify_cli_contract=true)` can now inspect exact known vendor CLI entrypoints with bounded `--version`/`--help` and optional sanitized Cursor `status`. It does **not** execute a model or approve new costs. On the tested Windows owner PC, Cursor Agent is signed in with headless print/plan flags; Antigravity `agy` 1.4.7 exposes headless/sandbox flags, while its account eligibility remains unverified. Unit checks explicitly reject a misleading `Not logged in` positive match and a false `task_compatibility=compatible` promotion from help syntax alone.
 
 Details and official documentation: [P0_VENDOR_CLI_CONTRACTS.md](P0_VENDOR_CLI_CONTRACTS.md).
+
+## Actual hidden Excel COM execution
+
+The owner-authorized Windows PC has a registered Microsoft Excel.Application COM server. A new isolated acceptance harness creates an *owned invisible* Excel process when no other Excel instance is running; writes two values (20, 22) to a new temporary workbook; asks real Excel to calculate a SUM formula; saves only a temporary XLSX; independently reads its actual OOXML ZIP and formula cached value (=42); and cleans up its own workbook, EXCEL.EXE PID and temp data. The first ad hoc run succeeded but exposed a DateTime cleanup conversion bug; the reusable script fixes this and **passed end-to-end on the actual Windows PC**, exit code 0.
+
+Public tests/integration/excel_com_smoke.ps1 and tests/integration/excel_com_verify_ooxml.py are now run from public CI. On clean GitHub-hosted Windows without Excel COM they explicitly SKIP; they must never pretend a skipped live Excel trial is a PASS. When installed, any live Excel session belonging to the owner also causes an explicit SKIP instead of attaching or mutating it. Independent OOXML regression tests are always run.
+
+This verifies **programmatic Excel cell/formula/save** operations in a hidden process, NOT Copilot chat in Excel, login/licensing for Office AI, UIA fallback, or an arbitrary user workbook modification. Official COM SaveAs documentation: https://learn.microsoft.com/en-us/office/vba/api/excel.workbook.saveas .
+
+## Read-only Excel COM registration in task_preflight
+
+The existing CuaBridgeControlPlane supports opt-in verify_office_com=true for Excel tasks. This is a bounded Windows registry read of Excel.Application/CLSID/LocalServer32; it never calls CoCreateInstance, launches EXCEL.EXE, reads user documents, or falsely reports task success. When registration and executable are present, the next step is to prove an authorized owned hidden COM workbook and its postcondition. Other applications cannot turn on the Excel COM probe through an unrelated app request.

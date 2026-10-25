@@ -1487,6 +1487,14 @@ class CuaBridgeControlPlane:
             contract = probe_vendor_cli(
                 app, include_auth_status=args.get("include_auth_status") is True
             )
+        office_com = None
+        if "verify_office_com" in args and type(args["verify_office_com"]) is not bool:
+            raise CuaBridgeError("OFFICE_COM_PROBE_FLAG_INVALID")
+        if args.get("verify_office_com") is True:
+            if "excel" not in app.casefold():
+                raise CuaBridgeError("OFFICE_COM_APP_UNSUPPORTED")
+            from cua_office_com_probe import excel_registration
+            office_com = excel_registration()
         task_compatible = candidates.get("task_compatibility")
         route = route_preflight.get("selected_route") if isinstance(route_preflight, Mapping) else None
         best_task = candidates.get("preferred_task_route")
@@ -1494,6 +1502,8 @@ class CuaBridgeControlPlane:
             step = "validate_entitlement_and_execute_verified_programmatic_task"
         elif route:
             step = "verify_background_route_matches_task_then_act_with_postcondition"
+        elif office_com and office_com.get("candidate_route") == "EXCEL_COM":
+            step = "verify_owned_hidden_excel_com_and_task_postcondition"
         elif cli:
             step = "check_task_specific_cli_support_auth_and_pricing"
         else:
@@ -1503,6 +1513,7 @@ class CuaBridgeControlPlane:
             "app": app, "task": task,
             "programmatic": candidates,
             "cli_contract": contract,
+            "office_com_registration": office_com,
             "external_cli_readonly_probe_requested": contract is not None,
             "semantic_preflight": route_preflight,
             "task_compatibility": task_compatible,
