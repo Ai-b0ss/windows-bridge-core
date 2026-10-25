@@ -11,3 +11,5 @@ Inspect capabilities from the live connected Bridge; no static README proves cur
 - Evidence/recovery: `durable_call`, `request_status`, and relevant owner-scoped session APIs if advertised by the connected Bridge.
 
 The `computer_use` payload uses `command`, not an arbitrary `action` key. The public GitHub source, portable ZIP, installed file and active process are distinct objects; use `tools/runtime_inventory.py`. Never hard-code a user's hostname, port, secret path or GitHub issue into a publicly distributed skill.
+
+Read-only discovery even without standalone Skill installation: `bridge_call(op="agent_workflows",args={})` exposes the recommended task lifecycle; capabilities also contains `agent_workflows`. This is static advice, never authentication or authorization. See [agent discovery](../../../P0_AGENT_WORKFLOW_DISCOVERY.md).

@@ -65,6 +65,20 @@ def verify_rpc(port: int,secret: str):
            "CLI_FIRST_GUARD_INACTIVE")
     checks.append("cli_first_guard")
 
+    discovery=rpc(port,secret,"agent_workflows",{},"ci-agent-workflow-bootstrap")
+    verify(discovery.get("ok") is True,"AGENT_WORKFLOWS_READ_FAILED")
+    flow=discovery.get("result") or {}
+    verify(flow.get("schema")=="ff-windows-agent-workflows-v1",
+           "AGENT_WORKFLOW_SCHEMA_INVALID")
+    verify(flow.get("manifest_is_authorization") is False
+           and flow.get("owner_chat_permission_attested") is False
+           and flow.get("task_completed") is False,
+           "AGENT_WORKFLOW_CLAIMED_UNVERIFIED_CAPABILITY")
+    verify(features.get("agent_workflows_discovery") is True
+           and (cap.get("result") or {}).get("agent_workflows")==flow,
+           "AGENT_WORKFLOW_NOT_ADVERTISED_BY_CAPABILITIES")
+    checks.append("new_chat_readonly_agent_workflow_bootstrap")
+
     task=rpc(port,secret,"computer_use",{
         "command":"task_preflight","app":"git",
         "task":"inspect the repository status without modifying files",
