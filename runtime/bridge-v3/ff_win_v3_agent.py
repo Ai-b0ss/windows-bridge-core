@@ -925,7 +925,11 @@ def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
         log_file = log_dir / f"{session_id}.log"
         log_handle = open(log_file, "ab")
         if os.name == "nt":
-            flags = 0x00000008 | 0x00000200
+            # DETACHED_PROCESS leaves legacy Windows PowerShell without a
+            # console host: it can exit 0 without executing -Command. A hidden
+            # console process still survives this Bridge's exit because this
+            # branch is deliberately NOT assigned to the kill-on-close job.
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         process = subprocess.Popen(
             argv,
             cwd=str(cwd),
