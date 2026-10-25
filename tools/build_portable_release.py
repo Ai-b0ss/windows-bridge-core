@@ -134,6 +134,9 @@ def assemble(repo: Path, previous: Path, output: Path) -> dict:
     manifest.update({
         "runtime_contract": "ff-full-core-remote-addon-v3",
         "public_source_commit": head,
+        # The installer consumes this legacy key. Never inherit the previous
+        # package's source identity while replacing all runtime source bytes.
+        "source_commit": head,
         "source_bytes_verified_against_commit": True,
         "files": {name: sha(data) for name, data in sorted(contents.items())},
     })
