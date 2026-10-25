@@ -22,6 +22,12 @@ jobs:
       - name: Real isolated Bridge RPC and read-only task acceptance
         shell: pwsh
         run: python tests/integration/isolated_rpc_smoke.py
+      - name: Detached session PID identity with real Windows FILETIME
+        shell: pwsh
+        run: python tests/integration/detached_identity_probe.py
+      - name: Actual isolated Bridge restart and detached output recovery
+        shell: pwsh
+        run: python tests/integration/detached_restart_smoke.py
       - name: Real lost-ACK hard-crash durable request replay regression
         shell: pwsh
         run: python tests/integration/durable_crash_smoke.py

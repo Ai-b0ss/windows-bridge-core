@@ -17,6 +17,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -26,6 +27,8 @@ import uuid
 from collections import deque
 from pathlib import Path
 from typing import Any
+
+from ff_win_process_identity import process_creation_token, process_identity_matches
 
 PROTOCOL_VERSION = 1
 HOST = "127.0.0.1"
@@ -525,18 +528,19 @@ def is_pid_alive(pid: int) -> bool:
 
 
 class DetachedProcessStub:
-    def __init__(self, pid: int):
+    def __init__(self, pid: int, creation_token: int):
         self.pid = pid
+        self.creation_token = creation_token
         self.stdin = None
         self.stdout = None
         self.stderr = None
 
     def poll(self) -> int | None:
-        return None if is_pid_alive(self.pid) else 0
+        return None if process_identity_matches(self.pid, self.creation_token) else 0
 
     def wait(self, timeout: float | None = None) -> int:
         start = time.time()
-        while is_pid_alive(self.pid):
+        while self.poll() is None:
             if timeout and time.time() - start > timeout:
                 raise subprocess.TimeoutExpired(["detached", str(self.pid)], timeout)
             time.sleep(0.1)
@@ -686,7 +690,42 @@ class Session:
             }
 
 
+def detached_log_path(session_id: str, saved_path: Any) -> Path | None:
+    """Validate ownership before resolving links; reject reparse points too.
+
+    This is a restore-time check, not an OS sandbox against a concurrent local
+    account rewriting files after validation.
+    """
+    if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f]{16}", session_id):
+        return None
+    if not isinstance(saved_path, (str, Path)):
+        return None
+    expected = V3_ROOT / "state" / "detached_logs" / f"{session_id}.log"
+    try:
+        if Path(saved_path).absolute() != expected.absolute():
+            return None
+        # Do not call resolve() first: it erases the link being checked.
+        for path in (V3_ROOT, expected.parent.parent, expected.parent, expected):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                return None
+            if path != expected and not stat.S_ISDIR(info.st_mode):
+                return None
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None
+        return expected
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def save_detached_session(session: Session) -> None:
+    # A PID alone is not a durable identity; Windows may recycle it for a
+    # different user process. Never write an unbound record.
+    token = process_creation_token(session.pid)
+    if token is None or session.log_path is None:
+        return
+    if detached_log_path(session.id, session.log_path) is None:
+        return
     try:
         DETACHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         current = {}
@@ -698,6 +737,7 @@ def save_detached_session(session: Session) -> None:
         current[session.id] = {
             "session_id": session.id,
             "pid": session.pid,
+            "pid_creation_token": token,
             "command": session.command,
             "cwd": session.cwd,
             "shell": session.shell,
@@ -718,24 +758,41 @@ def recover_detached_sessions() -> dict[str, Session]:
     except Exception:
         return recovered
     updated = {}
+    if not isinstance(raw, dict):
+        return recovered
     for sid, info in raw.items():
-        pid = int(info.get("pid") or 0)
-        log_p = Path(info.get("log_path")) if info.get("log_path") else None
-        if pid > 0 and is_pid_alive(pid):
-            stub = DetachedProcessStub(pid)
-            s = Session(
-                stub,
-                command=info.get("command", ""),
-                cwd=info.get("cwd", ""),
-                shell=info.get("shell", ""),
-                session_id=sid,
-                detached=True,
-                pid=pid,
-                log_path=log_p,
-                created_at=int(info.get("created_at") or now_ms()),
-            )
-            recovered[sid] = s
-            updated[sid] = info
+        if not isinstance(sid, str) or not re.fullmatch(r"[0-9a-f]{16}", sid):
+            continue
+        if not isinstance(info, dict):
+            continue
+        pid, token = info.get("pid"), info.get("pid_creation_token")
+        # No migration for legacy PID-only entries: ownership not proven.
+        if not process_identity_matches(pid, token):
+            continue
+        saved_log = info.get("log_path")
+        if not isinstance(saved_log, str):
+            continue
+        expected_log = detached_log_path(sid, saved_log)
+        if expected_log is None:
+            continue
+        try:
+            created_at = int(info.get("created_at") or now_ms())
+        except (OSError, ValueError, TypeError):
+            continue
+        stub = DetachedProcessStub(pid, token)
+        s = Session(
+            stub,
+            command=str(info.get("command") or ""),
+            cwd=str(info.get("cwd") or ""),
+            shell=str(info.get("shell") or ""),
+            session_id=sid,
+            detached=True,
+            pid=pid,
+            log_path=expected_log,
+            created_at=created_at,
+        )
+        recovered[sid] = s
+        updated[sid] = info
     try:
         atomic_write_text(DETACHED_STATE_PATH, json.dumps(updated, indent=2))
     except Exception:
@@ -868,7 +925,11 @@ def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
         log_file = log_dir / f"{session_id}.log"
         log_handle = open(log_file, "ab")
         if os.name == "nt":
-            flags = 0x00000008 | 0x00000200
+            # DETACHED_PROCESS leaves legacy Windows PowerShell without a
+            # console host: it can exit 0 without executing -Command. A hidden
+            # console process still survives this Bridge's exit because this
+            # branch is deliberately NOT assigned to the kill-on-close job.
+            flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
         process = subprocess.Popen(
             argv,
             cwd=str(cwd),
