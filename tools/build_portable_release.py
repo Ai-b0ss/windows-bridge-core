@@ -80,7 +80,8 @@ def verify_source_commit(repo: Path, contents: dict[str, bytes]) -> str:
     """
     head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
                           capture_output=True, text=True, check=True).stdout.strip()
-    raw = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", head],
+    raw = subprocess.run(["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+                          "-C", str(repo), "archive", "--format=tar", head],
                          capture_output=True, check=True).stdout
     with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
         entries = {member.name: member for member in archive.getmembers()}
