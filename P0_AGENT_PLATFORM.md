@@ -114,3 +114,7 @@ This verifies **programmatic Excel cell/formula/save** operations in a hidden pr
 ## Read-only Excel COM registration in task_preflight
 
 The existing CuaBridgeControlPlane supports opt-in verify_office_com=true for Excel tasks. This is a bounded Windows registry read of Excel.Application/CLSID/LocalServer32; it never calls CoCreateInstance, launches EXCEL.EXE, reads user documents, or falsely reports task success. When registration and executable are present, the next step is to prove an authorized owned hidden COM workbook and its postcondition. Other applications cannot turn on the Excel COM probe through an unrelated app request.
+
+## Durable request recovery and isolated journals
+
+RequestJournal keeps a committed command fingerprint before dispatch, deduplicates repeated keys, rejects changed payloads and preserves tombstones. Explicit FF_BRIDGE_ROOT instances now keep their request journal in the isolated root while installed non-override deployments retain the legacy journal path. 89 local unit tests and actual durable_call RPC deduplication support this behavior; a full live process-restart acceptance test remains outstanding. [Precise recovery contract](P0_DURABLE_TASK_RECOVERY.md).

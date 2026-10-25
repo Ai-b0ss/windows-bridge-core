@@ -166,6 +166,54 @@ def verify_rpc(port: int,secret: str):
     verify(hashlib.sha256(TRACKED.read_bytes()).hexdigest()==filename_sha,
            "SOURCE_FILE_MODIFIED")
     checks.append("actual_git_cli_execution_independent_sha_verification")
+
+    # Execute one safe scoped read-only command through the EXISTING
+    # persistent durable_call machinery. Repeating the exact request must
+    # return the same session id; a conflicting request key must be denied.
+    durable={
+        "request_key":"ci-owned-durable-git-001",
+        "op":"start_process",
+        "args":{
+            "command":"git status --porcelain=v1 --untracked-files=no",
+            "cwd":str(REPO),"shell":"powershell.exe","wait_ms":500,
+            "agent_id":"ci-readonly-agent","task_id":"ci-durable-git",
+        },
+        "target_device":platform.node(),
+        "agent_id":"ci-readonly-agent","task_id":"ci-durable-git",
+    }
+    first=rpc(port,secret,"durable_call",durable,"ci-durable-first")
+    verify(first.get("ok") is True,"DURABLE_RPC_INITIAL_FAILED")
+    first_result=first.get("result") or {}
+    verify(first_result.get("state")=="completed" and first_result.get("cached") is False,
+           "DURABLE_FIRST_NOT_COMPLETED")
+    response=first_result.get("response") or {}
+    verify(response.get("ok") is True,"DURABLE_DISPATCH_NOT_OK")
+    first_session=(response.get("result") or {}).get("session_id")
+    verify(isinstance(first_session,str) and len(first_session)>3,
+           "DURABLE_PROCESS_SESSION_NOT_RECORDED")
+    duplicate=rpc(port,secret,"durable_call",durable,"ci-durable-repeated")
+    verify(duplicate.get("ok") is True,"DURABLE_REPEAT_CALL_FAILED")
+    repeated=duplicate.get("result") or {}
+    verify(repeated.get("state")=="completed" and repeated.get("cached") is True,
+           "DURABLE_REPLAY_NOT_DEDUPLICATED")
+    second_session=((repeated.get("response") or {}).get("result") or {}).get("session_id")
+    verify(second_session==first_session,"DURABLE_RETRY_STARTED_ANOTHER_SESSION")
+    status=rpc(port,secret,"request_status",{
+        "request_key":durable["request_key"],
+        "agent_id":"ci-readonly-agent","task_id":"ci-durable-git",
+    },"ci-durable-status")
+    verify(status.get("ok") is True and
+           (status.get("result") or {}).get("state")=="completed",
+           "DURABLE_PERSISTENT_STATUS_NOT_FOUND")
+    modified={
+        **durable,
+        "args":{**durable["args"],"command":"git rev-parse HEAD"},
+    }
+    conflict=rpc(port,secret,"durable_call",modified,"ci-durable-conflict")
+    verify(conflict.get("ok") is False and
+           conflict.get("error_code")=="REQUEST_KEY_CONFLICT",
+           "DURABLE_CONFLICT_DID_NOT_FAIL_CLOSED")
+    checks.append("durable_duplicate_dedupes_process_and_conflicting_key_fails_closed")
     return checks
 
 

@@ -461,13 +461,17 @@ def _install_gui_guards() -> None:
 _install_gui_guards()
 
 def _install_durable_requests() -> None:
-    from ff_win_request_journal import RequestJournal, RequestJournalError
+    from ff_win_request_journal import (
+        RequestJournal, RequestJournalError, choose_request_journal_root,
+    )
     from ff_win_evidence import TaskEvidence, assess_response
     evidence = TaskEvidence(core.BRIDGE_ROOT / "state" / "evidence")
-    journal = RequestJournal(
-        Path(os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local"))
-        / "FFWindowsBridge" / "state" / "request-outcomes"
-    )
+    journal = RequestJournal(choose_request_journal_root(
+        bridge_root=core.BRIDGE_ROOT,
+        override=os.environ.get("FF_BRIDGE_ROOT"),
+        local_appdata=os.environ.get("LOCALAPPDATA"),
+        home=Path.home(),
+    ))
     supported = frozenset({
         "ping", "write_file", "copy_path", "move_file", "delete_path",
         "create_directory", "computer_use", "start_process", "run_code", "restricted_run_code",

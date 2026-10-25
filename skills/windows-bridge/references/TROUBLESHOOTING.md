@@ -8,3 +8,5 @@
 - Vision dependency absent: optional PyTorch model is not required for core CLI/Win32/UIA; verify pinned addon before installation.
 - Temporary session cleanup: only close specific owned process/tab/profile IDs, never all `Chrome`, `Cursor` or `PowerShell`.
 - Escalation: preserve exact error code and redacted route evidence, then stop with the narrowest blocker rather than inventing success.
+
+Request lifecycle: preserve the same durable `request_key` after an ambiguous response; query `request_status` on the exact same authorized device. `outcome_unknown` and `outcome_expired` are never automatic retry permission. See [Durable Recovery](../../../P0_DURABLE_TASK_RECOVERY.md).

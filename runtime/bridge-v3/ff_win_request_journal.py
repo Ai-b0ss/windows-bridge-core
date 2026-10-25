@@ -10,6 +10,31 @@ from ff_win_evidence import redact
 from pathlib import Path
 from typing import Any, Callable
 
+def choose_request_journal_root(
+    *,
+    bridge_root: str | Path,
+    override: str | None,
+    local_appdata: str | None,
+    home: str | Path,
+) -> Path:
+    """Preserve legacy production journal; isolate explicit FF_BRIDGE_ROOT.
+
+    Deliberately do NOT move existing live machine records. Moving the
+    request-key tombstones could allow a previously dispatched operation
+    to be retried after an upgrade.
+    """
+    if override:
+        expected = Path(override)
+        if not expected.is_absolute():
+            raise RequestJournalError("REQUEST_JOURNAL_ROOT_NOT_ABSOLUTE")
+        resolved = Path(bridge_root)
+        if not resolved.is_absolute() or resolved.resolve() != expected.resolve():
+            raise RequestJournalError("REQUEST_JOURNAL_ROOT_MISMATCH")
+        return resolved / "state" / "request-outcomes"
+    local = Path(local_appdata) if local_appdata else Path(home) / "AppData" / "Local"
+    return local / "FFWindowsBridge" / "state" / "request-outcomes"
+
+
 class RequestJournalError(RuntimeError):
     def __init__(self, code: str):
         super().__init__(code)
