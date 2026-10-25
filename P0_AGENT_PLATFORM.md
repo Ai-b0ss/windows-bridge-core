@@ -123,3 +123,5 @@ RequestJournal keeps a committed command fingerprint before dispatch, deduplicat
 ## Detached process PID reuse prevention
 
 Detached sessions now bind both Windows PID and kernel creation FILETIME before saving and after reattaching. A recycled PID cannot be treated as the task-owned process after restart; old PID-only records fail closed, as do missing or redirected log paths. Tests run real Windows read-only process identity against the test Python PID only. See [P0_DETACHED_SESSION_IDENTITY.md](P0_DETACHED_SESSION_IDENTITY.md).
+## New-chat agent discovery via existing MCP
+Read-only `agent_workflows` RPC and `capabilities.agent_workflows` expose the core task lifecycle without requiring a standalone ChatGPT Skill; this is not a host installation or proof of automatic tool selection. [Proof and eligibility](P0_AGENT_WORKFLOW_DISCOVERY.md).

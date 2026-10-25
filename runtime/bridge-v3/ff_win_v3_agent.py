@@ -17,6 +17,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import threading
@@ -689,15 +690,41 @@ class Session:
             }
 
 
+def detached_log_path(session_id: str, saved_path: Any) -> Path | None:
+    """Validate ownership before resolving links; reject reparse points too.
+
+    This is a restore-time check, not an OS sandbox against a concurrent local
+    account rewriting files after validation.
+    """
+    if not isinstance(session_id, str) or not re.fullmatch(r"[0-9a-f]{16}", session_id):
+        return None
+    if not isinstance(saved_path, (str, Path)):
+        return None
+    expected = V3_ROOT / "state" / "detached_logs" / f"{session_id}.log"
+    try:
+        if Path(saved_path).absolute() != expected.absolute():
+            return None
+        # Do not call resolve() first: it erases the link being checked.
+        for path in (V3_ROOT, expected.parent.parent, expected.parent, expected):
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                return None
+            if path != expected and not stat.S_ISDIR(info.st_mode):
+                return None
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            return None
+        return expected
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def save_detached_session(session: Session) -> None:
     # A PID alone is not a durable identity; Windows may recycle it for a
     # different user process. Never write an unbound record.
     token = process_creation_token(session.pid)
     if token is None or session.log_path is None:
         return
-    expected_dir = (V3_ROOT / "state" / "detached_logs").resolve()
-    expected_log = expected_dir / f"{session.id}.log"
-    if expected_log.is_symlink() or session.log_path.resolve() != expected_log:
+    if detached_log_path(session.id, session.log_path) is None:
         return
     try:
         DETACHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -745,10 +772,10 @@ def recover_detached_sessions() -> dict[str, Session]:
         saved_log = info.get("log_path")
         if not isinstance(saved_log, str):
             continue
-        expected_log = (V3_ROOT / "state" / "detached_logs" / f"{sid}.log").resolve()
+        expected_log = detached_log_path(sid, saved_log)
+        if expected_log is None:
+            continue
         try:
-            if expected_log.is_symlink() or Path(saved_log).resolve() != expected_log or not expected_log.is_file():
-                continue
             created_at = int(info.get("created_at") or now_ms())
         except (OSError, ValueError, TypeError):
             continue

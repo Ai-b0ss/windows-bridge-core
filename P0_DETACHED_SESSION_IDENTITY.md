@@ -65,3 +65,33 @@ headless session persistence or owner chat permission by itself.
 Required next gates: actual safe Bridge restart acceptance in a disposable
 environment, persistent output reconciliation, independent task postconditions,
 host-attested ChatGPT grants, and new-chat skill activation.
+
+## Master-plan continuation — 25 October 2026
+
+The candidate now incorporates current Core main, preserving the separate
+lost-ACK crash and agent-workflow discovery gates. Restore rejects symlinks
+**before** path resolution, Windows reparse points (including junctions),
+hardlinked logs, missing logs, invalid session IDs and mismatched filenames.
+Querying an exited process with a retained Windows handle no longer reports
+that process as live; overflowing DWORD PIDs are rejected.
+
+`tests/integration/detached_restart_smoke.py` is the new real Windows gate:
+start an isolated current Bridge via loopback; durably launch one bounded
+PowerShell task in a temporary directory; kill only that Bridge; start another
+Bridge on the same temporary root; recover the same PID/session; repeat the
+same durable request; independently verify one file append; reconcile output
+before and after restart; release the task and remove owned resources.
+This gate must actually pass on Windows before its behavior is called verified.
+
+Local Linux regression: 111 tests, 109 passed and 2 Windows-only skips.
+Windows CI evidence is recorded in the PR after execution, never inferred from
+these portable tests.
+
+Remaining boundaries: this is a synthetic task, not AI conversation recovery,
+ChatGPT-host permission integration, or full reboot acceptance. Process-scope
+ownership for interactive input is in-memory and is not newly granted by this
+restore. Restored output replays from the beginning of its log, not a persisted
+client cursor. Checking paths does not constitute an OS sandbox against a
+concurrent same-account attacker. The legacy PID-based termination path still
+requires a separate handle-bound race review; PID birth checks alone are not
+a proof of race-free tree termination. No active user installation is changed.

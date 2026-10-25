@@ -17,7 +17,7 @@ class _FileTime(ctypes.Structure):
 
 def process_creation_token(pid: int) -> int | None:
     """Return 64-bit Windows process creation FILETIME, fail closed if unknown."""
-    if os.name!="nt" or type(pid) is not int or pid<=0:
+    if os.name!="nt" or type(pid) is not int or not 0 < pid <= 0xffffffff:
         return None
     try:
         kernel=ctypes.windll.kernel32
@@ -45,6 +45,10 @@ def process_creation_token(pid: int) -> int | None:
             user_time=_FileTime()
             if not times(handle,ctypes.byref(start),ctypes.byref(exit_time),
                          ctypes.byref(kernel_time),ctypes.byref(user_time)):
+                return None
+            # An exited process may retain a valid queryable HANDLE. Its birth
+            # identity alone does not mean that the task is still running.
+            if exit_time.high or exit_time.low:
                 return None
             token=(int(start.high)<<32)|int(start.low)
             return token if token>0 else None

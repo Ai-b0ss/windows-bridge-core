@@ -65,6 +65,20 @@ def verify_rpc(port: int,secret: str):
            "CLI_FIRST_GUARD_INACTIVE")
     checks.append("cli_first_guard")
 
+    discovery=rpc(port,secret,"agent_workflows",{},"ci-agent-workflow-bootstrap")
+    verify(discovery.get("ok") is True,"AGENT_WORKFLOWS_READ_FAILED")
+    flow=discovery.get("result") or {}
+    verify(flow.get("schema")=="ff-windows-agent-workflows-v1",
+           "AGENT_WORKFLOW_SCHEMA_INVALID")
+    verify(flow.get("manifest_is_authorization") is False
+           and flow.get("owner_chat_permission_attested") is False
+           and flow.get("task_completed") is False,
+           "AGENT_WORKFLOW_CLAIMED_UNVERIFIED_CAPABILITY")
+    verify(features.get("agent_workflows_discovery") is True
+           and (cap.get("result") or {}).get("agent_workflows")==flow,
+           "AGENT_WORKFLOW_NOT_ADVERTISED_BY_CAPABILITIES")
+    checks.append("new_chat_readonly_agent_workflow_bootstrap")
+
     task=rpc(port,secret,"computer_use",{
         "command":"task_preflight","app":"git",
         "task":"inspect the repository status without modifying files",
@@ -205,6 +219,22 @@ def verify_rpc(port: int,secret: str):
     verify(status.get("ok") is True and
            (status.get("result") or {}).get("state")=="completed",
            "DURABLE_PERSISTENT_STATUS_NOT_FOUND")
+    recovery=rpc(port,secret,"task_recovery_plan",{
+        "request_key":durable["request_key"],
+    },"ci-read-only-recovery")
+    verify(recovery.get("ok") is True,"RECOVERY_RPC_MISSING")
+    advice=recovery.get("result") or {}
+    verify(advice.get("schema")=="ff-task-recovery-decision-v1",
+           "RECOVERY_CONTRACT_SCHEMA")
+    verify(advice.get("journal_state")=="completed" and
+           advice.get("automatic_retry_allowed") is False,
+           "RECOVERY_REPLAY_MISCLASSIFIED")
+    verify(advice.get("previous_effect_independently_verified") is False,
+           "RECOVERY_FALSE_POSTCONDITION_PROOF")
+    verify(advice.get("response_contents_returned") is False and
+           "session_id" not in json.dumps(advice),
+           "RECOVERY_RETURNED_RECORDED_PRIVATE_CONTENT")
+    checks.append("trusted_journal_recovery_plan_no_replay_no_response_leak")
     modified={
         **durable,
         "args":{**durable["args"],"command":"git rev-parse HEAD"},

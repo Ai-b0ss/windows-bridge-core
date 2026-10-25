@@ -27,6 +27,19 @@ class TestReadOnlyProcessIdentity(unittest.TestCase):
         self.assertIsNone(process_creation_token(0))
         self.assertIsNone(process_creation_token(-1))
         self.assertIsNone(process_creation_token(True))
+        self.assertIsNone(process_creation_token(0x100000001))
+
+    @unittest.skipUnless(os.name=="nt","Windows-only process FILETIME API")
+    def test_exited_process_with_retained_handle_is_not_live(self):
+        import subprocess
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            child.wait(timeout=10)
+            self.assertIsNone(process_creation_token(child.pid))
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.wait(timeout=10)
 
     @unittest.skipUnless(os.name=="nt","Windows-only process FILETIME API")
     def test_real_windows_self_creation_token_stable(self):
