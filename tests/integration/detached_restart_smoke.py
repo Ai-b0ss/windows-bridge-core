@@ -105,7 +105,17 @@ def main():
             sid = started.get("session_id")
             verify(isinstance(sid, str), "NO_SESSION_ID")
             child_started = True
-            wait_file(effect)
+            try:
+                wait_file(effect)
+            except RuntimeError:
+                # This is ONLY this constant synthetic task's disposable log.
+                # No user command, host config, or live log is read.
+                log = root / "bridge-v3/state/detached_logs" / (sid + ".log")
+                diagnostic = log.read_bytes()[-4000:].decode("utf-8", errors="replace") if log.is_file() else "MISSING_TEST_LOG"
+                print(json.dumps({"owned_fixture_diagnostic": diagnostic.replace(td, "<TEST_ROOT>"),
+                                  "initial_running": started.get("running"),
+                                  "initial_exit_code": started.get("exit_code")}), file=sys.stderr)
+                raise
             state_path = root / "bridge-v3/state/detached_sessions.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
             verify(type(state[sid].get("pid_creation_token")) is int, "NO_PERSISTED_BIRTH")
