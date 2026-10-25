@@ -1,0 +1,51 @@
+name: Verified candidate package and installed RPC
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  candidate-install:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Preserve canonical checkout bytes
+        shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Build two identical candidates from pinned public assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = Join-Path $env:RUNNER_TEMP 'ff-owned-candidate'
+          New-Item -ItemType Directory -Path $base | Out-Null
+          $previous = Join-Path $base 'previous.zip'
+          Invoke-WebRequest -Uri 'https://github.com/Ai-b0ss/windows-bridge-core/releases/download/v2026.10.24-remote-beta2/Windows-Bridge-Full-Core-Remote-20261024-v2.zip' -OutFile $previous
+          python tools/build_portable_release.py --previous-release $previous --output "$base/candidate.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'CANDIDATE_BUILD_FAILED' }
+          python tools/build_portable_release.py --previous-release $previous --output "$base/repeated.zip"
+          if ($LASTEXITCODE -ne 0) { throw 'REPEAT_BUILD_FAILED' }
+          if ((Get-FileHash "$base/candidate.zip").Hash -ne (Get-FileHash "$base/repeated.zip").Hash) { throw 'NONDETERMINISTIC_CANDIDATE' }
+          Expand-Archive -LiteralPath "$base/candidate.zip" -DestinationPath "$base/package"
+      - name: Install locally without startup and verify actual embedded runtime RPC
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = Join-Path $env:RUNNER_TEMP 'ff-owned-candidate'
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$base/package/install.ps1" -NoStartup -Transport Local -InstallRoot "$base/installed"
+          if ($LASTEXITCODE -ne 0) { throw 'OWNED_CANDIDATE_INSTALL_FAILED' }
+          $head = git rev-parse HEAD
+          python tests/integration/installed_package_smoke.py --package-root "$base/package" --install-root "$base/installed" --source-commit $head --report "$base/acceptance.json"
+          if ($LASTEXITCODE -ne 0) { throw 'INSTALLED_CANDIDATE_RPC_FAILED' }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-candidate-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/ff-owned-candidate/candidate.zip
+            ${{ runner.temp }}/ff-owned-candidate/acceptance.json
+          retention-days: 7
+          if-no-files-found: error
