@@ -6,11 +6,13 @@ Does NOT clone or copy historical private Git refs or host credentials.
 from __future__ import annotations
 import argparse
 import hashlib
+import io
 import json
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tarfile
 import zipfile
 
 PREVIOUS_RELEASE_SHA = "46e43217fe6cace1f7a55c8aa00afba694fd03926c276565671a7566cee0d540"
@@ -39,6 +41,13 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def bundled_subtree_file(name: str) -> bool:
+    path = Path(name)
+    return (path.parts[0] in {"runtime", "tests"} and
+            "__pycache__" not in path.parts and
+            path.suffix.lower() not in {".pyc", ".pyd", ".exe", ".dll", ".zip"})
+
+
 def source_tree(repo: Path) -> dict[str, bytes]:
     bundle = {}
     for path in sorted(ROOT_FILES | TOOL_FILES):
@@ -54,13 +63,38 @@ def source_tree(repo: Path) -> dict[str, bytes]:
             if file.is_symlink():
                 raise ValueError("Public source file/link not allowed: " + str(file))
             if file.is_file():
-                if "__pycache__" in file.parts or file.suffix.lower() in (".pyc", ".pyd", ".exe", ".dll", ".zip"):
-                    continue
                 name = file.relative_to(repo).as_posix()
-                bundle[name] = file.read_bytes()
+                if bundled_subtree_file(name):
+                    bundle[name] = file.read_bytes()
     if "runtime/bridge-v3/ff_win_v3_main.py" not in bundle:
         raise ValueError("Core runtime entrypoint missing")
     return bundle
+
+
+def verify_source_commit(repo: Path, contents: dict[str, bytes]) -> str:
+    """Bind every packaged source byte to HEAD, including untracked/ignored files.
+
+    Compare bytes from git's object database, not status/index timestamps or
+    diff (which can trust assume-unchanged/skip-worktree flags). Pin HEAD once
+    so concurrent branch movement cannot relabel the archive.
+    """
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=True).stdout.strip()
+    raw = subprocess.run(["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
+                          "-C", str(repo), "archive", "--format=tar", head],
+                         capture_output=True, check=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(raw), mode="r:") as archive:
+        entries = {member.name: member for member in archive.getmembers()}
+        for name, entry in entries.items():
+            if entry.isfile() and bundled_subtree_file(name) and name not in contents:
+                raise ValueError("COMMITTED_SOURCE_MISSING_FROM_BUNDLE: " + name)
+        for name, actual in contents.items():
+            entry = entries.get(name)
+            if entry is None or not entry.isfile():
+                raise ValueError("BUNDLED_SOURCE_NOT_IN_COMMIT: " + name)
+            if archive.extractfile(entry).read() != actual:
+                raise ValueError("BUNDLED_SOURCE_DIFFERS_FROM_COMMIT: " + name)
+    return head
 
 
 def assemble(repo: Path, previous: Path, output: Path) -> dict:
@@ -69,6 +103,7 @@ def assemble(repo: Path, previous: Path, output: Path) -> dict:
     if not previous.is_file() or sha(previous.read_bytes()) != PREVIOUS_RELEASE_SHA:
         raise ValueError("PREVIOUS_RELEASE_SHA256_MISMATCH")
     contents = source_tree(repo)
+    head = verify_source_commit(repo, contents)
     with zipfile.ZipFile(previous) as z:
         manifest = json.loads(z.read("release-manifest.json"))
         if manifest.get("schema") != "ff-gh-release-v1":
@@ -95,12 +130,11 @@ def assemble(repo: Path, previous: Path, output: Path) -> dict:
                     matches.append(path)
     if matches:
         raise ValueError("Likely credential pattern in a bundled file (paths only): " + str(sorted(set(matches))))
-    # Source root reflects the public commit. Same bytes on a clean checkout -> same ZIP.
-    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                          capture_output=True, text=True, check=True).stdout.strip()
+    # Every bundled source byte was compared against the pinned commit above.
     manifest.update({
         "runtime_contract": "ff-full-core-remote-addon-v3",
         "public_source_commit": head,
+        "source_bytes_verified_against_commit": True,
         "files": {name: sha(data) for name, data in sorted(contents.items())},
     })
     contents["release-manifest.json"] = json.dumps(
