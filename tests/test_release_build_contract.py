@@ -1,8 +1,11 @@
 from pathlib import Path
 import sys
+import json
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"tools"))
@@ -29,6 +32,33 @@ class TestReleaseBuildContract(unittest.TestCase):
             file = self.source_repo(root)
             expected = self.git(root, "rev-parse", "HEAD").decode().strip()
             self.assertEqual(builder.verify_source_commit(root, {"source.py": file.read_bytes()}), expected)
+
+    def test_repacked_installer_identity_matches_new_source_and_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            file = self.source_repo(root)
+            expected = self.git(root, "rev-parse", "HEAD").decode().strip()
+            previous = root / "previous.zip"
+            asset = b"pinned-test-asset"
+            with zipfile.ZipFile(previous, "w") as archive:
+                archive.writestr("release-manifest.json", json.dumps({
+                    "schema": "ff-gh-release-v1", "source_commit": "old-source"}))
+                archive.writestr("assets/test.zip", asset)
+                archive.writestr("README-FIRST.md", "Previous release")
+            original = previous.read_bytes()
+            with patch.object(builder, "PREVIOUS_RELEASE_SHA", builder.sha(original)), \
+                 patch.object(builder, "ASSET_HASHES", {"assets/test.zip": builder.sha(asset)}), \
+                 patch.object(builder, "source_tree", side_effect=lambda repo: {"source.py": file.read_bytes()}):
+                first = builder.assemble(root, previous, root / "first.zip")
+                second = builder.assemble(root, previous, root / "second.zip")
+            self.assertEqual(first["sha256"], second["sha256"])
+            self.assertEqual(previous.read_bytes(), original)
+            with zipfile.ZipFile(root / "first.zip") as archive:
+                manifest = json.loads(archive.read("release-manifest.json"))
+                self.assertEqual(manifest["source_commit"], expected)
+                self.assertEqual(manifest["public_source_commit"], expected)
+                self.assertTrue(manifest["source_bytes_verified_against_commit"])
+                self.assertEqual(archive.read("assets/test.zip"), asset)
 
     def test_modified_file_refused_even_if_git_index_assumes_unchanged(self):
         with tempfile.TemporaryDirectory() as tmp:
