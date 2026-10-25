@@ -8,6 +8,7 @@ import argparse
 import hashlib
 import json
 from pathlib import Path
+import posixpath
 import re
 import zipfile
 
@@ -40,7 +41,23 @@ def contents(root: Path):
         for pattern in BLOCK:
             if re.search(pattern,raw):
                 raise ValueError("SKILL_SOURCE_PRIVATE_DATA_MATCH")
-        data[rel]=raw
+        # References to repository documents are outside both install ZIP
+        # layouts. Keep bundled links local; make repo-only links explicit.
+        current="skills/windows-bridge/"+rel
+        def link(match):
+            target=match.group(2)
+            if target.startswith(("https://","http://","#")):
+                return match.group(0)
+            normalized=posixpath.normpath(posixpath.join(posixpath.dirname(current),target))
+            if normalized.startswith("skills/windows-bridge/"):
+                bundled=normalized.removeprefix("skills/windows-bridge/")
+                if bundled not in FILENAMES:
+                    raise ValueError("SKILL_BUNDLED_REFERENCE_MISSING")
+                return match.group(0)
+            if normalized.startswith("../") or not (root/normalized).is_file():
+                raise ValueError("SKILL_REPOSITORY_REFERENCE_MISSING")
+            return match.group(1)+"https://github.com/Ai-b0ss/windows-bridge-core/blob/main/"+normalized+")"
+        data[rel]=re.sub(r"(\[[^\]]+\]\()([^\s)]+)\)",link,raw.decode()).encode()
     if not data["SKILL.md"].startswith(b"---\nname: windows-bridge\n"):
         raise ValueError("SKILL_FRONTMATTER_INVALID")
     return data
@@ -91,13 +108,66 @@ def build(root: Path,output: Path,mode: str):
             "files":len(entries),"installed_in_chatgpt":False,"remote_permission_granted":False}
 
 
+def build_existing(root: Path, original: Path, output: Path, version: str):
+    """Update a complete Codex-layout plugin without losing its registered MCP.
+
+    Original configuration is private input. Never publish this output as the
+    generic skills-only release. This function performs no host installation.
+    """
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise ValueError("PLUGIN_VERSION_INVALID")
+    if original.resolve()==output.resolve():
+        raise ValueError("PLUGIN_ORIGINAL_MUST_BE_PRESERVED")
+    with zipfile.ZipFile(original) as z:
+        members=z.infolist()
+        if len({item.filename for item in members})!=len(members):
+            raise ValueError("PLUGIN_DUPLICATE_MEMBER")
+        if sum(item.file_size for item in members)>64*1024*1024:
+            raise ValueError("PLUGIN_ORIGINAL_TOO_LARGE")
+        for item in members:
+            parts=item.filename.split("/")
+            if item.filename.startswith("/") or ".." in parts or "\\" in item.filename or ":" in item.filename or (item.external_attr>>16)&0o170000==0o120000:
+                raise ValueError("PLUGIN_UNSAFE_MEMBER")
+        data={item.filename:z.read(item) for item in members if not item.is_dir()}
+    manifest_path=".codex-plugin/plugin.json"
+    if "plugin.json" in data or manifest_path not in data or ".app.json" not in data:
+        raise ValueError("EXISTING_CODEX_APP_LAYOUT_REQUIRED")
+    meta=json.loads(data[manifest_path])
+    app=json.loads(data[".app.json"])
+    if not meta.get("name") or meta.get("apps")!="./.app.json" or not isinstance(app.get("apps"),dict) or not app["apps"]:
+        raise ValueError("EXISTING_PLUGIN_MAPPING_INVALID")
+    original_mapping=data[".app.json"]
+    original_identity=meta["name"]
+    meta["version"]=version
+    meta["skills"]="./skills/"
+    data[manifest_path]=(json.dumps(meta,ensure_ascii=False,sort_keys=True,indent=2)+"\n").encode()
+    for path,raw in contents(root).items():
+        data["skills/windows-bridge/"+path]=raw
+    digest=write_zip(output,data)
+    with zipfile.ZipFile(output) as z:
+        if z.read(".app.json")!=original_mapping or json.loads(z.read(manifest_path))["name"]!=original_identity:
+            raise ValueError("PLUGIN_IDENTITY_OR_MAPPING_CHANGED")
+    return {"mode":"existing-plugin","version":version,"sha256":digest,
+            "bytes":output.stat().st_size,"files":len(data),
+            "mcp_mapping_byte_identical":True,"identity_preserved":True,
+            "installed_in_chatgpt":False,"remote_permission_granted":False}
+
+
 def main():
     ap=argparse.ArgumentParser()
     ap.add_argument("--repo",type=Path,default=Path(__file__).resolve().parents[1])
     ap.add_argument("--output",type=Path,required=True)
-    ap.add_argument("--mode",choices=["skill","plugin"],required=True)
+    ap.add_argument("--mode",choices=["skill","plugin","existing-plugin"],required=True)
+    ap.add_argument("--original",type=Path)
+    ap.add_argument("--version")
     args=ap.parse_args()
-    print(json.dumps(build(args.repo,args.output,args.mode),sort_keys=True))
+    if args.mode=="existing-plugin":
+        if not args.original or not args.version:
+            ap.error("existing-plugin requires --original and --version")
+        result=build_existing(args.repo,args.original,args.output,args.version)
+    else:
+        result=build(args.repo,args.output,args.mode)
+    print(json.dumps(result,sort_keys=True))
 
 
 if __name__=="__main__":

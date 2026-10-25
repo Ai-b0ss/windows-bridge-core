@@ -1,11 +1,11 @@
 ---
 name: windows-bridge
-description: "Use for authorized Windows-computer tasks: connect to PC, open Cursor or Antigravity, inspect installed applications, execute a computer workflow with FF Windows Bridge. Programmatic first, hidden second, ordinary desktop last after trusted approval."
+description: "Use for authorized Windows-computer tasks: подключись к компьютеру, используй Bridge, открой Cursor, зайди в Antigravity, работай на домашнем ПК; connect to PC, inspect installed applications, execute a computer workflow with FF Windows Bridge. Programmatic first, hidden second, ordinary desktop last after trusted approval."
 ---
 
 # Windows Bridge: task-oriented computer agent skill
 
-**Status:** Source package for a future ChatGPT plugin/skill distribution. A repository copy is **not proof that this skill has been installed, automatically invoked or authorized by the ChatGPT host.** Do not claim activation from this file alone.
+**Status:** Distribution source for the Windows Bridge plugin/skill. A repository copy is **not proof that this skill has been installed, automatically invoked or authorized by the ChatGPT host.** Verify installation and activation on the actual account; do not claim activation from this file alone.
 
 ## Trigger
 
