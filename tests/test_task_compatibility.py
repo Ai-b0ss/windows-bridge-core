@@ -38,10 +38,24 @@ class TestTaskSuitability(unittest.TestCase):
         self.assertEqual(result["task_compatibility"],"requires_ui")
         self.assertFalse(result["excel_com_covers_assistant"])
 
+    def test_cli_help_only_proves_headless_flag_not_real_agent_task(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        candidate={"command":"agent","path":"owned-cli.cmd","health":"healthy"}
+        with patch("cua_task_routes.subprocess.run",return_value=SimpleNamespace(
+                returncode=0,stdout=b"Usage: Cursor agent --print --mode=ask",
+                stderr=b"")):
+            result=task_routes("Cursor","cursor.assistant",[candidate],probe=True)
+        self.assertEqual(result["task_compatibility"],"unknown")
+        self.assertIsNone(result["preferred_task_route"])
+        self.assertTrue(result["routes"][0]["cli_contract_headless_supported"])
+        self.assertFalse(result["verified_task_support"])
+
     def test_unknown_structured_capability_not_invented(self):
         result=task_routes("antigravity","antigravity.assistant",[])
         self.assertEqual(result["task_compatibility"],"unknown")
-        self.assertEqual(result["remaining_gate"],"TASK_SUPPORT_RESEARCH_REQUIRED")
+        self.assertEqual(result["remaining_gate"],"OBSERVE_APP_ASSISTANT_AND_VERIFY")
+        self.assertFalse(result["verified_task_support"])
 
 
 if __name__=="__main__":
