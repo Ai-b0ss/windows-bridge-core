@@ -1478,6 +1478,15 @@ class CuaBridgeControlPlane:
                     "require_verified": True,
                 },
             })
+        if any(name in args and type(args[name]) is not bool
+               for name in ("verify_cli_contract", "include_auth_status")):
+            raise CuaBridgeError("CLI_CONTRACT_PROBE_FLAG_INVALID")
+        contract = None
+        if args.get("verify_cli_contract") is True:
+            from cua_cli_contracts import probe_vendor_cli
+            contract = probe_vendor_cli(
+                app, include_auth_status=args.get("include_auth_status") is True
+            )
         task_compatible = candidates.get("task_compatibility")
         route = route_preflight.get("selected_route") if isinstance(route_preflight, Mapping) else None
         best_task = candidates.get("preferred_task_route")
@@ -1493,6 +1502,8 @@ class CuaBridgeControlPlane:
             "schema": "ff-cua-task-preflight-v1",
             "app": app, "task": task,
             "programmatic": candidates,
+            "cli_contract": contract,
+            "external_cli_readonly_probe_requested": contract is not None,
             "semantic_preflight": route_preflight,
             "task_compatibility": task_compatible,
             "has_programmatic_candidates": bool(cli),

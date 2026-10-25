@@ -95,3 +95,10 @@ Note that a read-only `task_preflight` request carrying `physical_input_allowed=
 6. **actual** task-scoped read-only `git status` through normal Bridge process RPC, successful `read_process_output`, independent second Git verification, tracked source SHA unchanged.
 
 `finally` terminates the owned agent PID and removes the temporary root; it has no access to operator GitHub tokens or remote transport keys. The public GitHub-hosted `windows-latest` runner now executes this acceptance alongside the unit tests on every PR and `main` push. It is a P0 proof of *one bounded free programmatic task*, not of Cursor/Antigravity/Office assistant completion, host chat consent or full fallback orchestration.
+
+
+## Bounded Cursor and Antigravity CLI contract probes
+
+`task_preflight(verify_cli_contract=true)` can now inspect exact known vendor CLI entrypoints with bounded `--version`/`--help` and optional sanitized Cursor `status`. It does **not** execute a model or approve new costs. On the tested Windows owner PC, Cursor Agent is signed in with headless print/plan flags; Antigravity `agy` 1.4.7 exposes headless/sandbox flags, while its account eligibility remains unverified. Unit checks explicitly reject a misleading `Not logged in` positive match and a false `task_compatibility=compatible` promotion from help syntax alone.
+
+Details and official documentation: [P0_VENDOR_CLI_CONTRACTS.md](P0_VENDOR_CLI_CONTRACTS.md).

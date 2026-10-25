@@ -44,3 +44,7 @@ Read [P0_AGENT_PLATFORM.md](P0_AGENT_PLATFORM.md) for verified three-way runtime
 ### P0 — Device-bound owner consent
 
 [Permission Broker design and test status](P0_PERMISSION_BROKER.md): signed approvals bind the exact device/agent/task/action/TTL, reject legacy unbound grants and provide local revocation. This is a local authorization foundation, **not** a claim that ChatGPT host-attested consent is integrated.
+
+### P0 — Inspect real Cursor/Antigravity CLI contracts
+
+[Bounded and redacted CLI capability audit](P0_VENDOR_CLI_CONTRACTS.md) is implemented in `task_preflight` as an explicit opt-in. Status/Help/version checks are **not** proof of model entitlement or agent task success.

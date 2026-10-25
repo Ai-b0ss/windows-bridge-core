@@ -10,6 +10,7 @@ import subprocess
 TASKS = {
     "excel.assistant", "excel.cells",
     "cursor.assistant", "cursor.edit_files", "cursor.open_workspace",
+    "antigravity.assistant", "antigravity.edit_files",
     "word.assistant", "powerpoint.assistant",
 }
 
@@ -68,11 +69,13 @@ def task_routes(app, task, candidates, *, probe=False, api_capabilities=()):
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                     )
                     help_text = p.stdout.decode("utf-8", errors="replace").lower()
-                    support = (
-                        "compatible" if p.returncode == 0
-                        and "cursor" in help_text and "--print" in help_text
-                        else "incompatible"
+                    # Help text proves syntax, not auth, quota, true ability
+                    # to execute the requested task, cost or postcondition.
+                    # Do not accidentally promote "--print" to "compatible".
+                    row["cli_contract_headless_supported"] = (
+                        p.returncode == 0 and "--print" in help_text
                     )
+                    support = "unknown"
                     row["task_probe_exit_code"] = p.returncode
                 except (OSError, subprocess.TimeoutExpired):
                     support = "unknown"

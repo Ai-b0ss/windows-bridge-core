@@ -78,6 +78,27 @@ def verify_rpc(port: int,secret: str):
         verify(info.get(field) is False,"TASK_PREFLIGHT_UNSAFE_"+field)
     checks.append("read_only_task_preflight")
 
+    # Optional subprocess probes run only known vendor --help/--version and
+    # Cursor's redacted status. In a clean runner, no CLI is expected.
+    for app in ("cursor","antigravity"):
+        vendor=rpc(port,secret,"computer_use",{
+            "command":"task_preflight","app":app,
+            "task":"investigate CLI contract without AI inference",
+            "verify_cli_contract":True,
+            "include_auth_status":app=="cursor",
+        },"ci-vendor-cli-contract-"+app)
+        verify(vendor.get("ok") is True,"VENDOR_READONLY_PROBE_FAILED_"+app)
+        parsed=(vendor.get("result") or {}).get("cli_contract")
+        verify(isinstance(parsed,dict) and parsed.get("schema")=="ff-cli-contract-v1",
+               "VENDOR_PROBE_SCHEMA_"+app)
+        for claim in ("model_called","paid_api_invoked","task_completed",
+                      "quota_and_pricing_verified","authenticated_task_execution_verified"):
+            verify(parsed.get(claim) is False,"VENDOR_INCORRECT_CLAIM_"+claim)
+        # No host pathname, account identity or token is ever returned.
+        verify("@" not in json.dumps(parsed),"VENDOR_PROBE_ACCOUNT_LEAK")
+        verify("AppData" not in json.dumps(parsed),"VENDOR_PROBE_PROFILE_LEAK")
+    checks.append("vendor_cli_help_auth_no_inference")
+
     unsafe=rpc(port,secret,"computer_use",{
         "command":"task_preflight","app":"cursor",
         "task":"read-only analysis","physical_input_allowed":True,
