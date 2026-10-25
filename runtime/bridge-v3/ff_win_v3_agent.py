@@ -27,6 +27,8 @@ from collections import deque
 from pathlib import Path
 from typing import Any
 
+from ff_win_process_identity import process_creation_token, process_identity_matches
+
 PROTOCOL_VERSION = 1
 HOST = "127.0.0.1"
 PORT = 39073
@@ -525,18 +527,19 @@ def is_pid_alive(pid: int) -> bool:
 
 
 class DetachedProcessStub:
-    def __init__(self, pid: int):
+    def __init__(self, pid: int, creation_token: int):
         self.pid = pid
+        self.creation_token = creation_token
         self.stdin = None
         self.stdout = None
         self.stderr = None
 
     def poll(self) -> int | None:
-        return None if is_pid_alive(self.pid) else 0
+        return None if process_identity_matches(self.pid, self.creation_token) else 0
 
     def wait(self, timeout: float | None = None) -> int:
         start = time.time()
-        while is_pid_alive(self.pid):
+        while self.poll() is None:
             if timeout and time.time() - start > timeout:
                 raise subprocess.TimeoutExpired(["detached", str(self.pid)], timeout)
             time.sleep(0.1)
@@ -687,6 +690,15 @@ class Session:
 
 
 def save_detached_session(session: Session) -> None:
+    # A PID alone is not a durable identity; Windows may recycle it for a
+    # different user process. Never write an unbound record.
+    token = process_creation_token(session.pid)
+    if token is None or session.log_path is None:
+        return
+    expected_dir = (V3_ROOT / "state" / "detached_logs").resolve()
+    expected_log = expected_dir / f"{session.id}.log"
+    if expected_log.is_symlink() or session.log_path.resolve() != expected_log:
+        return
     try:
         DETACHED_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
         current = {}
@@ -698,6 +710,7 @@ def save_detached_session(session: Session) -> None:
         current[session.id] = {
             "session_id": session.id,
             "pid": session.pid,
+            "pid_creation_token": token,
             "command": session.command,
             "cwd": session.cwd,
             "shell": session.shell,
@@ -718,24 +731,41 @@ def recover_detached_sessions() -> dict[str, Session]:
     except Exception:
         return recovered
     updated = {}
+    if not isinstance(raw, dict):
+        return recovered
     for sid, info in raw.items():
-        pid = int(info.get("pid") or 0)
-        log_p = Path(info.get("log_path")) if info.get("log_path") else None
-        if pid > 0 and is_pid_alive(pid):
-            stub = DetachedProcessStub(pid)
-            s = Session(
-                stub,
-                command=info.get("command", ""),
-                cwd=info.get("cwd", ""),
-                shell=info.get("shell", ""),
-                session_id=sid,
-                detached=True,
-                pid=pid,
-                log_path=log_p,
-                created_at=int(info.get("created_at") or now_ms()),
-            )
-            recovered[sid] = s
-            updated[sid] = info
+        if not isinstance(sid, str) or not re.fullmatch(r"[0-9a-f]{16}", sid):
+            continue
+        if not isinstance(info, dict):
+            continue
+        pid, token = info.get("pid"), info.get("pid_creation_token")
+        # No migration for legacy PID-only entries: ownership not proven.
+        if not process_identity_matches(pid, token):
+            continue
+        saved_log = info.get("log_path")
+        if not isinstance(saved_log, str):
+            continue
+        expected_log = (V3_ROOT / "state" / "detached_logs" / f"{sid}.log").resolve()
+        try:
+            if expected_log.is_symlink() or Path(saved_log).resolve() != expected_log or not expected_log.is_file():
+                continue
+            created_at = int(info.get("created_at") or now_ms())
+        except (OSError, ValueError, TypeError):
+            continue
+        stub = DetachedProcessStub(pid, token)
+        s = Session(
+            stub,
+            command=str(info.get("command") or ""),
+            cwd=str(info.get("cwd") or ""),
+            shell=str(info.get("shell") or ""),
+            session_id=sid,
+            detached=True,
+            pid=pid,
+            log_path=expected_log,
+            created_at=created_at,
+        )
+        recovered[sid] = s
+        updated[sid] = info
     try:
         atomic_write_text(DETACHED_STATE_PATH, json.dumps(updated, indent=2))
     except Exception:

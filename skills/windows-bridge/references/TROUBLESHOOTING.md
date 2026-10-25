@@ -10,3 +10,6 @@
 - Escalation: preserve exact error code and redacted route evidence, then stop with the narrowest blocker rather than inventing success.
 
 Request lifecycle: preserve the same durable `request_key` after an ambiguous response; query `request_status` on the exact same authorized device. `outcome_unknown` and `outcome_expired` are never automatic retry permission. See [Durable Recovery](../../../P0_DURABLE_TASK_RECOVERY.md).
+
+
+Detached process recovery: PID alone is NOT a valid task ownership proof. After restart, the new runtime requires persisted Windows process creation FILETIME and exact task-owned log path; legacy PID-only records do not reattach. If the process identity is unknown, inspect the external postcondition; never terminate an arbitrary current process with a recycled PID. See [Detached session identity contract](../../../P0_DETACHED_SESSION_IDENTITY.md).

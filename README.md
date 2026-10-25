@@ -52,3 +52,8 @@ Read [P0_AGENT_PLATFORM.md](P0_AGENT_PLATFORM.md) for verified three-way runtime
 ### P0 — Durable task recovery
 
 [At-most-once request admission and unknown-outcome handling](P0_DURABLE_TASK_RECOVERY.md): actual RPC duplicate suppression; isolated test-root journals; no automatic replay after lost responses. Full live-process restart still pending.
+
+
+### P0 — Detached session identity
+
+[Windows PID reuse and detached log ownership verification](P0_DETACHED_SESSION_IDENTITY.md) prevents accidentally resuming or acting on a different process after restart.
