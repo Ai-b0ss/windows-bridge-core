@@ -118,3 +118,6 @@ The existing CuaBridgeControlPlane supports opt-in verify_office_com=true for Ex
 ## Durable request recovery and isolated journals
 
 RequestJournal keeps a committed command fingerprint before dispatch, deduplicates repeated keys, rejects changed payloads and preserves tombstones. Explicit FF_BRIDGE_ROOT instances now keep their request journal in the isolated root while installed non-override deployments retain the legacy journal path. 89 local unit tests and actual durable_call RPC deduplication support this behavior; a full live process-restart acceptance test remains outstanding. [Precise recovery contract](P0_DURABLE_TASK_RECOVERY.md).
+
+## New-chat agent discovery via existing MCP
+Read-only `agent_workflows` RPC and `capabilities.agent_workflows` expose the core task lifecycle without requiring a standalone ChatGPT Skill; this is not a host installation or proof of automatic tool selection. [Proof and eligibility](P0_AGENT_WORKFLOW_DISCOVERY.md).

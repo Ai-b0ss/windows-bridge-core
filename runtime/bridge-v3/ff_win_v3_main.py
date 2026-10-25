@@ -413,6 +413,9 @@ def _install_gui_guards() -> None:
     core.OPS["gui_action_sequence"] = _gui_action_sequence
     core.OPS["computer_use"] = _computer_use
 
+    from cua_agent_workflows import agent_workflows as _agent_workflows
+    core.OPS["agent_workflows"] = lambda args: _agent_workflows()
+
     def capabilities(args: dict[str, Any]) -> dict[str, Any]:
         result = original_capabilities(args) if original_capabilities else {}
         features = result.setdefault("features", {})
@@ -430,6 +433,8 @@ def _install_gui_guards() -> None:
         features["desktop_modes"] = ["coexist", "dedicated"]
         features["dedicated_mode_requires_task_approval"] = True
         features["durable_request_outcomes"] = True
+        features["agent_workflows_discovery"] = True
+        result["agent_workflows"] = _agent_workflows()
         from cua_hidden_apps import available_apps
         features["hidden_desktop_supported_apps"] = available_apps()
         features["hidden_uia_no_focus_msaa_invoke"] = True
