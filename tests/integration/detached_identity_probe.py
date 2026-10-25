@@ -52,6 +52,11 @@ def main():
         assert sid in recovered
         assert recovered[sid].is_running()
         assert recovered[sid].poll() is None
+        # The stub must recheck birth time on EVERY poll, not only at restore.
+        from unittest.mock import patch
+        with patch("ff_win_v3_agent.process_identity_matches",return_value=False):
+            assert not recovered[sid].is_running()
+            assert recovered[sid].poll()==0
         mismatched={**record,"pid_creation_token":token+1}
         file.write_text(json.dumps({sid:mismatched}),encoding="utf-8")
         assert sid not in agent.recover_detached_sessions()
