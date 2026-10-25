@@ -12,7 +12,6 @@ def install(core, *, shell_policy="restricted", authority=None):
         raise ValueError("SHELL_POLICY_INVALID")
     # Capture local startup policy. Request args/config cannot enable this.
     trusted_shell = shell_policy == "user" or os.environ.get(TRUSTED_SHELL_OVERRIDE_ENV) == "1"
-    session_owners = {}
     def scoped_process(name, original):
         from cua_task_authority import identity, AuthorityError, guard_effect
         checked = guard_effect(core, authority, name, original)
@@ -21,11 +20,11 @@ def install(core, *, shell_policy="restricted", authority=None):
                 owner = (identity(args.get("agent_id")), identity(args.get("task_id")))
             except AuthorityError as exc:
                 raise core.RPCError(str(exc), details={"execution_started": False}) from exc
-            if name != "start_process" and session_owners.get(args.get("session_id")) != owner:
-                raise core.RPCError("PROCESS_SESSION_OUTSIDE_TASK_SCOPE", details={"execution_started": False})
+            if name != "start_process":
+                session = core.get_session(str(args.get("session_id") or ""))
+                if getattr(session, "owner_scope", None) != owner:
+                    raise core.RPCError("PROCESS_SESSION_OUTSIDE_TASK_SCOPE", details={"execution_started": False})
             result = checked(args)
-            if name == "start_process":
-                session_owners[result["session_id"]] = owner
             return result
         return call
     def guard_shell(original):
@@ -82,6 +81,24 @@ def install(core, *, shell_policy="restricted", authority=None):
                 core.OPS[name] = guard_effect(core, authority, name, core.OPS[name])
         if "force_terminate" in core.OPS:
             core.OPS["force_terminate"] = scoped_process("force_terminate", core.OPS["force_terminate"])
+        if "read_process_output" in core.OPS:
+            core.OPS["read_process_output"] = scoped_process("read_process_output", core.OPS["read_process_output"])
+        original_list = core.OPS.get("list_sessions")
+        if original_list:
+            def list_owned_sessions(args):
+                from cua_task_authority import identity, AuthorityError
+                try:
+                    owner = (identity(args.get("agent_id")), identity(args.get("task_id")))
+                except AuthorityError as exc:
+                    raise core.RPCError(str(exc), details={"execution_started": False}) from exc
+                result = original_list(args)
+                with core.STATE.lock:
+                    owned = {sid for sid, session in core.STATE.sessions.items()
+                             if getattr(session, "owner_scope", None) == owner}
+                return {**result, "sessions": [row for row in result.get("sessions", [])
+                                               if row.get("session_id") in owned],
+                        "scope": "agent_id/task_id"}
+            core.OPS["list_sessions"] = list_owned_sessions
     else:
         core.OPS["run_code"] = restricted_run_code
     core.OPS["restricted_run_code"] = restricted_run_code

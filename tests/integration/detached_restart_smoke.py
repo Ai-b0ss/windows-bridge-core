@@ -125,7 +125,21 @@ def main():
             server = None
             port = free_port()
             server, secret = start_bridge(root, port)
-            output = rpc(port, secret, "read_process_output", {"session_id": sid}, "restart-read")
+            scope = {"agent_id": "ci-restart-agent", "task_id": "ci-restart-task"}
+            for op in ("read_process_output", "interact_with_process", "force_terminate"):
+                denied = rpc(port, secret, op, {"session_id": sid, "input": "foreign",
+                             "agent_id": "ci-other-agent", "task_id": "ci-other-task"}, "foreign-" + op)
+                verify(denied.get("ok") is False and
+                       denied.get("error_code") == "PROCESS_SESSION_OUTSIDE_TASK_SCOPE",
+                       "FOREIGN_SESSION_ACCESS_" + op)
+            listed = rpc(port, secret, "list_sessions", {
+                "agent_id": "ci-other-agent", "task_id": "ci-other-task"}, "foreign-list")
+            verify(listed.get("ok") is True and not listed["result"]["sessions"], "FOREIGN_SESSION_LIST_LEAK")
+            own_list = rpc(port, secret, "list_sessions", scope, "own-list")
+            verify(own_list.get("ok") is True and
+                   any(row["session_id"] == sid for row in own_list["result"]["sessions"]),
+                   "OWN_SESSION_NOT_LISTED_AFTER_RESTART")
+            output = rpc(port, secret, "read_process_output", {"session_id": sid, **scope}, "restart-read")
             restored = output.get("result") or {}
             verify(output.get("ok") is True and restored.get("pid") == original_pid
                    and restored.get("running") is True, "SESSION_NOT_RESTORED")
@@ -142,7 +156,7 @@ def main():
             wait_file(done)
             deadline = time.monotonic() + 12
             while time.monotonic() < deadline:
-                response = rpc(port, secret, "read_process_output", {"session_id": sid}, "restart-final")
+                response = rpc(port, secret, "read_process_output", {"session_id": sid, **scope}, "restart-final")
                 result = response.get("result") or {}
                 events = "".join(x["text"] for x in result.get("events", []))
                 if not result.get("running", True) and "AFTER_RESTART" in events:
@@ -159,6 +173,9 @@ def main():
                               "real_bridge_restart": True, "same_process_restored": True,
                               "output_before_and_after_verified": True,
                               "actual_nonzero_exit_code_preserved": True,
+                              "restored_task_scope_verified": True,
+                              "foreign_read_input_terminate_denied": True,
+                              "foreign_session_list_hidden": True,
                               "durable_duplicate_one_effect": True,
                               "scope": "isolated synthetic task; no host consent or GUI proof"}))
         finally:

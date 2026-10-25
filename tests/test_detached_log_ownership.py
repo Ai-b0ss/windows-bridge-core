@@ -45,6 +45,28 @@ class TestDetachedLogOwnership(unittest.TestCase):
         self.log.unlink()
         self.assertIsNone(self.agent.detached_log_path(self.sid, self.log))
 
+    def test_task_scope_roundtrips_and_invalid_scope_never_gets_invented(self):
+        from types import SimpleNamespace
+        state = self.root / "state/detached_sessions.json"
+        owned = SimpleNamespace(id=self.sid, pid=123, log_path=self.log,
+                                command="owned", cwd="test", shell="test", created_at=1,
+                                owner_scope=("agent-a", "task-a"))
+        with patch.object(self.agent, "DETACHED_STATE_PATH", state), \
+             patch.object(self.agent, "process_creation_token", return_value=456):
+            self.agent.save_detached_session(owned)
+        raw = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual(raw[self.sid]["owner_scope"], ["agent-a", "task-a"])
+        for scope, expected in ((["agent-a", "task-a"], ("agent-a", "task-a")),
+                                (None, None), (["agent-a", "../foreign"], None)):
+            raw[self.sid]["owner_scope"] = scope
+            state.write_text(json.dumps(raw), encoding="utf-8")
+            with patch.object(self.agent, "DETACHED_STATE_PATH", state), \
+                 patch.object(self.agent, "process_identity_matches", return_value=True), \
+                 patch.object(self.agent, "DetachedProcessStub"), \
+                 patch.object(self.agent, "Session") as session:
+                self.agent.recover_detached_sessions()
+                self.assertEqual(session.call_args.kwargs["owner_scope"], expected)
+
     def make_link(self, link, target, directory=False):
         try:
             link.symlink_to(target, target_is_directory=directory)

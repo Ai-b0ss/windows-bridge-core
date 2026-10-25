@@ -576,6 +576,7 @@ class Session:
         pid: int | None = None,
         log_path: Path | None = None,
         created_at: int | None = None,
+        owner_scope: tuple[str, str] | None = None,
     ):
         self.id = session_id or uuid.uuid4().hex[:16]
         self.process = process
@@ -586,6 +587,7 @@ class Session:
         self.pid = pid or (getattr(process, "pid", 0) if process else 0)
         self.log_path = log_path
         self.created_at = created_at or now_ms()
+        self.owner_scope = owner_scope
         self.closed_at: int | None = None
         self.events: deque[dict[str, Any]] = deque()
         self.next_seq = 1
@@ -758,6 +760,7 @@ def save_detached_session(session: Session) -> None:
             "shell": session.shell,
             "log_path": str(session.log_path) if session.log_path else None,
             "created_at": session.created_at,
+            "owner_scope": list(session.owner_scope) if session.owner_scope else None,
         }
         atomic_write_text(DETACHED_STATE_PATH, json.dumps(current, indent=2))
     except Exception:
@@ -798,6 +801,10 @@ def recover_detached_sessions() -> dict[str, Session]:
             stub = DetachedProcessStub(pid, token)
         except OSError:
             continue
+        owner = info.get("owner_scope")
+        if not (isinstance(owner, list) and len(owner) == 2 and
+                all(isinstance(x, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", x) for x in owner)):
+            owner = None  # Legacy/unbound sessions never acquire caller ownership.
         s = Session(
             stub,
             command=str(info.get("command") or ""),
@@ -808,6 +815,7 @@ def recover_detached_sessions() -> dict[str, Session]:
             pid=pid,
             log_path=expected_log,
             created_at=created_at,
+            owner_scope=tuple(owner) if owner else None,
         )
         recovered[sid] = s
         updated[sid] = info
@@ -918,6 +926,13 @@ def op_set_config_value(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
+    from cua_task_authority import identity, AuthorityError
+    owner_scope = None
+    if "agent_id" in args or "task_id" in args:
+        try:
+            owner_scope = (identity(args.get("agent_id")), identity(args.get("task_id")))
+        except AuthorityError as exc:
+            raise RPCError(str(exc), details={"execution_started": False}) from exc
     command = args.get("command")
     if not isinstance(command, str) or not command.strip():
         raise RPCError("COMMAND_INVALID")
@@ -990,11 +1005,13 @@ def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
         session_id=session_id,
         detached=detached,
         log_path=log_file,
+        owner_scope=owner_scope,
     )
     with STATE.lock:
         STATE.sessions[session.id] = session
-    if detached:
-        save_detached_session(session)
+        if detached:
+            # Serialize read-modify-write of the shared detached registry.
+            save_detached_session(session)
     wait_ms = args.get("wait_ms", 250)
     if isinstance(wait_ms, int) and wait_ms > 0:
         time.sleep(min(wait_ms, 5000) / 1000.0)
