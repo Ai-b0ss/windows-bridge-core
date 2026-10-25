@@ -99,6 +99,22 @@ def verify_rpc(port: int,secret: str):
         verify("AppData" not in json.dumps(parsed),"VENDOR_PROBE_PROFILE_LEAK")
     checks.append("vendor_cli_help_auth_no_inference")
 
+    office=rpc(port,secret,"computer_use",{
+        "command":"task_preflight","app":"Excel",
+        "task":"Inspect a temporary workbook using native COM",
+        "verify_office_com":True,
+    },"ci-office-com-registry")
+    verify(office.get("ok") is True,"OFFICE_REGISTRATION_PROBE_FAILED")
+    registered=(office.get("result") or {}).get("office_com_registration")
+    verify(isinstance(registered,dict) and
+           registered.get("schema")=="ff-excel-com-discovery-v1",
+           "OFFICE_REGISTRATION_PROBE_SCHEMA")
+    for key in ("excel_process_started","user_workbook_accessed",
+                "model_called","task_completed","task_support_proven"):
+        verify(registered.get(key) is False,
+               "OFFICE_REGISTRATION_INCORRECT_TASK_PROOF_"+key)
+    checks.append("excel_com_registration_without_launch")
+
     unsafe=rpc(port,secret,"computer_use",{
         "command":"task_preflight","app":"cursor",
         "task":"read-only analysis","physical_input_allowed":True,
