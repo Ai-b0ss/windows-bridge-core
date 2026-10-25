@@ -67,21 +67,22 @@ def main():
         root = Path(td) / "agent"
         root.mkdir()
         effect, release, done = (Path(td) / name for name in ("effect.txt", "release", "done"))
-        script = Path(td) / "owned-task.ps1"
-        # Constant script; data paths travel as parameters, never source text.
-        script.write_text(
-            "param($Effect,$Release,$Done)\n"
-            "Add-Content -LiteralPath $Effect -Value 'ONCE'\n"
-            "Write-Output 'BEFORE_RESTART'\n"
-            "$timer=[Diagnostics.Stopwatch]::StartNew()\n"
+        # Inline constant scriptblock uses the ordinary supported shell route;
+        # an external .ps1 would depend on the runner's execution policy.
+        # Data paths travel as quoted parameters, never interpolated source.
+        script = (
+            "param($Effect,$Release,$Done); "
+            "$ErrorActionPreference='Stop'; "
+            "Add-Content -LiteralPath $Effect -Value 'ONCE'; "
+            "Write-Output 'BEFORE_RESTART'; "
+            "$timer=[Diagnostics.Stopwatch]::StartNew(); "
             "while (-not (Test-Path -LiteralPath $Release) -and $timer.Elapsed.TotalSeconds -lt 40) "
-            "{ Start-Sleep -Milliseconds 100 }\n"
-            "Write-Output 'AFTER_RESTART'\n"
-            "Set-Content -LiteralPath $Done -Value 'DONE'\n",
-            encoding="utf-8",
+            "{ Start-Sleep -Milliseconds 100 }; "
+            "Write-Output 'AFTER_RESTART'; "
+            "Set-Content -LiteralPath $Done -Value 'DONE'"
         )
         quote = lambda path: "'" + str(path).replace("'", "''") + "'"
-        command = "& " + " ".join(quote(p) for p in (script, effect, release, done))
+        command = "& { " + script + " } " + " ".join(quote(p) for p in (effect, release, done))
         request = {
             "request_key": "ci-detached-once",
             "op": "start_process",
@@ -150,7 +151,7 @@ def main():
         finally:
             try:
                 release.write_text("release", encoding="ascii")
-                if child_started:
+                if child_started and effect.is_file():
                     wait_file(done, seconds=45)
                     # Give the bounded owned PowerShell time to close its log.
                     time.sleep(.5)
