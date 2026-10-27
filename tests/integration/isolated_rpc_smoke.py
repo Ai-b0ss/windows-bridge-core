@@ -77,6 +77,24 @@ def verify_rpc(port: int,secret: str):
     verify(features.get("agent_workflows_discovery") is True
            and (cap.get("result") or {}).get("agent_workflows")==flow,
            "AGENT_WORKFLOW_NOT_ADVERTISED_BY_CAPABILITIES")
+    flow_steps = flow.get("flow") or []
+    research = next((x for x in flow_steps
+                     if x.get("step") == "research_missing_programmatic_interfaces"), None)
+    visible = next((x for x in flow_steps
+                    if x.get("step") == "request_explicit_chat_foreground_permission_if_needed"), None)
+    verify(isinstance(research,dict)
+           and research.get("actor") == "chatgpt_agent"
+           and research.get("required_before_visible_input") is True
+           and research.get("unavailable_web_is_route_exhaustion") is False
+           and research.get("research_performed_by_bridge") is False,
+           "MANIFEST_MISSING_REAL_EXTERNAL_RESEARCH_REQUIREMENT")
+    verify(isinstance(visible,dict)
+           and visible.get("required_even_if_owner_away") is True
+           and visible.get("owner_confirmation_channel") == "same_chat_text"
+           and visible.get("chat_text_alone_is_trusted_grant") is False
+           and visible.get("visible_input_allowed_without_host_receipt") is False,
+           "MANIFEST_MISSING_ALWAYS_ASK_SAME_CHAT_WITH_TRUSTED_BROKER")
+    checks.append("mandatory_web_research_and_explicit_in_chat_foreground_gate")
     checks.append("new_chat_readonly_agent_workflow_bootstrap")
 
     task=rpc(port,secret,"computer_use",{
@@ -91,6 +109,17 @@ def verify_rpc(port: int,secret: str):
                   "owner_authorization_verified"):
         verify(info.get(field) is False,"TASK_PREFLIGHT_UNSAFE_"+field)
     decision = info.get("orchestration") or {}
+    research_gate = decision.get("programmatic_research") or {}
+    chat_gate = decision.get("visible_permission_flow") or {}
+    verify(research_gate.get("required_before_visible_fallback") is True
+           and research_gate.get("web_research_performed") is False
+           and research_gate.get("unavailable_web_is_exhaustion") is False,
+           "REAL_PREFLIGHT_FALSE_WEB_RESEARCH_EXHAUSTION")
+    verify(chat_gate.get("explicit_chat_question_required") is True
+           and chat_gate.get("required_even_when_owner_away") is True
+           and chat_gate.get("host_attested_grant_received") is False
+           and chat_gate.get("owner_confirmation_channel") == "same_chat_text",
+           "REAL_PREFLIGHT_FALSE_CHAT_APPROVAL")
     verify(decision.get("schema") == "ff-task-orchestration-gate-v1",
            "TASK_ORCHESTRATION_GATE_MISSING")
     safety = decision.get("guards") or {}
