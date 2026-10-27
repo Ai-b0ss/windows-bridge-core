@@ -35,7 +35,7 @@ jobs:
             Write-Output ("GIT_OFFICIAL_REPARSE=" + [bool]($info.Attributes -band [IO.FileAttributes]::ReparsePoint))
           }
           @'
-i          mport os,sys
+          import os,sys
           from pathlib import Path
           sys.path.insert(0, str(Path.cwd() / 'runtime' / 'bridge-v3'))
           from cua_cli_contracts import official_git_for_windows
