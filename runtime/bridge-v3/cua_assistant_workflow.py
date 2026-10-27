@@ -7,6 +7,7 @@ import hashlib
 import difflib
 import math
 import time
+from cua_assistant_step_ledger import WorkflowLedgerError
 from pathlib import Path
 
 class AssistantError(RuntimeError):
@@ -20,8 +21,11 @@ def _unwrap(response):
     return response
 
 class AssistantWorkflow:
-    def __init__(self, dispatch):
+    def __init__(self, dispatch, *, step_ledger=None):
         self.dispatch = dispatch
+        # The installed Bridge supplies a durable ledger. Direct unit uses can
+        # inject one; no second/parallel assistant execution engine is created.
+        self.step_ledger = step_ledger
 
     def step(self, args):
         if args.get("app", "").casefold() not in {"excel", "microsoft excel", "cursor", "word", "microsoft word", "winword.exe", "powerpoint", "microsoft powerpoint", "powerpnt.exe"}:
@@ -321,11 +325,23 @@ class AssistantWorkflow:
             elif "route" in step and step["route"] not in {"APP_CDP", "native"}:
                 raise AssistantError("ASSISTANT_ROUTE_INVALID")
         panel_reply = next((step for step in plan if step.get("stage") == "read_reply" and {**args, **step}.get("route") == "APP_CDP"), None)
+        ledger = self.step_ledger
+        agent_id, task_id = args.get("agent_id"), args.get("task_id")
+        if ledger is not None:
+            try:
+                ledger.reserve(args)
+            except WorkflowLedgerError as exc:
+                raise AssistantError(exc.code, exc.details) from exc
         receipts = []
         previous_text = None
-        for step in plan:
+        for index, step in enumerate(plan):
             merged = {**args, **step}
             try:
+                # This durable record is committed BEFORE an action can send a
+                # prompt, apply edits, save a file, or alter assistant state.
+                # After a crash, a new request key cannot replay this stage.
+                if ledger is not None:
+                    ledger.before(agent_id, task_id, index, step["stage"])
                 if step["stage"] == "send" and panel_reply is not None:
                     reply_args = {**args, **panel_reply}
                     snap = self._panel_dispatch(reply_args, "panel.inspect")
@@ -334,10 +350,43 @@ class AssistantWorkflow:
                 if step["stage"] == "read_reply" and previous_text is not None:
                     merged["previous_text"] = previous_text
                     merged["prompt"] = next({**args, **entry}.get("prompt", "") for entry in plan if entry["stage"] == "set_prompt")
-                receipts.append(self.step(merged))
-            except AssistantError as exc:
-                exc.details.update({"failed_stage": step["stage"], "completed_stages": [r["stage"] for r in receipts],
-                                    "workflow_retry_safe": False if receipts else exc.details.get("retry_safe", True)})
+                receipt = self.step(merged)
+                if ledger is not None:
+                    ledger.after(agent_id, task_id, index, step["stage"], receipt)
+                receipts.append(receipt)
+            except Exception as exc:
+                # Do not return or log prompt text, selector, private path, or
+                # model response in persistence/secondary RPC error details.
+                if ledger is not None:
+                    try:
+                        ledger.unknown(agent_id, task_id)
+                    except WorkflowLedgerError:
+                        pass  # DISPATCHING remains durable; still never replay.
+                if isinstance(exc, WorkflowLedgerError):
+                    exc = AssistantError(exc.code, exc.details)
+                if isinstance(exc, AssistantError):
+                    exc.details.update({"failed_stage": step["stage"],
+                                        "completed_stages": [r["stage"] for r in receipts],
+                                        "workflow_retry_safe": False,
+                                        "durable_replay_allowed": False})
+                    raise exc
+                # A non-AssistantError can occur after the side effect; keep
+                # the durable UNKNOWN marker and surface the original error.
                 raise
-        return {"ok": True, "verified": True, "verification": receipts[-1], "steps": receipts,
-                "proof_scope": "observed-ui-and-independent-artifact"}
+        if ledger is not None:
+            try:
+                finished = ledger.finish(agent_id, task_id)
+            except WorkflowLedgerError as exc:
+                raise AssistantError(exc.code, exc.details) from exc
+        else:
+            finished = None
+        result = {"ok": True, "verified": True, "verification": receipts[-1],
+                  "steps": receipts, "proof_scope": "observed-ui-and-independent-artifact"}
+        if finished is not None:
+            result["durable_checkpoint"] = {
+                "schema": ledger.SCHEMA,
+                "state": "COMPLETED",
+                "verified_steps": finished["verified_steps"],
+                "automatic_replay_allowed": False,
+            }
+        return result

@@ -270,3 +270,57 @@ unpredictable to the model. The independently checked answer matched; the
 workspace was empty after cleanup. GitHub-hosted CI runs the deterministic
 security/unit suite, not a paid or quota-consuming model test.
 
+## Durable recovery for existing multi-stage assistant_task (27 October 2026)
+
+**Problem fixed:** the installed Bridge already had a genuine
+`AssistantWorkflow.run` able to operate an application's assistant through
+native/APP_CDP routes and verify a final artifact, but the **per-stage** record
+was transient. The outer RPC request journal can correctly refuse a replayed
+request after an ACK failure, yet cannot tell the owner which stage last passed
+and which effect may still be in flight.
+
+The existing execution path now records each `assistant_task` stage durably
+into `FF_BRIDGE_ROOT/state/assistant-checkpoints/assistant-step-checkpoints.sqlite3`:
+
+- Reserve exact stable `agent_id/task_id` *after* plan preflight but before
+  any stage begins. Atomic uniqueness survives a new RPC request key or process
+  restart. Different agent/task scopes remain separate.
+- Commit `DISPATCHING(stage/index)` **before** each existing assistant action.
+  Commit `VERIFIED(stage/index)` only after that step's existing verified
+  postcondition. After the final independently verified artifact stage, mark
+  `COMPLETED`.
+- On an error, leave `OUTCOME_UNKNOWN`. If the Bridge process is killed,
+  `DISPATCHING` survives SQLite restart; no automatic Send/Accept/Save replay.
+  A separate `computer_use(command="assistant_task_status",agent_id=...,
+  task_id=...)` RPC reports only the stage, count, state and uncertainty. It
+  does **not** issue a model request or touch the desktop.
+- Never persist prompt, reply, UI selector, window name, owner path or file
+  content to this ledger. The request fingerprint itself is stored only as a
+  SHA-256 digest. Never reveal it in status. No record is silently pruned:
+  capacity exhaustion fails closed rather than losing replay tombstones.
+
+This is a **recovery visibility/safety improvement to an existing working
+executor**, NOT newly implemented Cursor, Excel Copilot or native assistant
+functionality. It does not automatically resume an interrupted mutation:
+external postcondition reconciliation and trusted owner approval are still
+required before any new effects. The user may continue through an explicitly
+verified new task, but the same task scope cannot silently resend a prompt.
+
+Acceptance:
+- `tests/test_assistant_step_checkpoint.py`: injected fake I/O exercises
+  **the real `AssistantWorkflow.run` sequence**, durable SQLite, complete,
+  failure after a simulated Send, second request-key denial, concurrent agent
+  reservation, and absence of sensitive prompt bytes in SQLite.
+- `tests/integration/assistant_step_checkpoint_restart_smoke.py`: starts a
+  **real separate Windows Bridge**, seeds a simulated effect and a stage
+  `DISPATCHING(send)`, queries status over authenticated RPC, terminates only
+  its own Bridge, starts another process using the same isolated state root,
+  confirms identical stage and that Send cannot be replayed.
+- `tests/integration/isolated_rpc_smoke.py`: read-only status and malformed
+  request are checked through real authenticated loopback RPC.
+
+The restart smoke uses a simulated non-idempotent file append; it does **not**
+claim that a real Cursor/Antigravity chat was interrupted, nor that task-level
+reconciliation of actual external assistant state is complete. Working
+production Bridge stays untouched until an explicit safe release cutover.
+

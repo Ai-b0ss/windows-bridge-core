@@ -105,6 +105,31 @@ def verify_rpc(port: int,secret: str):
     checks.append("read_only_task_preflight")
     checks.append("task_aware_orchestration_guard")
 
+    # New real RPC recovery surface: no UI/assistant launch, no model,
+    # no arbitrary request data or authorization claims accepted.
+    checkpoint=rpc(port,secret,"computer_use",{
+        "command":"assistant_task_status",
+        "agent_id":"ci-owned-task-agent",
+        "task_id":"ci-never-created-task",
+    },"ci-assistant-task-status")
+    verify(checkpoint.get("ok") is True,"ASSISTANT_CHECKPOINT_STATUS_UNAVAILABLE")
+    recorded=checkpoint.get("result") or {}
+    verify(recorded.get("schema")=="ff-assistant-step-checkpoint-v1"
+           and recorded.get("state")=="NOT_FOUND"
+           and recorded.get("automatic_replay_allowed") is False
+           and recorded.get("retry_safe") is False,
+           "ASSISTANT_CHECKPOINT_STATUS_FALSE_REPLAY")
+    forged=rpc(port,secret,"computer_use",{
+        "command":"assistant_task_status",
+        "agent_id":"ci-owned-task-agent",
+        "task_id":"ci-never-created-task",
+        "approved":True,
+    },"ci-assistant-status-forged-grant")
+    verify(forged.get("ok") is False
+           and forged.get("error_code")=="ASSISTANT_CHECKPOINT_STATUS_SCOPE_INVALID",
+           "ASSISTANT_CHECKPOINT_STATUS_SCOPE_BYPASS")
+    checks.append("durable_assistant_task_readonly_recovery_status")
+
     # Optional subprocess probes run only known vendor --help/--version and
     # Cursor's redacted status. In a clean runner, no CLI is expected.
     for app in ("cursor","antigravity"):
