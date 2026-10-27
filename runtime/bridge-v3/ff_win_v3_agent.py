@@ -1571,11 +1571,29 @@ def op_read_audit(args: dict[str, Any]) -> dict[str, Any]:
 
 
 def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
-    older_seconds = max(int(args.get("older_than_seconds", 3600)), 0)
-    cutoff = now_ms() - older_seconds * 1000
+    # Cleanup is an effect, not merely a read: a root can exit while owned
+    # descendants remain alive. Do not let one agent's cleanup request reap
+    # another agent's completed-but-still-working subprocess tree.
+    from cua_task_authority import identity, AuthorityError
+    age = args.get("older_than_seconds", 3600)
+    if type(age) is not int or not 0 <= age <= 30 * 24 * 3600:
+        raise RPCError("CLEANUP_AGE_INVALID")
+    a_given, t_given = "agent_id" in args, "task_id" in args
+    if a_given != t_given:
+        raise RPCError("CLEANUP_SCOPE_INCOMPLETE")
+    scope = None
+    if a_given:
+        try:
+            scope = (identity(args["agent_id"]), identity(args["task_id"]))
+        except AuthorityError as exc:
+            raise RPCError("CLEANUP_SCOPE_INVALID") from exc
+    # Legacy/unscoped housekeeping is deliberately conservative: it can
+    # only retire sessions that never declared an agent/task owner.
+    cutoff = now_ms() - age * 1000
     removed = []
     verified_jobs = []
     cleanup_failed = []
+    skipped_foreign = 0
     # Snapshot first: Win32 job termination/stream teardown may block. Holding
     # STATE.lock over that operation would block unrelated agent sessions.
     with STATE.lock:
@@ -1585,6 +1603,11 @@ def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
             with STATE.lock:
                 if STATE.sessions.get(session_id) is not session:
                     continue
+            if (scope is not None and session.owner_scope != scope) or (
+                scope is None and session.owner_scope is not None
+            ):
+                skipped_foreign += 1
+                continue
             if session.poll() is None or (session.closed_at or now_ms()) > cutoff:
                 continue
             process = session.process
@@ -1616,7 +1639,9 @@ def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
         except Exception:
             pass
     return {"removed": removed, "owned_job_descendants_verified": verified_jobs,
-            "cleanup_failed": cleanup_failed}
+            "cleanup_failed": cleanup_failed,
+            "scope_enforced": scope is not None,
+            "other_task_sessions_skipped": skipped_foreign}
 
 
 OPS = {
