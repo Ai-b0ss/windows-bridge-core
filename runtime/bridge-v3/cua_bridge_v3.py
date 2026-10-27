@@ -523,8 +523,13 @@ class CuaBridgeControlPlane:
         if command == "task_execute":
             if args.get("task") == "antigravity.assistant":
                 from cua_antigravity_task import execute_headless_task, VendorTaskError
+                from ff_win_v3_agent import BRIDGE_ROOT
                 try:
-                    return execute_headless_task(args, bridge_root=self.root)
+                    # package_root/self.root is SOURCE CODE, not an owned
+                    # task workspace. Mutating it breaks installed provenance!
+                    # All scratch work belongs under the Bridge's own
+                    # per-installation state directory instead.
+                    return execute_headless_task(args, bridge_root=BRIDGE_ROOT / "state")
                 except VendorTaskError as exc:
                     raise CuaBridgeError(exc.code) from exc
             return self._task_execute(args)
