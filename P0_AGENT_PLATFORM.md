@@ -153,3 +153,50 @@ keys remain compatibility aliases, with clearer `all_installed_*` summaries.
 Source commit, package hash, installed disk files and actual running process
 remain separate evidence. Complete WB-00/public #16 acceptance still requires
 an authorized exact-device process/loaded-source check and release/deploy parity.
+
+## First complete bounded task: read-only Excel cell
+
+The installed runtime now supports **one explicit application-level real task**
+through the same canonical `CuaBridgeControlPlane`, `ControlRouter`, and Excel
+COM adapter as ordinary `computer_use.act`. It is not a generic self-driving
+agent or Copilot/AI assistant call.
+
+1. Attach an already-open, authorized Excel workbook via
+   `computer_use(command="attach",surface_kind="app",app="Excel")`; retain
+   its server-issued `surface_id`. No model call, visible launch, new workbook
+   or new paid entitlement is authorized by this step.
+2. Invoke:
+   ```json
+   {
+     "command": "task_execute", "app": "Excel", "task": "excel.cells",
+     "operation": "cell.read", "surface_id": "<registered surface>",
+     "agent_id": "your-agent-id", "task_id": "your-task-id",
+     "action_args": {"sheet": "Sheet1", "address": "A3"},
+     "expected_value": 42
+   }
+   ```
+   The server accepts only this **read-only, background-safe, COM-backed**
+   operation. It runs a real action through the existing route, checks the
+   cell against the externally specified expectation and reads it **again**
+   through COM before marking this limited task `COMPLETED`. It never calls
+   a model, changes an Excel cell, takes foreground input or grants
+   authorization via `approved=true`.
+3. Close the **owned Bridge surface** with
+   `computer_use(command="close",surface_id=<same id>)`. This releases only
+   the surface; it does not close the pre-existing user workbook or Excel.
+   The caller owns surface cleanup, not the target process.
+
+An observed cell value matching an expectation on two COM reads is **not**
+independent saved-file verification or proof of Excel Copilot operation.
+`expected_value` is intentionally mandatory: no unverified UI/CLI fallback,
+arbitrary app operation, write, or purchased model inference is allowed through
+this first task executor. Mutations will require separate durable requests,
+trusted authority where needed, and independent persisted postconditions.
+
+Evidence: `tests/integration/excel_task_com_rpc_smoke.py` runs on actual
+Windows/Excel in a separate `FF_BRIDGE_ROOT`, creates its **own hidden temporary
+Excel workbook**, performs this RPC task and checks the independently saved
+XLSX with openpyxl. It tests forged-consent denial, expected-value mismatch,
+scope cleanup, and preservation of the owned Excel instance. A clean CI machine
+without Office reports `SKIP`; it does not magically prove Excel compatibility.
+
