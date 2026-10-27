@@ -1544,9 +1544,9 @@ class CuaBridgeControlPlane:
         Uses an ALREADY ATTACHED COM handle, the canonical ControlRouter and
         its real app executor. No model, installation, worksheet mutation,
         visible input or user session cleanup. Never treats a preflight flag
-        as task permission; exact IDs and an explicit expected result required.
+        as task permission; exact IDs and two consistent fresh reads; caller may also assert an expected result.
 
-        Two independent COM observations are not independent saved-artifact
+        Two fresh COM observations are not independent saved-artifact
         evidence; the report states the narrower actual verification scope.
         """
         from cua_task_authority import identity, AuthorityError
@@ -1577,15 +1577,15 @@ class CuaBridgeControlPlane:
             address = _excel_validate_address(address, single_cell=True)
         except AppApiError as exc:
             raise CuaBridgeError(exc.code) from exc
-        if "expected_value" not in args:
-            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_REQUIRED")
-        expected = args["expected_value"]
-        if type(expected) not in (str, int, float, bool, type(None)):
-            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
-        if isinstance(expected, str) and len(expected) > 8192:
-            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
-        if type(expected) is float and not math.isfinite(expected):
-            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+        has_expectation = "expected_value" in args
+        expected = args.get("expected_value")
+        if has_expectation:
+            if type(expected) not in (str, int, float, bool, type(None)):
+                raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+            if isinstance(expected, str) and len(expected) > 8192:
+                raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+            if type(expected) is float and not math.isfinite(expected):
+                raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
 
         surface_id, surface = self._surface(args)
         handle = surface.get("app_api_handle")
@@ -1614,10 +1614,11 @@ class CuaBridgeControlPlane:
                 preflight.get("action_executed") is not False):
             raise CuaBridgeError("TASK_EXECUTE_VERIFIED_BACKGROUND_ROUTE_REQUIRED")
 
-        def equivalent(actual):
-            if type(actual) in (int, float) and type(expected) in (int, float):
-                return math.isfinite(float(actual)) and float(actual) == float(expected)
-            return type(actual) is type(expected) and actual == expected
+        def equivalent(actual, comparison):
+            if type(actual) in (int, float) and type(comparison) in (int, float):
+                return (math.isfinite(float(actual)) and math.isfinite(float(comparison))
+                        and float(actual) == float(comparison))
+            return type(actual) is type(comparison) and actual == comparison
 
         observations = []
         for _ in range(2):
@@ -1637,9 +1638,20 @@ class CuaBridgeControlPlane:
                     details={"attempted": True, "retry_safe": True},
                 )
             observed = action["value"]
-            if not equivalent(observed):
+            if type(observed) not in (str, int, float, bool, type(None)):
+                raise CuaBridgeError("TASK_EXECUTE_READBACK_UNVERIFIED",
+                                     details={"attempted": True, "retry_safe": True})
+            if isinstance(observed, str) and len(observed) > 8192:
+                raise CuaBridgeError("TASK_EXECUTE_READBACK_UNVERIFIED",
+                                     details={"attempted": True, "retry_safe": True})
+            if has_expectation and not equivalent(observed, expected):
                 raise CuaBridgeError(
                     "TASK_EXECUTE_POSTCONDITION_FAILED",
+                    details={"attempted": True, "retry_safe": True},
+                )
+            if observations and not equivalent(observed, observations[-1]):
+                raise CuaBridgeError(
+                    "TASK_EXECUTE_INCONSISTENT_LIVE_READS",
                     details={"attempted": True, "retry_safe": True},
                 )
             observations.append(observed)
@@ -1652,7 +1664,9 @@ class CuaBridgeControlPlane:
             "verified": True,
             "verification": {
                 "kind": "two_fresh_excel_com_cell_reads",
-                "postcondition_matches_expected": True,
+                "two_fresh_reads_consistent": True,
+                "user_expectation_supplied": has_expectation,
+                "postcondition_matches_expected": True if has_expectation else None,
                 "distinct_read_calls": 2,
                 "independent_saved_artifact_verified": False,
             },
