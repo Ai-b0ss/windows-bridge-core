@@ -31,6 +31,8 @@ class TestFullShadowRuntimeParity(unittest.TestCase):
         self.modules = {
             "ff_win_v3_agent.py": b"x = 1\n",
             "cua_task_routes.py": b"def route():\n    return True\n",
+            "cua_vscode_extension.cjs": b"module.exports = {};\n",
+            "cua_owner_approval_controller/sample.csproj": b"<Project />\n",
         }
         self.extra = {}
         self._write_zip()
@@ -70,7 +72,7 @@ class TestFullShadowRuntimeParity(unittest.TestCase):
         result = self.compare(observed_live_agent_sha=hashlib.sha256(self.modules["ff_win_v3_agent.py"]).hexdigest())
         self.assertTrue(result["shadow_disk_matches_candidate"])
         self.assertTrue(result["live_disk_matches_candidate"])
-        self.assertEqual(result["runtime_modules"], 2)
+        self.assertEqual(result["runtime_modules"], 4)
         self.assertTrue(result["live_reported_agent_sha_equals_candidate"])
         self.assertFalse(result["live_process_identity_independently_verified"])
         self.assertFalse(result["safe_to_replace_running_runtime"])
@@ -96,7 +98,7 @@ class TestFullShadowRuntimeParity(unittest.TestCase):
         (self.live_root / "ff_win_v3_agent.py").unlink()
         result = self.compare()
         self.assertFalse(result["live_disk_matches_candidate"])
-        self.assertFalse(result["modules"][1]["live_present"])
+        self.assertFalse(next(x for x in result["modules"] if x["module"] == "ff_win_v3_agent.py")["live_present"])
         self.assertIsNone(result["live_reported_agent_sha_equals_candidate"])
 
     def test_corrupt_candidate_bytes_are_rejected_before_live_is_read(self):
