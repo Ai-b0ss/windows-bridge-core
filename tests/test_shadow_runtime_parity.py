@@ -40,9 +40,10 @@ class TestFullShadowRuntimeParity(unittest.TestCase):
         self.shadow_root = self.shadow / "bridge-v3"
         self.source_root = self.source / "runtime" / "bridge-v3"
         for name, data in self.modules.items():
-            (self.source_root / name).write_bytes(data)
-            (self.shadow_root / name).write_bytes(data)
-            (self.live_root / name).write_bytes(data)
+            for root in (self.source_root, self.shadow_root, self.live_root):
+                target = root / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(data)
 
     def _write_zip(self):
         files = {
