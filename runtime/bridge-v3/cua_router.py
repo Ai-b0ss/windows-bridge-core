@@ -654,6 +654,13 @@ def task_orchestration_gate(
     elif selected in ROUTE_ORDER[:-1]:
         next_action = "PROBE_BACKGROUND_OPERATION_AND_POSTCONDITION"
         reason = "SEMANTIC_CAPABILITY_NOT_TASK_PROOF"
+    elif family == "git" and raw_task == "git.repository.status" and any(
+        str(row.get("command") or "").casefold() == "git"
+        and row.get("kind") == "cli_command"
+        for row in discovered if isinstance(row, Mapping)
+    ):
+        next_action = "RUN_SCOPED_GIT_TASK_EXECUTE_AND_VERIFY_STATUS"
+        reason = "GIT_FOUND_BUT_REPO_OPERATION_NOT_YET_PROVEN"
     elif discovered:
         next_action = "RESEARCH_AND_PIN_CANDIDATE_TASK_INTERFACE"
         reason = "CLI_DISCOVERY_NOT_OPERATION_PROOF"
