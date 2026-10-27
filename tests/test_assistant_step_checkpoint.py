@@ -170,6 +170,71 @@ class TestAssistantCheckpointLedger(unittest.TestCase):
                                                "app":"Cursor", "steps": []},
                                          "computer_use"))
 
+    def _seed_interrupted_final_artifact(self):
+        import hashlib
+        artifact = self.dir / "final.txt"
+        artifact.write_text("verified saved result", encoding="utf-8")
+        self.args["expected_sha256"] = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        self.args["path"] = str(artifact)
+        self.store.reserve(self.args)
+        for idx, step in enumerate(self.steps[:-1]):
+            stage = step["stage"]
+            self.store.before("agent-01", "task-01", idx, stage)
+            self.store.after("agent-01", "task-01", idx, stage,
+                             {"stage": stage, "ok": True, "verified": True})
+        self.store.before("agent-01", "task-01", len(self.steps)-1, "verify_artifact")
+        return artifact, {**self.args, "command": "assistant_task_reconcile"}
+
+    def test_interrupted_final_artifact_verification_recovers_without_send(self):
+        file, request = self._seed_interrupted_final_artifact()
+        effects = []
+        # Original AssistantWorkflow.step is used to hash real file bytes.
+        wf = AssistantWorkflow(lambda _: (_ for _ in ()).throw(
+            AssertionError("GUI or assistant side effect was invoked")),
+            step_ledger=self.store)
+        answer = wf.reconcile_final(request)
+        self.assertTrue(answer["reconciled_without_replay"])
+        self.assertTrue(answer["verified"])
+        self.assertFalse(answer["any_mutation_replayed"])
+        self.assertEqual(answer["result"]["state"], "COMPLETED")
+        self.assertEqual(self.store.status("agent-01","task-01")["verified_steps"], 6)
+        self.assertEqual(effects, [])
+        with self.assertRaises(AssistantError) as err:
+            wf.reconcile_final(request)
+        self.assertEqual(err.exception.args[0], "ASSISTANT_RECONCILE_NOT_READONLY_FINAL")
+
+    def test_mismatched_artifact_never_advances_uncertain_final(self):
+        file, request = self._seed_interrupted_final_artifact()
+        wf = AssistantWorkflow(lambda _: None, step_ledger=self.store)
+        file.write_text("different externally observed result", encoding="utf-8")
+        with self.assertRaises(AssistantError) as err:
+            wf.reconcile_final(request)
+        self.assertEqual(err.exception.args[0], "ASSISTANT_ARTIFACT_POSTCONDITION_FAILED")
+        self.assertEqual(self.store.status("agent-01","task-01")["state"], "DISPATCHING")
+
+    def test_reconcile_refuses_modified_plan_and_earlier_unknown_send(self):
+        file, request = self._seed_interrupted_final_artifact()
+        wf = AssistantWorkflow(lambda _: None, step_ledger=self.store)
+        with self.assertRaises(AssistantError) as err:
+            wf.reconcile_final({**request, "prompt": "new unapproved prompt"})
+        self.assertEqual(err.exception.args[0], "ASSISTANT_RECONCILE_PLAN_MISMATCH")
+        self.assertEqual(self.store.status("agent-01", "task-01")["state"], "DISPATCHING")
+        other = {**request, "agent_id": "another-agent"}
+        with self.assertRaises(AssistantError):
+            wf.reconcile_final(other)
+        self.assertEqual(self.store.status("agent-01", "task-01")["verified_steps"], 5)
+        with self.assertRaises(AssistantError):
+            wf.reconcile_final({**request, "command": "assistant_task"})
+        self.assertFalse(self.store.status("agent-01","task-01")["automatic_replay_allowed"])
+
+    def test_reconcile_is_readonly_exception_but_assistant_task_still_denied(self):
+        self.assertIsNone(_gui_target(None, {
+            "command": "assistant_task_reconcile", "app": "Cursor",
+        }, "computer_use"))
+        self.assertIsNotNone(_gui_target(None, {
+            "command": "assistant_task", "app": "Cursor",
+        }, "computer_use"))
+
     def test_no_auto_retry_after_any_partial_checkpoint(self):
         self.store.reserve(self.args)
         self.store.before("agent-01","task-01",0,"send")
