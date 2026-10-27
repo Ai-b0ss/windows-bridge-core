@@ -20,9 +20,10 @@ class FakeExecutorPlane(CuaBridgeControlPlane):
         self.preflight_route = "APP_API"
         self.handle = SimpleNamespace(
             executor="excel_com", app="Excel",
-            capabilities={"cell.read": {
-                "mutation": False, "background_safe": True, "desktop_exclusive": False,
-            }},
+            capabilities={
+                "cell.read": {"mutation": False, "background_safe": True, "desktop_exclusive": False},
+                "range.read": {"mutation": False, "background_safe": True, "desktop_exclusive": False},
+            },
         )
     def _surface(self, args):
         return "owned-surface", {
@@ -152,6 +153,67 @@ class TestRealReadOnlyTaskExecution(unittest.TestCase):
                 with self.assertRaises(CuaBridgeError):
                     self.execute(**{key: value})
                 self.assertFalse(self.plane.calls)
+
+    def test_range_read_unknown_values_returns_verified_matrix(self):
+        request = dict(self.args)
+        request.pop("expected_value")
+        request["operation"] = "range.read"
+        request["action_args"] = {"sheet": "Sheet1", "address": "A1:A3"}
+        self.plane.values = [[[20], [22], [42]], [[20], [22], [42]]]
+        original = self.plane._act
+        def range_read(payload):
+            result = original(payload)
+            result["action_result"]["address"] = "A1:A3"
+            return result
+        self.plane._act = range_read
+        receipt = self.plane._task_execute(request)
+        self.assertEqual(receipt["operation"], "range.read")
+        self.assertEqual(receipt["value"], [[20], [22], [42]])
+        self.assertEqual(receipt["verification"]["kind"], "two_fresh_excel_com_range_reads")
+        self.assertFalse(receipt["verification"]["user_expectation_supplied"])
+        self.assertEqual([v[0] for v in self.plane.calls], ["preflight", "act", "act"])
+
+    def test_range_read_rejects_large_reversed_and_malformed_ranges_without_effect(self):
+        for address in ("A1:AZ20", "A1:A300", "D4:A1", "A1", "A1:ZZ99999"):
+            with self.subTest(address=address):
+                self.setUp()
+                request = dict(self.args)
+                request["operation"] = "range.read"
+                request["action_args"] = {"sheet": "Sheet1", "address": address}
+                request.pop("expected_value")
+                with self.assertRaises(CuaBridgeError):
+                    self.plane._task_execute(request)
+                self.assertFalse(self.plane.calls)
+
+    def test_range_read_rejects_nested_corruption_and_inconsistent_values(self):
+        request = dict(self.args)
+        request.pop("expected_value")
+        request["operation"] = "range.read"
+        request["action_args"] = {"sheet": "Sheet1", "address": "A1:B2"}
+        original = self.plane._act
+        def range_read(payload):
+            result = original(payload)
+            result["action_result"]["address"] = "A1:B2"
+            return result
+        self.plane._act = range_read
+        self.plane.values = [
+            [[1, 2], [3, 4]],
+            [[1, 2], [3, 99]],
+        ]
+        with self.assertRaises(CuaBridgeError) as caught:
+            self.plane._task_execute(request)
+        self.assertEqual(caught.exception.code, "TASK_EXECUTE_INCONSISTENT_LIVE_READS")
+        self.setUp()
+        original = self.plane._act
+        def malformed(payload):
+            result = original(payload)
+            result["action_result"]["address"] = "A1:B2"
+            return result
+        self.plane._act = malformed
+        self.plane.values = [ [[1,2]], [[1,2]] ]
+        with self.assertRaises(CuaBridgeError) as caught:
+            self.plane._task_execute(request)
+        self.assertEqual(caught.exception.code, "TASK_EXECUTE_READBACK_UNVERIFIED")
 
     def test_semantic_fallback_is_never_silently_promoted(self):
         self.plane.handle.executor = "winapp_cli"
