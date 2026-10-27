@@ -293,6 +293,15 @@ def _gui_target(core, args: dict, op: str) -> tuple[str, str] | None:
     app = None
     if op == "computer_use":
         command = str(args.get("command") or "").casefold()
+        # The authenticated CUA dispatcher runs this exact operation as a
+        # pinned headless vendor CLI inside an owned sandbox. It is not a GUI
+        # exception or permission to launch an arbitrary app: the executor
+        # independently validates every argument, billing gate and target.
+        if (command == "task_execute"
+                and args.get("task") == "antigravity.assistant"
+                and args.get("operation") == "headless.answer"
+                and str(args.get("app") or "").casefold() in {"antigravity", "agy"}):
+            return None
         # Discovery and observation can proceed without UI manipulation.
         if command in {"discover", "observe", "status", "health", "list", "get_capabilities", "capabilities", "screenshot", "attach", "inspect", "close", "routes", "route_discover", "discover_cli", "programmatic_plan", "prepare_tool", "app_api_probe", "resolve_app", "find", "wait", "capture", "vision_capture", "vision_detect", "vision_ocr", "vision_observe", "vision_ground", "vision_find", "vision_resolve", "vision_validate", "release_physical_lease", "plan_action", "task_preflight"}:
             return None
