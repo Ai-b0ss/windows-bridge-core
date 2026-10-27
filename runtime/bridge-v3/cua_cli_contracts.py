@@ -10,6 +10,57 @@ import re
 import subprocess
 from typing import Any, Callable
 
+def official_git_for_windows() -> Path | None:
+    """Find official installed Git without executing an untrusted PATH candidate.
+
+    Exact machine-wide location + valid Authenticode signature by the Git for
+    Windows publisher are required. The version/task still need independent
+    proof; this is only executable provenance for a bounded Git operation.
+    """
+    if os.name != "nt":
+        return None
+    for key in ("ProgramW6432", "ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(key)
+        if not base:
+            continue
+        root = Path(base)
+        path = root / "Git" / "cmd" / "git.exe"
+        try:
+            if not root.is_absolute() or root.is_symlink() or not path.is_file():
+                continue
+            if any(p.is_symlink() or getattr(p, "is_junction", lambda: False)()
+                   for p in (root / "Git", root / "Git" / "cmd", path)):
+                continue
+            if root.resolve(strict=True) not in path.resolve(strict=True).parents:
+                continue
+            # Argument never comes from task input. Double single quotes for
+            # PowerShell's literal string syntax; never run via cmd or shell.
+            literal = str(path).replace("'", "''")
+            statement = ("$s = Get-AuthenticodeSignature -LiteralPath '" + literal +
+                         "'; if ($s.Status -eq 'Valid' -and " +
+                         "$s.SignerCertificate.Subject -match 'CN=Johannes Schindelin') " +
+                         "{ exit 0 } else { exit 7 }")
+            # GitHub-hosted pwsh and some user shells inherit a PSModulePath
+            # rooted in PowerShell 7. Windows PowerShell 5.1 must load its own
+            # built-in security module or signature checks fail spuriously.
+            native = Path(os.environ.get("WINDIR") or "C:/Windows")
+            windows_modules = native / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
+            environment = dict(os.environ)
+            environment["PSModulePath"] = str(windows_modules)
+            result = subprocess.run(
+                ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+                 "-Command", statement],
+                capture_output=True, timeout=12, env=environment,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                check=False,
+            )
+            if result.returncode == 0:
+                return path
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            continue
+    return None
+
+
 BANNED_PATH_CHARS='\\r\\n"%!^&|<>'
 _ALLOWED = {
     "cursor": ("cursor-agent", "agent.cmd"),
