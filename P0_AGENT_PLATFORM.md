@@ -217,3 +217,56 @@ A1:A3 (`[[20],[22],[42]]`) through authenticated isolated Bridge RPC and
 independently checks the separately saved .xlsx. The CI runner without Office
 reports an explicit SKIP rather than claiming native Excel proof.
 
+## First real headless AI task: Antigravity subscription baseline (27 Oct 2026)
+
+Unlike `task_preflight`, this operation **calls a real model**, consuming
+the user's existing Antigravity baseline quota. It is a genuine new capability
+not provided by the previous CLI inventory. The route is *strictly limited*
+to one pre-existing official `agy` executable, a pinned
+`gemini-3.8-flash-medium` model and a new ephemeral Bridge-owned workspace.
+It is not a universal Cursor/Antigravity automation framework.
+
+Use the authenticated existing `computer_use` RPC, with:
+```json
+{
+  "command": "task_execute",
+  "app": "Antigravity",
+  "task": "antigravity.assistant",
+  "operation": "headless.answer",
+  "agent_id": "agent-example",
+  "task_id": "task-example",
+  "context": "Project facts for this request only",
+  "prompt": "Answer a question using context.txt in the current workspace"
+}
+```
+An optional exact `expected_response` allows a narrow result postcondition
+to be checked. Without it, the model's answer is returned with
+`state=OUTCOME_UNKNOWN`, **not falsely certified as complete**. A successful
+vendor exit code alone does not verify semantic correctness.
+
+Payment/permission boundaries: the Bridge examines the existing local
+Antigravity settings and fails closed when `useG1Credits` is enabled or
+`modelProvider` selects an external API-key provider. It does **not** write
+the account settings, install the CLI, switch paid features on, purchase
+credits, invoke `--dangerously-skip-permissions`, or inherit raw API-key
+environment variables. It pins the model, passes an owned context only,
+closes stdin, runs with `--sandbox`, binds the subprocess and descendants to
+a real Windows Job Object, then checks the ephemeral files have not changed
+before deleting the workspace. Neither text from private CLI diagnostics nor
+account metadata is returned.
+
+These checks prevent known additional-credit fallbacks but **cannot guarantee
+the vendor's actual billing**; baseline rate-limited quota is consumed.
+The Bridge does not yet independently verify arbitrary semantic outcomes,
+account limits, external broker descendants or a hostile native-process
+escape from the vendor's sandbox. Never present the task as a paid API, an
+owner-approved GUI action, file-editing automation or universal AI agent.
+
+**Real Windows evidence:** `tests/integration/antigravity_baseline_task_smoke.py`
+is an explicitly opted-in integration test (`FF_ENABLE_AGY_FREE_BASELINE_SMOKE=1`)
+that performs the actual model call through a fresh authenticated loopback
+Bridge. It asks Antigravity to read a random, ephemeral file marker that was
+unpredictable to the model. The independently checked answer matched; the
+workspace was empty after cleanup. GitHub-hosted CI runs the deterministic
+security/unit suite, not a paid or quota-consuming model test.
+
