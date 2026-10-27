@@ -122,6 +122,50 @@ def main():
             # Ensure the durable SQLite store never retains prompt text.
             verify(b"PRIVATELY_OWNED_UNLOGGED_PROMPT" not in store.path.read_bytes(),
                    "PROMPT_LEAKED_IN_STEP_CHECKPOINTS")
+            # Second task: all assistant effects recorded VERIFIED; only
+            # final read-only artifact verification lost its ACK.
+            import hashlib
+            output_dir=Path(directory)/"task-artifacts"
+            output_dir.mkdir()
+            artifact=output_dir/"saved.txt"
+            artifact.write_text("independently persisted result\\n",encoding="utf-8")
+            expected=hashlib.sha256(artifact.read_bytes()).hexdigest()
+            task_args={
+                "command":"assistant_task","app":"Cursor",
+                "agent_id":"ci-assistant-agent",
+                "task_id":"ci-final-verification-recovery",
+                "artifact_root":str(output_dir),"path":str(artifact),
+                "expected_sha256":expected,
+                "steps":[{"stage":st,"route":"native"} for st in (
+                    "open_panel","set_prompt","send","read_reply","save","verify_artifact")],
+            }
+            store.reserve(task_args)
+            for idx, entry in enumerate(task_args["steps"][:-1]):
+                stage=entry["stage"]
+                store.before(task_args["agent_id"],task_args["task_id"],idx,stage)
+                store.after(task_args["agent_id"],task_args["task_id"],idx,stage,
+                            {"stage":stage,"ok":True,"verified":True})
+            store.before(task_args["agent_id"],task_args["task_id"],5,"verify_artifact")
+            final_rpc=rpc(second_port,secret_again,"computer_use",{
+                **task_args,"command":"assistant_task_reconcile",
+            },"ci-final-readonly-reconcile")
+            verify(final_rpc.get("ok") is True,
+                   "FINAL_ARTIFACT_RECONCILE_RPC_FAILED_"+str(final_rpc.get("error_code")))
+            final=final_rpc.get("result") or {}
+            verify(final.get("verified") is True
+                   and final.get("reconciled_without_replay") is True
+                   and final.get("any_mutation_replayed") is False
+                   and (final.get("result") or {}).get("state")=="COMPLETED",
+                   "INDEPENDENT_ARTIFACT_RECONCILE_FAILED")
+            verify(store.status("ci-assistant-agent","ci-final-verification-recovery")["state"]=="COMPLETED"
+                   and hashlib.sha256(artifact.read_bytes()).hexdigest()==expected,
+                   "RECONCILED_ARTIFACT_INVALID")
+            retry=rpc(second_port,secret_again,"computer_use",{
+                **task_args,"command":"assistant_task_reconcile",
+            },"ci-final-readonly-reconcile-duplicate")
+            verify(retry.get("ok") is False,"FINAL_RECONCILE_DUPLICATE_NOT_BLOCKED")
+            verify(sink.read_text("utf-8")=="SEND_EXECUTED_ONCE\\n",
+                   "FINAL_RECONCILE_REPLAYED_OLD_SEND")
             print(json.dumps({
                 "schema": "ff-assistant-task-step-restart-v1",
                 "all_passed": True,
@@ -131,6 +175,8 @@ def main():
                 "pending_stage": "send",
                 "auto_retry_blocked": True,
                 "simulated_effect_count": 1,
+                "independent_saved_artifact_reconciled": True,
+                "no_mutating_stage_replayed_on_final_reconciliation": True,
                 "owner_files_modified": False,
                 "model_called": False,
             }, sort_keys=True))
