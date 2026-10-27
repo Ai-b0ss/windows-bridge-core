@@ -7,6 +7,7 @@ import hashlib
 import difflib
 import math
 import time
+from cua_assistant_step_ledger import WorkflowLedgerError
 from pathlib import Path
 
 class AssistantError(RuntimeError):
@@ -327,7 +328,6 @@ class AssistantWorkflow:
         ledger = self.step_ledger
         agent_id, task_id = args.get("agent_id"), args.get("task_id")
         if ledger is not None:
-            from cua_assistant_step_ledger import WorkflowLedgerError
             try:
                 ledger.reserve(args)
             except WorkflowLedgerError as exc:
