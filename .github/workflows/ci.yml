@@ -22,6 +22,14 @@ jobs:
       - name: Real isolated Bridge RPC and read-only task acceptance
         shell: pwsh
         run: python tests/integration/isolated_rpc_smoke.py
+      - name: Real signed owner approval over isolated Windows Bridge RPC
+        shell: pwsh
+        run: |
+          # Test-only trusted RSA library; the deployable Bridge has no new dependency.
+          python -m pip install --disable-pip-version-check --only-binary=:all: cryptography==46.0.3
+          if ($LASTEXITCODE -ne 0) { throw 'TEST_CRYPTOGRAPHY_DEPENDENCY_FAILED' }
+          python tests/integration/owner_signed_approval_real_rpc_smoke.py
+          if ($LASTEXITCODE -ne 0) { throw 'REAL_OWNER_SIGNED_RPC_SMOKE_FAILED' }
       - name: Detached session PID identity with real Windows FILETIME
         shell: pwsh
         run: python tests/integration/detached_identity_probe.py
