@@ -1619,9 +1619,10 @@ class CuaBridgeControlPlane:
             raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_NOT_ALLOWED") from exc
         if not (root / ".git").exists():
             raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_ROOT_REQUIRED")
-        executable = shutil.which("git.exe" if os.name == "nt" else "git")
-        if not executable:
-            raise CuaBridgeError("TASK_EXECUTE_GIT_CLI_UNAVAILABLE")
+        from cua_cli_contracts import official_git_for_windows
+        executable = official_git_for_windows()
+        if executable is None:
+            raise CuaBridgeError("TASK_EXECUTE_TRUSTED_GIT_CLI_UNAVAILABLE")
         environment = dict(os.environ, GIT_OPTIONAL_LOCKS="0",
                            GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1",
                            GIT_PAGER="cat")
