@@ -133,5 +133,9 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print("AGI_RPC_REAL_SMOKE_FAILED:" + type(exc).__name__, file=sys.stderr)
+        code = str(exc)
+        if not (code.isascii() and 1 <= len(code) <= 128 and
+                all(ch.isupper() or ch.isdigit() or ch in "_-" for ch in code)):
+            code = type(exc).__name__
+        print("AGI_RPC_REAL_SMOKE_FAILED:" + code, file=sys.stderr)
         raise SystemExit(1)
