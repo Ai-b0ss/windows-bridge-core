@@ -324,3 +324,44 @@ claim that a real Cursor/Antigravity chat was interrupted, nor that task-level
 reconciliation of actual external assistant state is complete. Working
 production Bridge stays untouched until an explicit safe release cutover.
 
+## Read-only final artifact recovery after lost assistant ACK
+
+Once the original `assistant_task` has durably verified **every mutation**
+including `save`, the process may crash before the *final read-only* artifact
+verification completes. The owner/agent can now use:
+
+```json
+{
+  "command": "assistant_task_reconcile",
+  "agent_id": "original-agent-id",
+  "task_id": "original-task-id",
+  "app": "Cursor",
+  "steps": ["the exact original full structured step objects"],
+  "path": "original task-owned artifact path",
+  "artifact_root": "original approved artifact root",
+  "expected_sha256": "original expected artifact digest"
+}
+```
+
+All original fields/steps must be supplied **identically** except the command
+name. This is a contract sketch; the real `steps` payload is the original
+structured stage list, not a string. The Bridge checks the original request
+SHA-256 against its durable checkpoint and accepts reconciliation **only**
+when the saved workflow had already verified every preceding step, last
+verified stage `save`, and the pending stage is exactly `verify_artifact`.
+It invokes the **existing** `AssistantWorkflow.step(verify_artifact)`, which
+performs independent file SHA/Office artifact verification with path scope and
+symlink/junction checks. It never opens an assistant, sends a message,
+types, applies edits or saves a file. Wrong digest, altered plan or still
+uncertain Send is denied. Successful validation commits `COMPLETED`
+atomically and returns `reconciled_without_replay=true`.
+
+The stage-specific status remains read-only under
+`computer_use(command="assistant_task_status",agent_id=...,task_id=...)`.
+This is **not general automatic recovery**: an ambiguous Send/Accept/Save
+remains blocked pending application-specific independent effect
+reconciliation. The installed Windows acceptance verifies an actual separate
+Bridge restart, then a real authenticated reconciliation RPC against a
+*simulated already-saved workflow* and a genuinely persisted owned file.
+Do not claim this test sent a real Cursor model prompt.
+
