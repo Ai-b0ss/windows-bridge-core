@@ -94,7 +94,8 @@ def main(argv=None):
               "loaded_agent_sha256": expected_agent, "owned_child_pid_matched": True,
               "owned_runtime_stopped": process.poll() is not None, "checks": checks,
               "live_user_installation_modified": False, "model_called": False,
-              "scope": "isolated GitHub-hosted Windows; not standard-user/reboot/full master acceptance"}
+              "scope": "isolated nonproduction candidate; not reboot/full master acceptance",
+              "test_host_environment_attested": False}
     opts.report.write_text(json.dumps(report, sort_keys=True, indent=2), encoding="utf-8")
     print(json.dumps(report, sort_keys=True))
     return 0
