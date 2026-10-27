@@ -16,6 +16,22 @@ jobs:
       - name: Python sources compile
         shell: pwsh
         run: python -m compileall -q runtime
+      - name: Diagnose Git for Windows signer on clean hosted runner
+        shell: pwsh
+        run: |
+          $git = Get-Command git.exe -ErrorAction SilentlyContinue
+          if ($git) {
+            Write-Output ("GIT_PATH_KIND=" + $(if ($git.Source -like "$env:ProgramFiles\\Git\\*") { "PROGRAM_FILES_GIT" } else { "OTHER" }))
+            $signature = Get-AuthenticodeSignature -LiteralPath $git.Source
+            Write-Output ("GIT_SIGN_STATUS=" + $signature.Status)
+            Write-Output ("GIT_SIGNER=" + $signature.SignerCertificate.Subject)
+          }
+          $official = Join-Path $env:ProgramFiles 'Git\\cmd\\git.exe'
+          if (Test-Path -LiteralPath $official) {
+            $signed = Get-AuthenticodeSignature -LiteralPath $official
+            Write-Output ("GIT_OFFICIAL_STATUS=" + $signed.Status)
+            Write-Output ("GIT_OFFICIAL_SIGNER=" + $signed.SignerCertificate.Subject)
+          }
       - name: Pairing permission and consent regression
         shell: pwsh
         run: python -m unittest discover -s tests -v
