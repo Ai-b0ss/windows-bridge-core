@@ -520,6 +520,8 @@ class CuaBridgeControlPlane:
                 raise CuaBridgeError(exc.code) from exc
         if command == "task_preflight":
             return self._task_preflight(args)
+        if command == "task_execute":
+            return self._task_execute(args)
         if command == "plan_action":
             # Uses the existing surface registry and route adapters, not a
             # second parallel router. Planning never performs adapter.act().
@@ -1534,6 +1536,132 @@ class CuaBridgeControlPlane:
             "billing_or_purchase_executed": False,
             "tools_installed": False,
             "next_step": step,
+        }
+
+    def _task_execute(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """First bounded real task: a read-only Excel cell with fresh readback.
+
+        Uses an ALREADY ATTACHED COM handle, the canonical ControlRouter and
+        its real app executor. No model, installation, worksheet mutation,
+        visible input or user session cleanup. Never treats a preflight flag
+        as task permission; exact IDs and an explicit expected result required.
+
+        Two independent COM observations are not independent saved-artifact
+        evidence; the report states the narrower actual verification scope.
+        """
+        from cua_task_authority import identity, AuthorityError
+        from cua_app_api import _excel_validate_address, AppApiError
+        import math
+        allowed = {
+            "command", "app", "task", "agent_id", "task_id",
+            "surface_id", "operation", "action_args", "expected_value",
+        }
+        if set(args) - allowed:
+            raise CuaBridgeError("TASK_EXECUTE_ARGUMENT_UNSUPPORTED")
+        try:
+            agent = identity(args.get("agent_id"))
+            task_id = identity(args.get("task_id"))
+        except AuthorityError as exc:
+            raise CuaBridgeError("TASK_EXECUTE_OWNER_SCOPE_REQUIRED") from exc
+        if str(args.get("app") or "").strip().casefold() not in {"excel", "microsoft excel", "excel.exe"}:
+            raise CuaBridgeError("TASK_EXECUTE_APP_UNSUPPORTED")
+        if args.get("task") != "excel.cells" or args.get("operation") != "cell.read":
+            raise CuaBridgeError("TASK_EXECUTE_OPERATION_NOT_SUPPORTED")
+        raw_args = args.get("action_args")
+        if not isinstance(raw_args, Mapping) or set(raw_args) != {"sheet", "address"}:
+            raise CuaBridgeError("TASK_EXECUTE_CELL_SCOPE_REQUIRED")
+        sheet, address = raw_args.get("sheet"), raw_args.get("address")
+        if not isinstance(sheet, str) or not sheet.strip() or len(sheet) > 31:
+            raise CuaBridgeError("TASK_EXECUTE_SHEET_INVALID")
+        try:
+            address = _excel_validate_address(address, single_cell=True)
+        except AppApiError as exc:
+            raise CuaBridgeError(exc.code) from exc
+        if "expected_value" not in args:
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_REQUIRED")
+        expected = args["expected_value"]
+        if type(expected) not in (str, int, float, bool, type(None)):
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+        if isinstance(expected, str) and len(expected) > 8192:
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+        if type(expected) is float and not math.isfinite(expected):
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+
+        surface_id, surface = self._surface(args)
+        handle = surface.get("app_api_handle")
+        if (surface.get("kind") != "app" or
+                getattr(handle, "executor", None) not in {"excel_com", "excel_powershell_com"} or
+                str(getattr(handle, "app", "") or "").casefold() not in
+                {"excel", "microsoft excel", "excel.exe"}):
+            raise CuaBridgeError("TASK_EXECUTE_EXCEL_COM_SURFACE_REQUIRED")
+        capability = getattr(handle, "capabilities", {}).get("cell.read")
+        if (not isinstance(capability, Mapping) or
+                capability.get("mutation") is not False or
+                capability.get("background_safe") is not True or
+                capability.get("desktop_exclusive") is not False):
+            raise CuaBridgeError("TASK_EXECUTE_READONLY_CAPABILITY_UNVERIFIED")
+        safe_policy = {
+            "background_required": True, "foreground_allowed": False,
+            "physical_input_allowed": False, "require_verified": True,
+        }
+        request = {
+            "surface_id": surface_id, "operation": "cell.read",
+            "action_args": {"sheet": sheet, "address": address},
+            "policy": safe_policy,
+        }
+        preflight = self.dispatch({"command": "plan_action", **request})
+        if (preflight.get("selected_route") != "APP_API" or
+                preflight.get("action_executed") is not False):
+            raise CuaBridgeError("TASK_EXECUTE_VERIFIED_BACKGROUND_ROUTE_REQUIRED")
+
+        def equivalent(actual):
+            if type(actual) in (int, float) and type(expected) in (int, float):
+                return math.isfinite(float(actual)) and float(actual) == float(expected)
+            return type(actual) is type(expected) and actual == expected
+
+        observations = []
+        for _ in range(2):
+            receipt = self._act(request)
+            action = receipt.get("action_result")
+            if (receipt.get("route") != "APP_API" or
+                    receipt.get("verified") is not True or
+                    receipt.get("physical_input_used") is not False or
+                    not isinstance(action, Mapping) or
+                    action.get("app_api_executor") != handle.executor or
+                    action.get("sheet") != sheet or
+                    str(action.get("address") or "").replace("$", "").upper() !=
+                    address.replace("$", "").upper() or
+                    "value" not in action):
+                raise CuaBridgeError(
+                    "TASK_EXECUTE_READBACK_UNVERIFIED",
+                    details={"attempted": True, "retry_safe": True},
+                )
+            observed = action["value"]
+            if not equivalent(observed):
+                raise CuaBridgeError(
+                    "TASK_EXECUTE_POSTCONDITION_FAILED",
+                    details={"attempted": True, "retry_safe": True},
+                )
+            observations.append(observed)
+        return {
+            "schema": "ff-task-execution-v1",
+            "ok": True, "state": "COMPLETED", "task": "excel.cells",
+            "agent_id": agent, "task_id": task_id, "route": "APP_API",
+            "operation": "cell.read",
+            "value": observations[-1],
+            "verified": True,
+            "verification": {
+                "kind": "two_fresh_excel_com_cell_reads",
+                "postcondition_matches_expected": True,
+                "distinct_read_calls": 2,
+                "independent_saved_artifact_verified": False,
+            },
+            "execution": {
+                "foreground_used": False, "model_called": False,
+                "paid_inference_used": False, "file_or_workbook_mutated": False,
+            },
+            "cleanup": "no_task_resources_created; existing_workbook_preserved",
+            "durable_mutation_journal_required": False,
         }
 
     def _act(self, args: Mapping[str, Any]) -> dict[str, Any]:
