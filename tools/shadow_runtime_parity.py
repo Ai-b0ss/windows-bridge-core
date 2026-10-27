@@ -20,7 +20,7 @@ import zipfile
 MAX_MODULE_BYTES = 8 * 1024 * 1024
 MAX_FILES = 400
 MAX_TOTAL_BYTES = 120 * 1024 * 1024
-PUBLIC_SUFFIXES = frozenset({".py", ".ps1", ".cmd", ".cs", ".js", ".mjs", ".json", ".md", ".txt"})
+PUBLIC_SUFFIXES = frozenset({".py", ".ps1", ".cmd", ".cs", ".csproj", ".js", ".cjs", ".mjs", ".json", ".md", ".txt"})
 PREFIX = ("runtime", "bridge-v3")
 
 
