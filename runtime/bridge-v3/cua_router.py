@@ -680,6 +680,40 @@ def task_orchestration_gate(
         "route_exhaustion_proven": route_exhaustion_proven,
         "background_routes_exhausted": False,
         "visible_last_resort_eligible": False,
+        # Preflight does not browse the internet: that research belongs to
+        # the ChatGPT agent with real web tools. The server MUST report the
+        # missing independent research gate instead of treating zero local
+        # matches as permission to grab the user's desktop.
+        "programmatic_research": {
+            "required_before_visible_fallback": True,
+            "web_research_performed": False,
+            "official_documentation_checked": False,
+            "maintained_oss_alternatives_checked": False,
+            "app_version_and_task_operation_verified": False,
+            "installable_missing_tool_evaluated": False,
+            "installation_if_needed_completed": False,
+            "source_license_cost_entitlement_checked": False,
+            "relevant_hidden_routes_probed": False,
+            "exhaustion_evidence_attested": False,
+            "research_actor": "chatgpt_agent_with_web_tools",
+            "unavailable_web_is_exhaustion": False,
+            "interface_families": [
+                "official_cli", "official_api_sdk", "mcp", "powershell_cmd",
+                "com_ipc", "browser_cdp_playwright", "maintained_open_source",
+                "native_uia_win32", "owned_hidden_desktop",
+            ],
+        },
+        "visible_permission_flow": {
+            "explicit_chat_question_required": True,
+            "required_even_when_owner_away": True,
+            "initial_work_request_is_foreground_consent": False,
+            "owner_confirmation_channel": "same_chat_text",
+            "owner_confirmation_received": False,
+            "host_attested_grant_received": False,
+            "repeated_prompt_for_valid_same_task_grant_required": False,
+            "manual_key_or_email_required": False,
+            "foreground_action_allowed": False,
+        },
         "owner_chat_grant_attested": False,
         "cost_policy": {
             "zero_new_spend": True,
@@ -702,5 +736,7 @@ def task_orchestration_gate(
             "MODEL_TARIFF_OR_NO_NEW_SPEND_PROOF" if assistant_task else "OPERATION_SAFETY_AND_COST",
             "INDEPENDENT_EXTERNAL_POSTCONDITION",
             "SCOPED_RESOURCE_OWNERSHIP_AND_CLEANUP",
+            "WEB_RESEARCH_OFFICIAL_AND_OSS_BEFORE_VISIBLE_FALLBACK",
+            "CHAT_QUESTION_AND_TRUSTED_GRANT_BEFORE_FIRST_VISIBLE_INPUT",
         ],
     }
