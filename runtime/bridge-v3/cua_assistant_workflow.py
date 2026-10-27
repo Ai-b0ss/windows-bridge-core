@@ -273,6 +273,33 @@ class AssistantWorkflow:
         if stage == "set_prompt": payload["text"] = args["prompt"]
         return {**self._panel_dispatch(args, intent, action_args=payload), "stage": stage}
 
+    def reconcile_final(self, args):
+        """Only repeat the independent *read-only* final artifact verification.
+
+        Never reopen the panel, type, send, accept edits or save again. The
+        durable ledger must prove every preceding operation already reached
+        a VERIFIED checkpoint, and that the exact originally reserved plan
+        is still being reconciled after a lost reply.
+        """
+        ledger = self.step_ledger
+        if ledger is None:
+            raise AssistantError("ASSISTANT_RECONCILE_LEDGER_REQUIRED")
+        try:
+            ledger.require_final_readonly_reconcile(args)
+            final = {**args, **args["steps"][-1]}
+            # Its stage comes from the exact fingerprinted stored plan.
+            receipt = self.step(final)
+            result = ledger.finalize_verified_reconciliation(args, receipt)
+        except WorkflowLedgerError as exc:
+            raise AssistantError(exc.code, exc.details) from exc
+        return {
+            "ok": True, "verified": True,
+            "stage": "verify_artifact", "reconciled_without_replay": True,
+            "result": result,
+            "verification": receipt,
+            "any_mutation_replayed": False,
+        }
+
     def run(self, args):
         """Explicit sequence, stopping on the first uncertain/unverified effect.
 
