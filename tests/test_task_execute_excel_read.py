@@ -68,6 +68,11 @@ class TestRealReadOnlyTaskExecution(unittest.TestCase):
         self.assertEqual(receipt["state"], "COMPLETED")
         self.assertEqual(receipt["value"], 42.0)
         self.assertTrue(receipt["verified"])
+        self.assertEqual(receipt["orchestration"]["gate_schema"], "ff-task-orchestration-gate-v1")
+        self.assertEqual(receipt["orchestration"]["selected_next_probe"],
+                         "PROBE_BACKGROUND_OPERATION_AND_POSTCONDITION")
+        self.assertFalse(receipt["orchestration"]["visible_last_resort_used"])
+        self.assertEqual(receipt["orchestration"]["actual_stages"][-1], "COMPLETED")
         self.assertEqual(receipt["verification"]["distinct_read_calls"], 2)
         self.assertFalse(receipt["verification"]["independent_saved_artifact_verified"])
         self.assertFalse(receipt["execution"]["model_called"])
