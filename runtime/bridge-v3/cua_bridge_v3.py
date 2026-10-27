@@ -1549,6 +1549,144 @@ class CuaBridgeControlPlane:
             "next_step": step,
         }
 
+    def _task_execute_git_status(self, args: Mapping[str, Any]) -> dict[str, Any]:
+        """Real bounded background Git CLI task with two fresh status observations.
+
+        Git is a no-inference, no-foreground programmatic route. This only
+        reads one exact repository root; it does NOT run arbitrary agent
+        commands, modify tracked files or claim general app automation.
+        """
+        from cua_task_authority import identity, AuthorityError
+        from pathlib import Path
+        import os
+        import shutil
+        import subprocess
+
+        allowed = {
+            "command", "app", "task", "agent_id", "task_id",
+            "operation", "action_args", "expected_clean",
+        }
+        if set(args) - allowed:
+            raise CuaBridgeError("TASK_EXECUTE_ARGUMENT_UNSUPPORTED")
+        try:
+            agent = identity(args.get("agent_id"))
+            task_id = identity(args.get("task_id"))
+        except AuthorityError as exc:
+            raise CuaBridgeError("TASK_EXECUTE_OWNER_SCOPE_REQUIRED") from exc
+        if str(args.get("app") or "").strip().casefold() not in {"git", "git.exe"}:
+            raise CuaBridgeError("TASK_EXECUTE_APP_UNSUPPORTED")
+        if args.get("task") != "git.repository.status" or args.get("operation") != "status.read":
+            raise CuaBridgeError("TASK_EXECUTE_OPERATION_NOT_SUPPORTED")
+        if "expected_clean" in args and type(args["expected_clean"]) is not bool:
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+        action = args.get("action_args")
+        if not isinstance(action, Mapping) or set(action) != {"repo_path"}:
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_SCOPE_REQUIRED")
+        raw_path = action.get("repo_path")
+        if (not isinstance(raw_path, str) or not 1 <= len(raw_path) <= 1024
+                or any(ord(c) < 32 for c in raw_path)):
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_SCOPE_REQUIRED")
+        target = Path(raw_path)
+        if not target.is_absolute() or not target.is_dir():
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_NOT_FOUND")
+        try:
+            root = target.resolve(strict=True)
+        except OSError as exc:
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_NOT_FOUND") from exc
+        # Keep the same filesystem restrictions already enforced by FF Bridge.
+        from ff_win_v3_agent import enforce_allowed, RPCError
+        try:
+            enforce_allowed(root)
+        except RPCError as exc:
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_NOT_ALLOWED") from exc
+        if not (root / ".git").exists():
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_ROOT_REQUIRED")
+        executable = shutil.which("git.exe" if os.name == "nt" else "git")
+        if not executable:
+            raise CuaBridgeError("TASK_EXECUTE_GIT_CLI_UNAVAILABLE")
+        environment = dict(os.environ, GIT_OPTIONAL_LOCKS="0",
+                           GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1",
+                           GIT_PAGER="cat")
+        common = [
+            executable, "--no-optional-locks",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            "-c", "submodule.recurse=false",
+            "-C", str(root),
+        ]
+
+        def checked_git(arguments: list[str]) -> str:
+            try:
+                completed = subprocess.run(
+                    [*common, *arguments], cwd=str(root), env=environment,
+                    capture_output=True, timeout=15, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise CuaBridgeError("TASK_EXECUTE_GIT_TIMEOUT",
+                                     details={"attempted": True, "retry_safe": True}) from exc
+            except OSError as exc:
+                raise CuaBridgeError("TASK_EXECUTE_GIT_FAILED",
+                                     details={"attempted": False, "retry_safe": True}) from exc
+            if completed.returncode != 0:
+                raise CuaBridgeError("TASK_EXECUTE_GIT_FAILED",
+                                     details={"attempted": True, "retry_safe": True})
+            if len(completed.stdout) > 65536:
+                raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_TOO_LARGE")
+            try:
+                return completed.stdout.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise CuaBridgeError("TASK_EXECUTE_GIT_ENCODING_UNSUPPORTED") from exc
+
+        # A nested directory or a Git worktree pointing to a different root
+        # cannot be accepted as an implicitly expanded task scope.
+        observed_root = checked_git(["rev-parse", "--show-toplevel"]).strip()
+        if os.path.normcase(str(Path(observed_root).resolve())) != os.path.normcase(str(root)):
+            raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_ROOT_MISMATCH")
+        command = ["status", "--porcelain=v1", "--untracked-files=normal"]
+        first = checked_git(command)
+        second = checked_git(command)
+        if first != second:
+            raise CuaBridgeError(
+                "TASK_EXECUTE_INCONSISTENT_LIVE_READS",
+                details={"attempted": True, "retry_safe": True},
+            )
+        rows = second.splitlines()
+        if len(rows) > 200 or any(len(line) > 2048 for line in rows):
+            raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_TOO_LARGE")
+        clean = not bool(rows)
+        if "expected_clean" in args and args["expected_clean"] != clean:
+            raise CuaBridgeError(
+                "TASK_EXECUTE_POSTCONDITION_FAILED",
+                details={"attempted": True, "retry_safe": True},
+            )
+        return {
+            "schema": "ff-task-execution-v1", "ok": True,
+            "state": "COMPLETED", "task": "git.repository.status",
+            "agent_id": agent, "task_id": task_id, "route": "OFFICIAL_GIT_CLI",
+            "operation": "status.read", "status_lines": rows, "clean": clean,
+            "verified": True,
+            "orchestration": {
+                "selected_route": "OFFICIAL_GIT_CLI",
+                "actual_stages": ["PROBING", "EXECUTING", "VERIFYING", "COMPLETED"],
+                "visible_last_resort_used": False,
+            },
+            "verification": {
+                "kind": "two_fresh_real_git_cli_status_reads",
+                "exact_repo_root_verified": True,
+                "two_fresh_reads_consistent": True,
+                "user_expectation_supplied": "expected_clean" in args,
+                "independent_saved_artifact_verified": False,
+                "no_optional_git_index_lock": True,
+            },
+            "execution": {
+                "foreground_used": False, "model_called": False,
+                "paid_inference_used": False, "repo_mutated_by_task": False,
+            },
+            "cleanup": "no_task_owned_process_or_file_persisted",
+            "durable_mutation_journal_required": False,
+        }
+
     def _task_execute(self, args: Mapping[str, Any]) -> dict[str, Any]:
         """First bounded real task: a bounded Excel cell or range read with fresh readback.
 
@@ -1560,6 +1698,8 @@ class CuaBridgeControlPlane:
         Two fresh COM observations are not independent saved-artifact
         evidence; the report states the narrower actual verification scope.
         """
+        if str(args.get("app") or "").strip().casefold() in {"git", "git.exe"}:
+            return self._task_execute_git_status(args)
         from cua_task_authority import identity, AuthorityError
         from cua_app_api import _excel_validate_address, _excel_cell_parts, AppApiError
         import math
