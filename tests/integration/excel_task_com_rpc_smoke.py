@@ -30,9 +30,25 @@ def wait_until(fn, code, seconds=14):
 
 def main():
     verify(os.name == "nt", "WINDOWS_REQUIRED")
-    import pythoncom
-    import win32com.client
-    import win32process
+    try:
+        import pythoncom
+        import win32com.client
+        import win32process
+        from openpyxl import load_workbook
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"pythoncom", "win32com", "win32process", "openpyxl"}:
+            raise
+        print(json.dumps({"schema": "ff-excel-task-com-rpc-v1", "status": "SKIP",
+                          "reason": "required_test_dependency_missing"}))
+        return 0
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Excel.Application\\CLSID"):
+            pass
+    except FileNotFoundError:
+        print(json.dumps({"schema": "ff-excel-task-com-rpc-v1", "status": "SKIP",
+                          "reason": "Excel_COM_not_installed"}))
+        return 0
     from ff_win_process_identity import ProcessReference, process_creation_token
 
     existing = subprocess.run(
@@ -128,7 +144,6 @@ def main():
 
             # The external artifact is checked independently from the Bridge
             # using the actual saved workbook ZIP, not the assistant's claim.
-            from openpyxl import load_workbook
             independent = load_workbook(workbook_path, data_only=True, read_only=True)
             try:
                 verify(independent[sheet_name]["A3"].value == 42,
@@ -140,6 +155,31 @@ def main():
             verify(float(worksheet.Range("A3").Value2) == 42,
                    "EXCEL_TASK_OWNER_WORKBOOK_CHANGED")
             verify(child.poll() is None, "EXCEL_TASK_OWNER_INSTANCE_TERMINATED")
+            rejected = rpc(port, secret, "computer_use", {
+                "command": "task_execute", "app": "Excel", "task": "excel.cells",
+                "operation": "cell.read", "agent_id": "ci-excel-agent",
+                "task_id": "ci-cell-read", "surface_id": surface_id,
+                "action_args": {"sheet": sheet_name, "address": "A3"},
+                "expected_value": 43,
+            }, "ci-excel-task-expected-mismatch")
+            verify(rejected.get("ok") is False and
+                   rejected.get("error_code") == "TASK_EXECUTE_POSTCONDITION_FAILED",
+                   "EXCEL_TASK_MISMATCH_NOT_REJECTED")
+            forged = rpc(port, secret, "computer_use", {
+                "command": "task_execute", "app": "Excel", "task": "excel.cells",
+                "operation": "cell.read", "agent_id": "ci-excel-agent",
+                "task_id": "ci-cell-read", "surface_id": surface_id,
+                "action_args": {"sheet": sheet_name, "address": "A3"},
+                "expected_value": 42, "approved": True,
+            }, "ci-excel-task-forged-consent")
+            verify(forged.get("ok") is False and
+                   forged.get("error_code") == "TASK_EXECUTE_ARGUMENT_UNSUPPORTED",
+                   "EXCEL_TASK_FORGED_CONSENT_NOT_REJECTED")
+            closed = rpc(port, secret, "computer_use", {
+                "command": "close", "surface_id": surface_id,
+            }, "ci-excel-task-release-owned-surface")
+            verify(closed.get("ok") is True, "EXCEL_TASK_SURFACE_CLEANUP_FAILED")
+            verify(child.poll() is None, "EXCEL_OWNER_INSTANCE_CLOSED_BY_SURFACE_CLEANUP")
             print(json.dumps({
                 "schema": "ff-excel-task-com-rpc-v1", "status": "PASS",
                 "task_execution_via_real_rpc": True,
@@ -147,6 +187,8 @@ def main():
                 "independent_saved_xlsx_check": True,
                 "two_fresh_value_observations": True,
                 "task_left_owner_workbook_open": True,
+                "task_surface_released_without_closing_excel": True,
+                "postcondition_mismatch_and_forged_grant_rejected": True,
                 "hidden_excel_only": True,
                 "no_model_or_paid_api": True,
                 "production_runtime_modified": False,
@@ -186,9 +228,6 @@ if __name__ == "__main__":
     sys.path.insert(0, str(REPO / "runtime/bridge-v3"))
     try:
         main()
-    except ImportError:
-        print(json.dumps({"schema": "ff-excel-task-com-rpc-v1", "status": "SKIP",
-                          "reason": "Excel COM or Python test dependency unavailable"}))
     except Exception as exc:
         print("EXCEL_TASK_COM_RPC_FAILED:" + type(exc).__name__, file=sys.stderr)
         raise SystemExit(1)
