@@ -16,12 +16,17 @@ class TestAgentWorkflowManifest(unittest.TestCase):
         keys=[x["step"] for x in data["flow"]]
         self.assertEqual(keys,[
             "identify_device","inspect_runtime","discover_task_routes",
-            "probe_vendor_contract_if_needed","execute_authorized_task",
-            "reconcile_ambiguous_reply","independent_verification_and_cleanup",
+            "probe_vendor_contract_if_needed","research_missing_programmatic_interfaces",
+            "request_explicit_chat_foreground_permission_if_needed",
+            "execute_authorized_task","reconcile_ambiguous_reply",
+            "independent_verification_and_cleanup",
         ])
         self.assertEqual(data["flow"][2]["args"]["command"],"task_preflight")
-        self.assertEqual(data["flow"][5]["bridge_op"],"request_status")
-        self.assertEqual(data["flow"][4]["bridge_op"],"durable_call")
+        self.assertEqual(data["flow"][7]["bridge_op"],"request_status")
+        self.assertEqual(data["flow"][6]["bridge_op"],"durable_call")
+        self.assertEqual(data["flow"][4]["required_before_visible_input"], True)
+        self.assertEqual(data["flow"][5]["owner_confirmation_channel"],"same_chat_text")
+        self.assertIs(data["flow"][5]["visible_input_allowed_without_host_receipt"],False)
 
     def test_manifest_is_neither_permission_nor_task_proof(self):
         x=agent_workflows()
