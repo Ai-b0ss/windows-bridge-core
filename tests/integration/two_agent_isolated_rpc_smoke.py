@@ -85,9 +85,23 @@ def main():
                        "SCOPED_SESSION_START_FAILED_" + agent_id)
                 session_id = (started.get("result") or {}).get("session_id")
                 verify(isinstance(session_id, str), "SCOPED_SESSION_ID_MISSING")
-                wait_until(marker.exists, "OWNED_CHILD_MARKER_MISSING")
-                pid = int(marker.read_text(encoding="ascii"))
-                child = ProcessReference(pid, process_creation_token(pid))
+                # File existence precedes a finished write on Windows. A CI
+                # runner may see the empty file for a few milliseconds, making
+                # int("") raise ValueError despite a healthy child. Wait for
+                # complete numeric contents and a real birth-bound handle.
+                def child_reference():
+                    try:
+                        raw = marker.read_text(encoding="ascii").strip()
+                        if not raw.isdecimal():
+                            return None
+                        pid = int(raw)
+                        token = process_creation_token(pid)
+                        if token is None:
+                            return None
+                        return ProcessReference(pid, token)
+                    except (FileNotFoundError, PermissionError, ValueError, OSError):
+                        return None
+                child = wait_until(child_reference, "OWNED_CHILD_IDENTITY_NOT_READY")
                 owned_children.append(child)
                 sessions.append((agent_id, task_id, session_id, child))
 
