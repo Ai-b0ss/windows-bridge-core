@@ -9,11 +9,14 @@ TASKS = {
     "cursor.assistant", "cursor.edit_files", "cursor.open_workspace",
     "antigravity.assistant", "antigravity.edit_files",
     "word.assistant", "powerpoint.assistant",
+    "git.repository.status",
 }
 
 
 def family_for(app):
     key = str(app or "").strip().casefold()
+    if key in {"git", "git.exe", "git for windows"}:
+        return "git"
     if "excel" in key:
         return "excel"
     if "cursor" in key:
@@ -71,6 +74,8 @@ def task_routes(app, task, candidates, *, probe=False, api_capabilities=()):
         if (raw_task == "cursor.open_workspace"
             and str(row.get("command") or "").casefold() == "cursor")
         or (raw_task == "excel.cells" and row.get("executor") == "Excel COM")
+        or (raw_task == "git.repository.status"
+            and str(row.get("command") or "").casefold() in {"git", "git.exe"})
     ]
     return {
         "task": task,
@@ -87,6 +92,7 @@ def task_routes(app, task, candidates, *, probe=False, api_capabilities=()):
                 "cursor.assistant", "cursor.edit_files", "antigravity.assistant",
                 "antigravity.edit_files"
             }
+            else "VERIFY_SCOPED_GIT_STATUS_WITH_TWO_REAL_READS" if raw_task == "git.repository.status"
             else "VERIFY_CANDIDATE_OPERATION_AND_POSTCONDITION"
         ),
         "requires_visible_desktop": False,

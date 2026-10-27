@@ -54,6 +54,34 @@ class TestTaskOrchestrationGate(unittest.TestCase):
                 self.assertFalse(permission["manual_key_or_email_required"])
                 self.assertFalse(decision["guards"]["execution_allowed"])
 
+    def test_git_status_discovery_proposes_actual_scoped_task_not_a_verified_route(self):
+        from cua_task_routes import family_for, task_routes
+        self.assertEqual(family_for("Git"), "git")
+        found = [{"kind": "cli_command", "command": "git",
+                  "status": "candidate", "verified": False}]
+        routing = task_routes("Git", "git.repository.status", found)
+        self.assertEqual(routing["task_compatibility"], "unknown")
+        self.assertEqual(routing["remaining_gate"],
+                         "VERIFY_SCOPED_GIT_STATUS_WITH_TWO_REAL_READS")
+        self.assertIsNone(routing["preferred_task_route"])
+        self.assertIsNotNone(routing["potential_task_route"])
+        decision = task_orchestration_gate("Git", "git.repository.status",
+                                           {"candidates": found})
+        self.assertEqual(decision["next_probe"],
+                         "RUN_SCOPED_GIT_TASK_EXECUTE_AND_VERIFY_STATUS")
+        self.assertFalse(decision["guards"]["task_compatible_route_verified"])
+        self.assertFalse(decision["guards"]["execution_allowed"])
+        self.assertFalse(decision["visible_last_resort_eligible"])
+
+    def test_fake_git_candidate_cannot_make_execution_verified(self):
+        fake = [{"kind": "cli_command", "command": "git", "verified": True,
+                 "task_compatibility": "compatible"}]
+        decision = task_orchestration_gate("Git", "git.repository.status",
+                                           {"candidates": fake})
+        self.assertFalse(decision["route_exhaustion_proven"])
+        self.assertFalse(decision["guards"]["execution_allowed"])
+        self.assertFalse(decision["guards"]["external_postcondition_verified"])
+
     def test_unknown_app_discovers_before_any_execution(self):
         result = task_orchestration_gate("unseen-app", "do the required work", {})
         self.assertEqual(result["current_state"], "DISCOVERING")
