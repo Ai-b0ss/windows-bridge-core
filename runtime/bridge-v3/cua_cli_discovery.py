@@ -103,43 +103,69 @@ def discover_cli_candidates(app: str, *, install_dirs=()) -> list[dict[str, Any]
     return out[:100]
 
 
-def probe_cli_versions(candidates, *, timeout_s=3.0):
-    """Explicit opt-in execution of --version; discovery alone never executes."""
-    out = []
-    for item in candidates:
-        row = dict(item); path = row["path"]; argv = [path, "--version"]
-        # These GUI entrypoints do not implement a version-only CLI. Launching
-        # them as a health probe can open owner-desktop windows even with
-        # CREATE_NO_WINDOW. Inventory is sufficient until a task-specific
-        # programmatic API or documented CLI is chosen.
-        if Path(path).name.casefold() in {"excel.exe", "winword.exe", "powerpnt.exe",
-                                           "notepad.exe", "wordpad.exe", "mspaint.exe", "cursor.exe"}:
-            row["health"] = "gui_executable_not_cli"
-            out.append(row)
+def _pinned_vendor_for_candidate(candidate):
+    """Return a vendor only for the documented local entrypoint (no PATH trust).
+
+    This proves candidate *location*, not Authenticode signature, task
+    entitlement, billing safety, or successful agent execution.
+    """
+    from cua_cli_contracts import _vendor_target, _allowed_path
+
+    local = os.environ.get("LOCALAPPDATA")
+    if not local:
+        return None
+    root = Path(local)
+    source = candidate.get("path")
+    if not isinstance(source, str) or not source:
+        return None
+    path = Path(source)
+    for vendor in ("cursor", "antigravity"):
+        kind, pinned = _vendor_target(vendor, root)
+        if os.path.normcase(str(path)) != os.path.normcase(str(pinned)):
             continue
-        if Path(path).suffix.casefold() in {".cmd", ".bat"}:
-            if any(c in path for c in '\r\n"%'):
-                row["health"] = "unsafe_shim_path"; out.append(row); continue
-            argv = subprocess.list2cmdline([os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c"]) + f' ""{path}" --version"'
-        try:
-            proc = subprocess.run(argv, capture_output=True, timeout=timeout_s,
-                                  creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            text = proc.stdout.decode("utf-8", errors="replace")[:1000]
-            match = re.search(r"(?<!\d)(\d+\.\d+(?:\.\d+)?)(?!\d)", text)
-            if proc.returncode != 0:
-                help_argv = [path, "--help"] if isinstance(argv, list) else argv.replace("--version", "--help")
-                help_proc = subprocess.run(help_argv, capture_output=True, timeout=timeout_s,
-                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                row["help_exit_code"] = help_proc.returncode
-                row["health"] = "healthy" if help_proc.returncode == 0 else "failed"
-            else:
-                row["health"] = "healthy"
-            row["version"] = match.group(1) if match else None
-            row["version_exit_code"] = proc.returncode
-        except (OSError, subprocess.TimeoutExpired) as exc: row["health"] = type(exc).__name__
+        if _allowed_path(root, path, kind):
+            return vendor
+    return None
+
+
+def probe_cli_versions(candidates, *, timeout_s=3.0):
+    """Probe only pinned known vendor CLIs, never arbitrary PATH executables.
+
+    A generic --version or --help runs executable code. Discovery is untrusted,
+    including user-writable PATH entries. Do not execute unknown candidates:
+    they need documented provenance and a separately authorized task probe.
+    This opt-in contract never runs a model or claims task success.
+    """
+    from cua_cli_contracts import probe_vendor_cli
+
+    out = []
+    checked = {}
+    for item in candidates:
+        row = dict(item)
+        vendor = _pinned_vendor_for_candidate(row)
+        row["verified"] = False
+        row["task_compatibility"] = "unknown"
+        if vendor is None:
+            row["health"] = "unprobed"
+            row["version"] = None
+            row["probe_status"] = "untrusted_cli_not_executed"
+        else:
+            if vendor not in checked:
+                checked[vendor] = probe_vendor_cli(vendor, timeout_s=timeout_s)
+            info = checked[vendor]
+            row["version"] = info.get("version")
+            row["health"] = (
+                "healthy" if info.get("path_verified") is True
+                and info.get("help_checked") is True else "unprobed"
+            )
+            row["probe_status"] = (
+                "pinned_vendor_help_checked" if row["health"] == "healthy"
+                else "pinned_vendor_unverified"
+            )
+            # Do not forward raw help/status stdout or account-identifying text.
+            row["task_compatibility"] = "unknown"
         out.append(row)
     return out
-
 
 def rank_cli_candidates(candidates):
     """Task-compatible evidence outranks version; newest healthy otherwise."""
