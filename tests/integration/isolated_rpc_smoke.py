@@ -301,6 +301,38 @@ def verify_rpc(port: int,secret: str):
     verify(advice.get("response_contents_returned") is False and
            "session_id" not in json.dumps(advice),
            "RECOVERY_RETURNED_RECORDED_PRIVATE_CONTENT")
+    # Actual end-to-end programmatic task against the CI-owned checkout.
+    # Nothing is modified; a separate Git CLI observation verifies the receipt.
+    import shutil
+    executable = shutil.which("git.exe")
+    verify(bool(executable), "REAL_GIT_CLI_NOT_INSTALLED")
+    preflight_git = rpc(port, secret, "computer_use", {
+        "command": "task_preflight", "app": "Git",
+        "task": "git.repository.status"}, "ci-git-task-preflight")
+    verify(preflight_git.get("ok") is True, "GIT_TASK_PREFLIGHT_UNAVAILABLE")
+    git_plan = preflight_git.get("result") or {}
+    verify(git_plan.get("next_step") ==
+           "run_explicit_git_status_task_execute_with_repo_path_and_check_receipt",
+           "GIT_PROGRAMMATIC_ROUTE_NOT_SELECTED")
+    verify(git_plan.get("action_executed") is False, "GIT_PREFLIGHT_DID_ACTION")
+    git_args = {"command": "task_execute", "app": "Git",
+                "task": "git.repository.status", "operation": "status.read",
+                "agent_id": "ci-git-agent", "task_id": "ci-git-status",
+                "action_args": {"repo_path": str(REPO)}}
+    completed_git = rpc(port, secret, "computer_use", git_args, "ci-real-git-status")
+    data_git = completed_git.get("result") or {}
+    independent_git = subprocess.run(
+        [executable, "--no-optional-locks", "-C", str(REPO),
+         "status", "--porcelain=v1", "--untracked-files=normal"],
+        capture_output=True, timeout=10)
+    verify(independent_git.returncode == 0
+           and completed_git.get("ok") is True
+           and data_git.get("verified") is True
+           and data_git.get("route") == "OFFICIAL_GIT_CLI"
+           and data_git.get("status_lines") ==
+           independent_git.stdout.decode("utf-8").splitlines(),
+           "REAL_GIT_TASK_EXTERNAL_READBACK_FAILED")
+    checks.append("git_preflight_to_real_task_execute_to_independent_cli_readback")
     checks.append("trusted_journal_recovery_plan_no_replay_no_response_leak")
     modified={
         **durable,
