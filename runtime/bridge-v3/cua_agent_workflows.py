@@ -16,6 +16,24 @@ def agent_workflows() -> dict:
         "owner_chat_permission_attested": False,
         "foreground_input_allowed": False,
         "agent_safe_no_effect_discovery": True,
+        # The manifest is static. The connected runtime's dispatcher may be
+        # an older version even when this workflow was copied forward.
+        "preflight_actual_rpc_support_verified": False,
+        "unsupported_preflight_fallback": {
+            "error_codes": ["CUA_COMMAND_UNSUPPORTED", "UNKNOWN_COMMAND"],
+            "command": "programmatic_plan",
+            "probe_versions": False,
+            "visible_input_allowed": False,
+            "instruction": "Use the fallback on the same device without restarting production",
+        },
+        "task_orchestration_gate": {
+            "schema": "ff-task-orchestration-gate-v1",
+            "field": "orchestration",
+            "route_candidate_is_task_proof": False,
+            "read_only": True,
+            "owner_grant_attested": False,
+            "next_probe_is_execution": False,
+        },
         "flow": [
             {
                 "step": "identify_device",
