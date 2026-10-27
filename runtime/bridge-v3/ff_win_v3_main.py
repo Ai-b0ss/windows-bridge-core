@@ -152,7 +152,10 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
 def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
     from cua_cli_first_policy import enforce as enforce_cli_first
     enforce_cli_first(core, "computer_use", args)
-    if args.get("command") in {"assistant_step", "assistant_task", "assistant_task_status"}:
+    if args.get("command") in {
+        "assistant_step", "assistant_task", "assistant_task_status",
+        "assistant_task_reconcile",
+    }:
         from cua_assistant_workflow import AssistantWorkflow, AssistantError
         from cua_assistant_step_ledger import AssistantStepLedger, WorkflowLedgerError
         ledger = AssistantStepLedger(core.BRIDGE_ROOT / "state" / "assistant-checkpoints")
@@ -164,6 +167,8 @@ def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
             workflow = AssistantWorkflow(
                 _computer_use, step_ledger=ledger if args["command"] == "assistant_task" else None,
             )
+            if args["command"] == "assistant_task_reconcile":
+                return AssistantWorkflow(_computer_use, step_ledger=ledger).reconcile_final(args)
             return workflow.run(args) if args["command"] == "assistant_task" else workflow.step(args)
         except (AssistantError, WorkflowLedgerError) as exc:
             raise core.RPCError(getattr(exc, "code", str(exc)), details=exc.details) from exc
@@ -448,6 +453,7 @@ def _install_gui_guards() -> None:
             "status_rpc": "computer_use.assistant_task_status",
             "restart_safe_state_only": True,
             "automatic_mutation_replay_allowed": False,
+            "read_only_final_artifact_reconciliation": True,
             "independent_app_task_success_attested": False,
         }
         features["agent_workflows_discovery"] = True
