@@ -109,6 +109,31 @@ def main(argv=None):
         except subprocess.TimeoutExpired:
             process.kill()
             process.wait(timeout=10)
+    # Also refuse a different version in an existing owned local root AFTER
+    # our exact test child exits; source upgrades require side-by-side cutover.
+    marker_path = installed / "bridge-v3/ff-local-owned-runtime.json"
+    original_marker_bytes = marker_path.read_bytes()
+    marker = json.loads(original_marker_bytes.decode("utf-8-sig"))
+    marker["source_commit"] = "0" * 40
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    try:
+        before_entry_sha = hashlib.sha256(server.read_bytes()).hexdigest()
+        mismatched = subprocess.run([
+            "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(package / "install.ps1"),
+            "-NoStartup", "-Transport", "Local", "-InstallRoot", str(installed),
+        ], capture_output=True, text=True, errors="replace", timeout=65,
+           creationflags=subprocess.CREATE_NO_WINDOW)
+        verify(mismatched.returncode != 0 and
+               "LOCAL_RUNTIME_UPGRADE_REQUIRES_CUTOVER" in
+               (mismatched.stdout + mismatched.stderr),
+               "UNREVIEWED_IN_PLACE_VERSION_OVERWRITE_NOT_BLOCKED")
+        verify(hashlib.sha256(server.read_bytes()).hexdigest() == before_entry_sha,
+               "VERSION_DENIAL_MODIFIED_EXISTING_BRIDGE")
+        checks.append("different_source_requires_explicit_side_by_side_cutover")
+    finally:
+        marker_path.write_bytes(original_marker_bytes)
+    verify_installed(package, installed, opts.source_commit)
     report = {"schema": "ff-installed-candidate-smoke-v1", "all_passed": True,
               "source_commit": opts.source_commit, "verified_installed_source_files": count,
               "loaded_agent_sha256": expected_agent, "owned_child_pid_matched": True,
