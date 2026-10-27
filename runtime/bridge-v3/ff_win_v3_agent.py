@@ -1574,11 +1574,39 @@ def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
     older_seconds = max(int(args.get("older_than_seconds", 3600)), 0)
     cutoff = now_ms() - older_seconds * 1000
     removed = []
+    verified_jobs = []
+    cleanup_failed = []
+    # Snapshot first: Win32 job termination/stream teardown may block. Holding
+    # STATE.lock over that operation would block unrelated agent sessions.
     with STATE.lock:
-        for session_id, session in list(STATE.sessions.items()):
-            if session.poll() is not None and (session.closed_at or now_ms()) <= cutoff:
-                removed.append(session_id)
-                STATE.sessions.pop(session_id, None)
+        candidates = list(STATE.sessions.items())
+    for session_id, session in candidates:
+        with session.lock:
+            with STATE.lock:
+                if STATE.sessions.get(session_id) is not session:
+                    continue
+            if session.poll() is None or (session.closed_at or now_ms()) > cutoff:
+                continue
+            process = session.process
+            # A completed root may still own live descendants that inherited
+            # its Job Object and stdio. Dropping the Session without draining
+            # that job leaves task-owned children active indefinitely.
+            if not session.detached and hasattr(process, "terminate_tree"):
+                try:
+                    if not getattr(session, "_owned_job_cleanup_verified", False):
+                        receipt = process.terminate_tree()
+                        if receipt.get("descendant_cleanup_verified") is not True:
+                            raise OSError("OWNED_JOB_CLEANUP_UNCONFIRMED")
+                        session._owned_job_cleanup_verified = True
+                    process.close()
+                except (OSError, ValueError, RuntimeError, AttributeError):
+                    cleanup_failed.append(session_id)
+                    continue
+                verified_jobs.append(session_id)
+            with STATE.lock:
+                if STATE.sessions.get(session_id) is session:
+                    STATE.sessions.pop(session_id, None)
+                    removed.append(session_id)
     if removed and DETACHED_STATE_PATH.is_file():
         try:
             current = json.loads(DETACHED_STATE_PATH.read_text("utf-8"))
@@ -1587,7 +1615,8 @@ def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
             atomic_write_text(DETACHED_STATE_PATH, json.dumps(current, indent=2))
         except Exception:
             pass
-    return {"removed": removed}
+    return {"removed": removed, "owned_job_descendants_verified": verified_jobs,
+            "cleanup_failed": cleanup_failed}
 
 
 OPS = {
