@@ -128,7 +128,7 @@ def main():
             output_dir=Path(directory)/"task-artifacts"
             output_dir.mkdir()
             artifact=output_dir/"saved.txt"
-            artifact.write_text("independently persisted result\\n",encoding="utf-8")
+            artifact.write_text("independently persisted result\n",encoding="utf-8")
             expected=hashlib.sha256(artifact.read_bytes()).hexdigest()
             task_args={
                 "command":"assistant_task","app":"Cursor",
@@ -164,7 +164,7 @@ def main():
                 **task_args,"command":"assistant_task_reconcile",
             },"ci-final-readonly-reconcile-duplicate")
             verify(retry.get("ok") is False,"FINAL_RECONCILE_DUPLICATE_NOT_BLOCKED")
-            verify(sink.read_text("utf-8")=="SEND_EXECUTED_ONCE\\n",
+            verify(sink.read_text("utf-8")=="SEND_EXECUTED_ONCE\n",
                    "FINAL_RECONCILE_REPLAYED_OLD_SEND")
             print(json.dumps({
                 "schema": "ff-assistant-task-step-restart-v1",
