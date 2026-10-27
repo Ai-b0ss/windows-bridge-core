@@ -226,3 +226,77 @@ class AssistantStepLedger:
             agent_id, task_id, {"PREPARED", "DISPATCHING", "VERIFIED"},
             "UPDATE tasks SET state='OUTCOME_UNKNOWN' WHERE agent=? AND task=?",
         )
+
+    def require_final_readonly_reconcile(self, request: Mapping[str, Any]) -> dict:
+        """Resume ONLY the final read-only artifact check, never Send/Save."""
+        agent, task = self._scope(request.get("agent_id"), request.get("task_id"))
+        if request.get("command") != "assistant_task_reconcile":
+            raise WorkflowLedgerError("ASSISTANT_RECONCILE_COMMAND_INVALID")
+        original = {**request, "command": "assistant_task"}
+        fingerprint = self._fingerprint(original)
+        steps = original.get("steps")
+        if (not isinstance(steps, list) or len(steps) < 2
+                or not isinstance(steps[-1], dict)
+                or steps[-1].get("stage") != "verify_artifact"
+                or not isinstance(steps[-2], dict)
+                or steps[-2].get("stage") != "save"):
+            raise WorkflowLedgerError("ASSISTANT_RECONCILE_FINAL_ONLY")
+        try:
+            with closing(self._connect()) as con:
+                row = con.execute(
+                    "SELECT fingerprint,total,state,step_index,step_name,"
+                    "verified_count,last_verified FROM tasks "
+                    "WHERE agent=? AND task=?", (agent, task)
+                ).fetchone()
+        except (sqlite3.Error, OSError) as exc:
+            raise WorkflowLedgerError("ASSISTANT_CHECKPOINT_UNAVAILABLE") from exc
+        if not row or row[0] != fingerprint:
+            raise WorkflowLedgerError("ASSISTANT_RECONCILE_PLAN_MISMATCH")
+        digest, total, state, index, stage, count, last = row
+        if not (total == len(steps) and state in {
+                    "DISPATCHING", "OUTCOME_UNKNOWN", "VERIFIED"
+                } and index == total - 1 and stage == "verify_artifact"
+                and ((count == total - 1 and last == "save")
+                     or (count == total and last == "verify_artifact"))):
+            raise WorkflowLedgerError("ASSISTANT_RECONCILE_NOT_READONLY_FINAL")
+        return {
+            "eligible": True, "stage": "verify_artifact",
+            "mutation_replay_allowed": False, "verified_previous_steps": count,
+        }
+
+    def finalize_verified_reconciliation(
+        self, request: Mapping[str, Any], receipt: Mapping[str, Any]
+    ) -> dict:
+        """Atomically close uncertainty only after a fresh artifact read."""
+        if (not isinstance(receipt, Mapping)
+                or receipt.get("ok") is not True
+                or receipt.get("verified") is not True
+                or receipt.get("stage") != "verify_artifact"):
+            raise WorkflowLedgerError("ASSISTANT_RECONCILE_PROOF_INVALID")
+        self.require_final_readonly_reconcile(request)
+        agent, task = self._scope(request.get("agent_id"), request.get("task_id"))
+        fingerprint = self._fingerprint({**request, "command": "assistant_task"})
+        try:
+            with closing(self._connect()) as con:
+                con.execute("BEGIN IMMEDIATE")
+                row = con.execute(
+                    "SELECT fingerprint,total,state,step_index,step_name,"
+                    "verified_count,last_verified FROM tasks "
+                    "WHERE agent=? AND task=?", (agent, task)
+                ).fetchone()
+                if (not row or row[0] != fingerprint or
+                        row[2] not in {"DISPATCHING", "OUTCOME_UNKNOWN", "VERIFIED"} or
+                        row[3] != row[1]-1 or row[4] != "verify_artifact" or
+                        not ((row[5] == row[1]-1 and row[6] == "save") or
+                             (row[5] == row[1] and row[6] == "verify_artifact"))):
+                    raise WorkflowLedgerError("ASSISTANT_RECONCILE_STATE_CHANGED")
+                con.execute("UPDATE tasks SET state='COMPLETED',"
+                            "verified_count=total,last_verified='verify_artifact' "
+                            "WHERE agent=? AND task=?", (agent, task))
+                con.commit()
+                return {"schema": self.SCHEMA, "state": "COMPLETED",
+                        "verified_steps": row[1], "reconciled_without_replay": True,
+                        "automatic_mutation_replay_allowed": False}
+        except (sqlite3.Error, OSError) as exc:
+            raise WorkflowLedgerError("ASSISTANT_CHECKPOINT_UNAVAILABLE") from exc
+
