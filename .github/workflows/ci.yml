@@ -40,6 +40,9 @@ jobs:
       - name: Hidden Excel COM and independent OOXML smoke (explicit skip if Excel absent)
         shell: pwsh
         run: powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -File tests/integration/excel_com_smoke.ps1
+      - name: Real task_execute through Excel COM RPC (explicit SKIP without Office or pywin32)
+        shell: pwsh
+        run: python tests/integration/excel_task_com_rpc_smoke.py
       - name: PowerShell parsing
         shell: pwsh
         run: |
