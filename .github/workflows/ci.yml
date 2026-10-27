@@ -28,6 +28,9 @@ jobs:
       - name: Completed terminal Job cleanup and foreign process preservation
         shell: pwsh
         run: python tests/integration/owned_job_cleanup_smoke.py
+      - name: Real Bridge restart recovers assistant task checkpoint without replay
+        shell: pwsh
+        run: python tests/integration/assistant_step_checkpoint_restart_smoke.py
       - name: Real two-agent Job isolation and independent scoped cleanup
         shell: pwsh
         run: python tests/integration/two_agent_isolated_rpc_smoke.py
