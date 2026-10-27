@@ -303,7 +303,7 @@ def _gui_target(core, args: dict, op: str) -> tuple[str, str] | None:
                 and str(args.get("app") or "").casefold() in {"antigravity", "agy"}):
             return None
         # Discovery and observation can proceed without UI manipulation.
-        if command in {"discover", "observe", "status", "health", "list", "get_capabilities", "capabilities", "screenshot", "attach", "inspect", "close", "routes", "route_discover", "discover_cli", "programmatic_plan", "prepare_tool", "app_api_probe", "resolve_app", "find", "wait", "capture", "vision_capture", "vision_detect", "vision_ocr", "vision_observe", "vision_ground", "vision_find", "vision_resolve", "vision_validate", "release_physical_lease", "plan_action", "task_preflight"}:
+        if command in {"discover", "observe", "status", "health", "list", "get_capabilities", "capabilities", "screenshot", "attach", "inspect", "close", "routes", "route_discover", "discover_cli", "programmatic_plan", "prepare_tool", "app_api_probe", "resolve_app", "find", "wait", "capture", "vision_capture", "vision_detect", "vision_ocr", "vision_observe", "vision_ground", "vision_find", "vision_resolve", "vision_validate", "release_physical_lease", "plan_action", "task_preflight", "assistant_task_status"}:
             return None
         app = _identity(args.get("app"))
         expected = args.get("expected_app")
