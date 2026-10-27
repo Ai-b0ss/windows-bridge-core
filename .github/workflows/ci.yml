@@ -25,6 +25,9 @@ jobs:
       - name: Detached session PID identity with real Windows FILETIME
         shell: pwsh
         run: python tests/integration/detached_identity_probe.py
+      - name: Completed terminal Job cleanup and foreign process preservation
+        shell: pwsh
+        run: python tests/integration/owned_job_cleanup_smoke.py
       - name: Actual isolated Bridge restart and detached output recovery
         shell: pwsh
         run: python tests/integration/detached_restart_smoke.py
