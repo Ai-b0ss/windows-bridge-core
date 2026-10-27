@@ -561,3 +561,146 @@ class ControlRouter:
 class _ContinueRouting(Exception):
     def __init__(self, attempts: list[dict[str, Any]]):
         self.attempts = attempts
+
+
+# The task-aware planner deliberately shares this route module with the
+# actual ControlRouter. It is a PURE decision gate; planning cannot dispatch a
+# model, install tools, alter focus, mint approval or execute an adapter.
+TASK_LIFECYCLE = (
+    "TASK_CREATED", "DISCOVERING", "PROBING", "PREPARING", "EXECUTING",
+    "VERIFYING", "CLEANING", "COMPLETED", "FAILED", "OUTCOME_UNKNOWN",
+)
+
+
+def task_orchestration_gate(
+    app: str, task: str, programmatic: Mapping[str, Any],
+    *, cli_contract: Mapping[str, Any] | None = None,
+    office_com: Mapping[str, Any] | None = None,
+    semantic_preflight: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Choose the next verifiable route probe, not an executable action.
+
+    A successful CLI --help, a COM registry entry, or adapter.can_handle()
+    is discovery evidence ONLY. They cannot prove entitlement, correct task
+    behavior, acceptable price, a postcondition or an owner's desktop grant.
+    Unknown routes remain unknown rather than being counted as exhausted.
+    Results contain no paths, account identifiers, document contents or keys.
+    """
+    from cua_task_routes import family_for
+
+    family = family_for(app)
+    raw_task = str(task or "").strip()
+    assistant_task = raw_task.endswith(".assistant") or raw_task.endswith(".edit_files")
+    programmatic = programmatic if isinstance(programmatic, Mapping) else {}
+    cli_contract = cli_contract if isinstance(cli_contract, Mapping) else {}
+    office_com = office_com if isinstance(office_com, Mapping) else {}
+    semantic_preflight = semantic_preflight if isinstance(semantic_preflight, Mapping) else {}
+
+    candidates = []
+    discovered = programmatic.get("candidates")
+    if not isinstance(discovered, list):
+        discovered = []
+    # Never trust a candidate's asserted health/compatible/verified flags.
+    # A discovery hit is not even a positive operation-specific probe.
+    if discovered:
+        candidates.append({
+            "route": "PROGRAMMATIC_DISCOVERED", "state": "UNKNOWN",
+            "evidence": "candidate_inventory_only",
+            "task_operation_verified": False,
+            "candidate_count": min(len(discovered), 100),
+        })
+    official_cli = (
+        cli_contract.get("path_verified") is True
+        and cli_contract.get("help_checked") is True
+        and cli_contract.get("model_called") is False
+        and cli_contract.get("task_completed") is False
+    )
+    if official_cli:
+        candidates.append({
+            "route": "PROGRAMMATIC_VENDOR_CLI", "state": "UNKNOWN",
+            "evidence": "vendor_help_syntax_only",
+            "task_operation_verified": False,
+        })
+    office_registered = (
+        family == "excel"
+        and office_com.get("registration_found") is True
+        and office_com.get("registered_executable_present") is True
+        and office_com.get("excel_process_started") is False
+        and office_com.get("task_completed") is False
+    )
+    if office_registered:
+        candidates.append({
+            "route": "PROGRAMMATIC_EXCEL_COM", "state": "UNKNOWN",
+            "evidence": "registry_only_not_assistant",
+            "task_operation_verified": False,
+        })
+    selected = semantic_preflight.get("selected_route")
+    if isinstance(selected, str) and selected in ROUTE_ORDER and selected != "PHYSICAL_INPUT":
+        candidates.append({
+            "route": selected, "state": "UNKNOWN",
+            "evidence": "operation_probe_only_not_task_postcondition",
+            "task_operation_verified": False,
+        })
+
+    # A CLI help document can describe capabilities without guaranteeing the
+    # cost or entitlement of any actual model inference. Zero new spend is a
+    # hard default; request-side flags must never override it.
+    if official_cli:
+        next_action = "PROBE_VENDOR_TASK_OPERATION_WITH_PROVEN_ENTITLEMENT"
+        reason = "CLI_SYNTAX_NOT_TASK_PROOF"
+    elif office_registered and raw_task == "excel.cells":
+        next_action = "PROBE_OWNED_EXCEL_COM_AND_VERIFY_SAVED_WORKBOOK"
+        reason = "COM_REGISTRATION_NOT_WORKBOOK_PROOF"
+    elif selected in ROUTE_ORDER[:-1]:
+        next_action = "PROBE_BACKGROUND_OPERATION_AND_POSTCONDITION"
+        reason = "SEMANTIC_CAPABILITY_NOT_TASK_PROOF"
+    elif discovered:
+        next_action = "RESEARCH_AND_PIN_CANDIDATE_TASK_INTERFACE"
+        reason = "CLI_DISCOVERY_NOT_OPERATION_PROOF"
+    else:
+        next_action = "DISCOVER_OFFICIAL_AND_OWNED_HIDDEN_INTERFACES"
+        reason = "RELEVANT_ROUTES_UNTESTED"
+
+    # Excel Copilot is fundamentally NOT covered by Excel COM cell access.
+    if office_registered and assistant_task and family == "excel" and not official_cli:
+        next_action = "RESEARCH_COPILOT_ENTITLEMENT_API_OR_OWNED_HIDDEN_PANEL"
+        reason = "COM_DOES_NOT_IMPLEMENT_COPILOT"
+    # The native inspector may have a route for an operation, but nothing has
+    # checked the full application's assistant workflow or complete result.
+    route_exhaustion_proven = False
+    return {
+        "schema": "ff-task-orchestration-gate-v1",
+        "current_state": "PROBING" if candidates else "DISCOVERING",
+        "lifecycle": list(TASK_LIFECYCLE),
+        "app_family": family,
+        "task_operation": raw_task,
+        "route_candidates": candidates,
+        "next_probe": next_action,
+        "reason": reason,
+        "route_exhaustion_proven": route_exhaustion_proven,
+        "background_routes_exhausted": False,
+        "visible_last_resort_eligible": False,
+        "owner_chat_grant_attested": False,
+        "cost_policy": {
+            "zero_new_spend": True,
+            "inference_entitlement_verified": False,
+            "unknown_model_price_requires_verification": assistant_task,
+            "purchase_authorized": False,
+        },
+        "guards": {
+            "task_compatible_route_verified": False,
+            "external_postcondition_verified": False,
+            "execution_allowed": False,
+            "fallback_execution_allowed": False,
+            "foreground_input_allowed": False,
+            "paid_inference_allowed": False,
+            "new_mutation_started": False,
+        },
+        "remaining_evidence": [
+            "EXACT_RUNTIME_AND_APPLICATION_VERSION",
+            "TASK_SPECIFIC_OPERATION_AND_AUTH",
+            "MODEL_TARIFF_OR_NO_NEW_SPEND_PROOF" if assistant_task else "OPERATION_SAFETY_AND_COST",
+            "INDEPENDENT_EXTERNAL_POSTCONDITION",
+            "SCOPED_RESOURCE_OWNERSHIP_AND_CLEANUP",
+        ],
+    }

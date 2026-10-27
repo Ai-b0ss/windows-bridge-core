@@ -1508,9 +1508,16 @@ class CuaBridgeControlPlane:
             step = "check_task_specific_cli_support_auth_and_pricing"
         else:
             step = "research_official_api_sdk_mcp_and_optional_hidden_paths"
+        from cua_router import task_orchestration_gate
+        orchestration = task_orchestration_gate(
+            app, task, candidates,
+            cli_contract=contract, office_com=office_com,
+            semantic_preflight=route_preflight,
+        )
         return {
             "schema": "ff-cua-task-preflight-v1",
             "app": app, "task": task,
+            "orchestration": orchestration,
             "programmatic": candidates,
             "cli_contract": contract,
             "office_com_registration": office_com,

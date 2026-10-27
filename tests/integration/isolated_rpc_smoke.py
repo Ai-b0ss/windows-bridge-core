@@ -90,7 +90,20 @@ def verify_rpc(port: int,secret: str):
                   "foreground_used","billing_or_purchase_executed",
                   "owner_authorization_verified"):
         verify(info.get(field) is False,"TASK_PREFLIGHT_UNSAFE_"+field)
+    decision = info.get("orchestration") or {}
+    verify(decision.get("schema") == "ff-task-orchestration-gate-v1",
+           "TASK_ORCHESTRATION_GATE_MISSING")
+    safety = decision.get("guards") or {}
+    for field in ("execution_allowed", "foreground_input_allowed",
+                  "paid_inference_allowed", "external_postcondition_verified",
+                  "new_mutation_started"):
+        verify(safety.get(field) is False, "TASK_ORCHESTRATION_UNSAFE_" + field)
+    verify(decision.get("route_exhaustion_proven") is False
+           and decision.get("visible_last_resort_eligible") is False
+           and (decision.get("cost_policy") or {}).get("zero_new_spend") is True,
+           "TASK_ORCHESTRATION_FALSE_CONSENT_OR_EXHAUSTION")
     checks.append("read_only_task_preflight")
+    checks.append("task_aware_orchestration_guard")
 
     # Optional subprocess probes run only known vendor --help/--version and
     # Cursor's redacted status. In a clean runner, no CLI is expected.
