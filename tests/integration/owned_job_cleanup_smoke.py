@@ -68,7 +68,7 @@ def main():
                                     shell="python", owner_scope=("ci-agent", "ci-task"))
             with agent.STATE.lock:
                 agent.STATE.sessions[session.id] = session
-            result = agent.op_cleanup_sessions({"older_than_seconds": 0})
+            result = agent.op_cleanup_sessions({"older_than_seconds": 0, "agent_id": "ci-agent", "task_id": "ci-task"})
             require(session.id in result["removed"], "SESSION_NOT_REMOVED")
             require(session.id in result["owned_job_descendants_verified"],
                     "DESCENDANT_CLEANUP_NOT_VERIFIED")
