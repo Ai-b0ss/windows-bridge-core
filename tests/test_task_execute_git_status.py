@@ -7,6 +7,8 @@ import subprocess
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import patch
+import os
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "runtime/bridge-v3"))
@@ -100,6 +102,24 @@ class TestGitTaskExecute(unittest.TestCase):
                 with self.assertRaises(CuaBridgeError):
                     self.execute(**attack)
                 self.assertEqual(self.fixture.read_bytes(), before)
+
+    def test_fake_path_git_does_not_execute_without_trusted_signature(self):
+        fake_root = Path(self.folder.name) / "untrusted-program-files"
+        cmd = fake_root / "Git" / "cmd"
+        cmd.mkdir(parents=True)
+        decoy = cmd / "git.exe"
+        decoy.write_bytes(b"not-an-official-signed-executable")
+        with patch.dict(os.environ, {
+            "ProgramW6432": str(fake_root),
+            "ProgramFiles": str(fake_root),
+            "ProgramFiles(x86)": str(fake_root),
+            "PATH": str(cmd),
+        }):
+            with self.assertRaises(CuaBridgeError) as caught:
+                self.execute()
+        self.assertEqual(caught.exception.code,
+                         "TASK_EXECUTE_TRUSTED_GIT_CLI_UNAVAILABLE")
+        self.assertTrue(self.fixture.exists())
 
     def test_unowned_or_nonrepo_path_denied(self):
         directory = Path(self.folder.name) / "not-git"
