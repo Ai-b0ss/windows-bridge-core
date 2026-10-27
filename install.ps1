@@ -49,6 +49,11 @@ if (($RuntimeOnly -or $Transport -eq 'Local') -and -not $StageOnly) {
     if (Test-Path -LiteralPath $localMarker) {
         $previousLocal = Get-Content -LiteralPath $localMarker -Raw | ConvertFrom-Json
         if ($previousLocal.schema -ne 'ff-local-owned-runtime-v1') { throw 'LOCAL_RUNTIME_OWNERSHIP_INVALID' }
+        # Ownership alone does not permit replacing a different source build.
+        # Version changes use a new shadow root and an explicit controlled cutover.
+        if ([string]$previousLocal.source_commit -cne [string]$manifest.source_commit) {
+            throw 'LOCAL_RUNTIME_UPGRADE_REQUIRES_CUTOVER'
+        }
     }
     # Re-installing into the exact directory used by a running Bridge would
     # replace imported Python modules and the launch script mid-execution.
@@ -133,6 +138,11 @@ if ($RuntimeOnly -or $Transport -eq 'Local') {
     if (Test-Path -LiteralPath $localMarker) {
         $previousLocal = Get-Content -LiteralPath $localMarker -Raw | ConvertFrom-Json
         if ($previousLocal.schema -ne 'ff-local-owned-runtime-v1') { throw 'LOCAL_RUNTIME_OWNERSHIP_INVALID' }
+        # Ownership alone does not permit replacing a different source build.
+        # Version changes use a new shadow root and an explicit controlled cutover.
+        if ([string]$previousLocal.source_commit -cne [string]$manifest.source_commit) {
+            throw 'LOCAL_RUNTIME_UPGRADE_REQUIRES_CUTOVER'
+        }
     }
     New-Item -ItemType Directory -Path $v3Root -Force | Out-Null
     Write-JsonAtomic $localMarker @{schema='ff-local-owned-runtime-v1';source_commit=$manifest.source_commit}
