@@ -68,6 +68,42 @@ def agent_workflows() -> dict:
                 "requirement": "Only exact vendor --help/--version and redacted login status, not inference entitlement",
             },
             {
+                "step": "research_missing_programmatic_interfaces",
+                "actor": "chatgpt_agent",
+                "required_before_visible_input": True,
+                "requirement": (
+                    "After bounded installed-interface probes, search current official "
+                    "web documentation and maintained OSS for task-capable CLI, API, "
+                    "SDK, MCP, COM, IPC, PowerShell/CMD, browser automation and "
+                    "installable adapters. Check Windows version, task suitability, "
+                    "license, source provenance, entitlement, cost, reversible install "
+                    "and real postcondition. An empty local catalog or missing web "
+                    "search capability is NEVER evidence of route exhaustion."
+                ),
+                "research_performed_by_bridge": False,
+                "unavailable_web_is_route_exhaustion": False,
+            },
+            {
+                "step": "request_explicit_chat_foreground_permission_if_needed",
+                "actor": "chatgpt_agent",
+                "required_even_if_owner_away": True,
+                "only_after": "relevant_programmatic_and_owned_hidden_routes_exhausted",
+                "owner_confirmation_channel": "same_chat_text",
+                "requirement": (
+                    "Explain concrete incompatible routes and ask the owner in "
+                    "this ChatGPT conversation before FIRST visible mouse, keyboard "
+                    "or focus takeover, even if the owner said they were away. "
+                    "Do not require phone popup, email or manual cryptographic key. "
+                    "Reuse still-valid exact task consent. The host/controller must "
+                    "independently authenticate that chat decision and provide "
+                    "an exact device/task/operation/time-bound grant; chat text "
+                    "alone and approved=true cannot bypass Bridge authorization. "
+                    "If no trusted attestation exists, visible effects stay BLOCKED."
+                ),
+                "chat_text_alone_is_trusted_grant": False,
+                "visible_input_allowed_without_host_receipt": False,
+            },
+            {
                 "step": "execute_authorized_task",
                 "bridge_op": "durable_call",
                 "requirement": "Use a stable request_key, exact device, task_id and agent_id; check costs and signed grants separately",
@@ -97,7 +133,10 @@ def agent_workflows() -> dict:
         "refusals": {
             "outcome_unknown": "do_not_auto_replay; use request_status and independent postcondition",
             "owner_approval_unverified": "do_not_invent_approval_or_force_visible_desktop",
-            "background_route_unproven": "research_another_programmatic_or_owned_hidden_route",
+            "background_route_unproven": "web_research_official_and_maintained_oss_then_probe_installable_or_hidden_route",
+            "away_is_not_visible_consent": "ask_in_same_chat_before_first_visible_mouse_or_keyboard",
+            "web_unavailable": "exhaustion_unknown_not_eligible_for_foreground",
+            "chat_yes_without_trusted_grant": "never_fabricate_rpc_approval",
             "model_entitlement_unknown": "do_not_assume_zero_cost_or_execute_unapproved_paid_inference",
         },
         "next_release_gate": "Real app task completion, host-attested chat consent and new-chat activation remain unverified",
