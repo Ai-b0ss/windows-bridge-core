@@ -551,6 +551,20 @@ class CuaBridgeControlPlane:
             result["next_step"] = "check_cli_task_support" if result["preferred_cli"] else "research_or_prepare_programmatic_tool"
             if args.get("task"):
                 result["next_step"] = "execute_task_compatible_programmatic_route_and_verify" if result.get("preferred_task_route") else "observe_assistant_ui_after_official_tool_research" if result.get("task_compatibility") == "requires_ui" else "research_task_compatible_cli_api_mcp"
+            if (str(app).casefold() in {"git", "git.exe", "git for windows"}
+                    and args.get("task") == "git.repository.status"
+                    and result.get("potential_task_route") is not None):
+                # A discovered CLI is only a candidate; actual task_execute
+                # performs the first operation-specific verification.
+                result["next_step"] = "RUN_SCOPED_GIT_STATUS_TASK_WITH_REAL_POSTCONDITION"
+                result["task_execute_contract"] = {
+                    "command": "task_execute", "app": "Git",
+                    "task": "git.repository.status", "operation": "status.read",
+                    "required_action_args": ["repo_path"],
+                    "requires_agent_and_task_ids": True,
+                    "execution_performed": False, "task_compatibility_verified": False,
+                    "model_called": False, "foreground_required": False,
+                }
             result["search_and_reasoning_are_planner_responsibilities"] = True
             return result
         if command == "discover_cli":
@@ -1527,6 +1541,10 @@ class CuaBridgeControlPlane:
             cli_contract=contract, office_com=office_com,
             semantic_preflight=route_preflight,
         )
+        if (app.casefold() in {"git", "git.exe", "git for windows"}
+                and task == "git.repository.status"
+                and candidates.get("task_execute_contract")):
+            step = "run_explicit_git_status_task_execute_with_repo_path_and_check_receipt"
         return {
             "schema": "ff-cua-task-preflight-v1",
             "app": app, "task": task,
