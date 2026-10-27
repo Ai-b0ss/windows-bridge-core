@@ -80,6 +80,26 @@ def main(argv=None):
         expected_agent = manifest["files"]["runtime/bridge-v3/ff_win_v3_agent.py"]
         verify(actual.get("agent_sha256") == expected_agent, "LOADED_AGENT_SHA_MISMATCH")
         checks = verify_rpc(port, secret)
+        # Regression: a normal local reinstall (even -NoStartup) must NEVER
+        # replace runtime bytes beneath a running, previously installed agent.
+        # Use only this isolated CI-owned install and its exact child process.
+        before_agent_sha = hashlib.sha256(server.read_bytes()).hexdigest()
+        attempt = subprocess.run([
+            "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+            "-ExecutionPolicy", "Bypass", "-File", str(package / "install.ps1"),
+            "-NoStartup", "-Transport", "Local", "-InstallRoot", str(installed),
+        ], capture_output=True, text=True, errors="replace", timeout=65,
+           creationflags=subprocess.CREATE_NO_WINDOW)
+        verify(attempt.returncode != 0 and
+               "LIVE_RUNTIME_RUNNING_SWITCH_REQUIRED" in
+               (attempt.stdout + attempt.stderr),
+               "ACTIVE_RUNTIME_REINSTALL_NOT_BLOCKED_BEFORE_WRITE")
+        verify(process.poll() is None, "REINSTALL_STOPPED_OWNED_RUNNING_AGENT")
+        verify(hashlib.sha256(server.read_bytes()).hexdigest() == before_agent_sha,
+               "REINSTALL_MODIFIED_RUNNING_AGENT_SOURCE")
+        alive = rpc(port, secret, "ping", {}, "ci-after-denied-active-reinstall")
+        verify(alive.get("ok") is True, "DENIED_REINSTALL_BROKE_RUNNING_AGENT")
+        checks.append("running_bridge_reinstall_denied_before_write")
         verify_installed(package, installed, opts.source_commit)
     finally:
         if process.poll() is None:
