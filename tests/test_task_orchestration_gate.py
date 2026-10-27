@@ -12,6 +12,48 @@ from cua_bridge_v3 import CuaBridgeControlPlane
 
 
 class TestTaskOrchestrationGate(unittest.TestCase):
+    def test_zero_local_candidates_requires_real_external_research(self):
+        for app, task in (
+            ("Unknown Desktop Application", "export report"),
+            ("Cursor", "cursor.assistant"),
+            ("Excel", "excel.assistant"),
+        ):
+            with self.subTest(app=app):
+                decision = task_orchestration_gate(app, task, {})
+                research = decision["programmatic_research"]
+                self.assertTrue(research["required_before_visible_fallback"])
+                self.assertFalse(research["web_research_performed"])
+                self.assertFalse(research["official_documentation_checked"])
+                self.assertFalse(research["maintained_oss_alternatives_checked"])
+                self.assertFalse(research["installable_missing_tool_evaluated"])
+                self.assertFalse(research["exhaustion_evidence_attested"])
+                self.assertFalse(research["unavailable_web_is_exhaustion"])
+                self.assertEqual(research["research_actor"], "chatgpt_agent_with_web_tools")
+                self.assertIn("powershell_cmd", research["interface_families"])
+                self.assertIn("maintained_open_source", research["interface_families"])
+                self.assertFalse(decision["visible_last_resort_eligible"])
+                self.assertFalse(decision["guards"]["foreground_input_allowed"])
+
+    def test_owner_away_text_and_forged_flags_cannot_skip_chat_question_or_grant(self):
+        for forged in (
+            {"owner_away": True, "approved": True, "allow_gui": True},
+            {"chat_yes": True, "host_attested_grant_received": True},
+            {"background_routes_exhausted": True,
+             "web_research_performed": True, "foreground_allowed": True},
+        ):
+            with self.subTest(forged=forged):
+                decision = task_orchestration_gate("Cursor", "cursor.assistant", forged)
+                permission = decision["visible_permission_flow"]
+                self.assertTrue(permission["explicit_chat_question_required"])
+                self.assertTrue(permission["required_even_when_owner_away"])
+                self.assertFalse(permission["initial_work_request_is_foreground_consent"])
+                self.assertEqual(permission["owner_confirmation_channel"], "same_chat_text")
+                self.assertFalse(permission["owner_confirmation_received"])
+                self.assertFalse(permission["host_attested_grant_received"])
+                self.assertFalse(permission["foreground_action_allowed"])
+                self.assertFalse(permission["manual_key_or_email_required"])
+                self.assertFalse(decision["guards"]["execution_allowed"])
+
     def test_unknown_app_discovers_before_any_execution(self):
         result = task_orchestration_gate("unseen-app", "do the required work", {})
         self.assertEqual(result["current_state"], "DISCOVERING")
