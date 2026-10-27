@@ -441,6 +441,15 @@ def _install_gui_guards() -> None:
         features["desktop_modes"] = ["coexist", "dedicated"]
         features["dedicated_mode_requires_task_approval"] = True
         features["durable_request_outcomes"] = True
+        # This attests that the currently loaded dispatcher supports real
+        # per-step assistant-task recovery, not that any app task succeeded.
+        features["durable_assistant_step_checkpoints"] = {
+            "version": 1,
+            "status_rpc": "computer_use.assistant_task_status",
+            "restart_safe_state_only": True,
+            "automatic_mutation_replay_allowed": False,
+            "independent_app_task_success_attested": False,
+        }
         features["agent_workflows_discovery"] = True
         result["agent_workflows"] = _agent_workflows()
         from cua_hidden_apps import available_apps
