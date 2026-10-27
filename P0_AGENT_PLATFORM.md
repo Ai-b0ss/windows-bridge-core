@@ -156,7 +156,7 @@ an authorized exact-device process/loaded-source check and release/deploy parity
 
 ## First complete bounded task: read-only Excel cell
 
-The installed runtime now supports **one explicit application-level real task**
+The public candidate runtime now supports **one explicit application-level real task**
 through the same canonical `CuaBridgeControlPlane`, `ControlRouter`, and Excel
 COM adapter as ordinary `computer_use.act`. It is not a generic self-driving
 agent or Copilot/AI assistant call.
@@ -171,14 +171,14 @@ agent or Copilot/AI assistant call.
      "command": "task_execute", "app": "Excel", "task": "excel.cells",
      "operation": "cell.read", "surface_id": "<registered surface>",
      "agent_id": "your-agent-id", "task_id": "your-task-id",
-     "action_args": {"sheet": "Sheet1", "address": "A3"},
-     "expected_value": 42
+     "action_args": {"sheet": "Sheet1", "address": "A3"}
    }
    ```
    The server accepts only this **read-only, background-safe, COM-backed**
    operation. It runs a real action through the existing route, checks the
-   cell against the externally specified expectation and reads it **again**
-   through COM before marking this limited task `COMPLETED`. It never calls
+   cell and reads it **again** through COM, requiring two consistent results
+   before marking this limited task `COMPLETED`. An optional `expected_value`
+   can also assert the value externally. It never calls
    a model, changes an Excel cell, takes foreground input or grants
    authorization via `approved=true`.
 3. Close the **owned Bridge surface** with
@@ -186,9 +186,10 @@ agent or Copilot/AI assistant call.
    the surface; it does not close the pre-existing user workbook or Excel.
    The caller owns surface cleanup, not the target process.
 
-An observed cell value matching an expectation on two COM reads is **not**
+Two consistent fresh COM reads, even when a supplied expectation matches, are **not**
 independent saved-file verification or proof of Excel Copilot operation.
-`expected_value` is intentionally mandatory: no unverified UI/CLI fallback,
+`expected_value` is optional because a user may not know a cell's value.
+No unverified UI/CLI fallback,
 arbitrary app operation, write, or purchased model inference is allowed through
 this first task executor. Mutations will require separate durable requests,
 trusted authority where needed, and independent persisted postconditions.
