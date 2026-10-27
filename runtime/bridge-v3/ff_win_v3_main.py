@@ -152,13 +152,21 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
 def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
     from cua_cli_first_policy import enforce as enforce_cli_first
     enforce_cli_first(core, "computer_use", args)
-    if args.get("command") in {"assistant_step", "assistant_task"}:
+    if args.get("command") in {"assistant_step", "assistant_task", "assistant_task_status"}:
         from cua_assistant_workflow import AssistantWorkflow, AssistantError
+        from cua_assistant_step_ledger import AssistantStepLedger, WorkflowLedgerError
+        ledger = AssistantStepLedger(core.BRIDGE_ROOT / "state" / "assistant-checkpoints")
         try:
-            workflow = AssistantWorkflow(_computer_use)
+            if args["command"] == "assistant_task_status":
+                if set(args) != {"command", "agent_id", "task_id"}:
+                    raise core.RPCError("ASSISTANT_CHECKPOINT_STATUS_SCOPE_INVALID")
+                return ledger.status(args["agent_id"], args["task_id"])
+            workflow = AssistantWorkflow(
+                _computer_use, step_ledger=ledger if args["command"] == "assistant_task" else None,
+            )
             return workflow.run(args) if args["command"] == "assistant_task" else workflow.step(args)
-        except AssistantError as exc:
-            raise core.RPCError(str(exc), details=exc.details) from exc
+        except (AssistantError, WorkflowLedgerError) as exc:
+            raise core.RPCError(getattr(exc, "code", str(exc)), details=exc.details) from exc
     if "visible_launch_allowed" in args and type(args["visible_launch_allowed"]) is not bool:
         raise core.RPCError("VISIBLE_LAUNCH_FLAG_INVALID")
     interactive = _enforce_computer_use_background_policy(args)
