@@ -521,6 +521,12 @@ class CuaBridgeControlPlane:
         if command == "task_preflight":
             return self._task_preflight(args)
         if command == "task_execute":
+            if args.get("task") == "antigravity.assistant":
+                from cua_antigravity_task import execute_headless_task, VendorTaskError
+                try:
+                    return execute_headless_task(args, bridge_root=self.root)
+                except VendorTaskError as exc:
+                    raise CuaBridgeError(exc.code) from exc
             return self._task_execute(args)
         if command == "plan_action":
             # Uses the existing surface registry and route adapters, not a
