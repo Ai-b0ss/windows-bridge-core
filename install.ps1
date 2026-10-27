@@ -38,6 +38,18 @@ function Write-JsonAtomic($Path, $Value) {
     [IO.File]::WriteAllText($temp, ($Value | ConvertTo-Json -Depth 20), [Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temp -Destination $Path -Force
 }
+function Assert-NoRunningLocalRuntime($Root) {
+    $entry = [IO.Path]::GetFullPath((Join-Path $Root 'ff_win_v3_main.py'))
+    if (-not (Test-Path -LiteralPath $entry -PathType Leaf)) { return }
+    try {
+        $pythonProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop)
+    } catch { throw 'LOCAL_RUNTIME_PROCESS_AUDIT_UNAVAILABLE' }
+    foreach ($proc in $pythonProcesses) {
+        if ($proc.CommandLine -and $proc.CommandLine.IndexOf($entry,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            throw 'LIVE_RUNTIME_RUNNING_SWITCH_REQUIRED'
+        }
+    }
+}
 $ownedStage = New-FFOwnedStage $InstallRoot
 $stage = $ownedStage.path
 $keepStage = $false
@@ -59,17 +71,7 @@ if (($RuntimeOnly -or $Transport -eq 'Local') -and -not $StageOnly) {
     # replace imported Python modules and the launch script mid-execution.
     # Never infer a safe in-place upgrade from a valid ownership marker or
     # -NoStartup. Explicit controlled cutover and rollback are separate steps.
-    $entry = [IO.Path]::GetFullPath((Join-Path $v3Root 'ff_win_v3_main.py'))
-    if (Test-Path -LiteralPath $entry -PathType Leaf) {
-        try {
-            $pythonProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop)
-        } catch { throw 'LOCAL_RUNTIME_PROCESS_AUDIT_UNAVAILABLE' }
-        foreach ($proc in $pythonProcesses) {
-            if ($proc.CommandLine -and $proc.CommandLine.IndexOf($entry,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                throw 'LIVE_RUNTIME_RUNNING_SWITCH_REQUIRED'
-            }
-        }
-    }
+    Assert-NoRunningLocalRuntime $v3Root
     $localInstallLease = [IO.File]::Open((Join-Path $InstallRoot 'local-runtime.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
 }
 # Copy only hash-verified runtime entries, never extra files/profiles in a
@@ -122,6 +124,11 @@ if ($StageOnly) {
 # StageOnly has no dependency writes outside the owned diagnostic stage.
 $env:LOCALAPPDATA = $originalLocalAppData
 $env:FF_BRIDGE_ROOT = $InstallRoot
+# Recheck immediately before the first persistent dependency copy: a
+# Bridge may have been started during our isolated ZIP verification/build.
+if ($RuntimeOnly -or $Transport -eq 'Local') {
+    Assert-NoRunningLocalRuntime $v3Root
+}
 $installedTools = Join-Path $InstallRoot 'tools'
 New-Item -ItemType Directory -Path $installedTools -Force | Out-Null
 Copy-FFPortableTree (Join-Path $stage 'tools') $installedTools
