@@ -43,7 +43,7 @@ def main():
         return 0
     import winreg
     try:
-        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Excel.Application\\CLSID"):
+        with winreg.OpenKey(winreg.HKEY_CLASSES_ROOT, r"Excel.Application\CLSID"):
             pass
     except FileNotFoundError:
         print(json.dumps({"schema": "ff-excel-task-com-rpc-v1", "status": "SKIP",
