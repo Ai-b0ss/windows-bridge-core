@@ -201,3 +201,19 @@ XLSX with openpyxl. It tests forged-consent denial, expected-value mismatch,
 scope cleanup, and preservation of the owned Excel instance. A clean CI machine
 without Office reports `SKIP`; it does not magically prove Excel compatibility.
 
+### Read a bounded Excel range (real task, no known values needed)
+
+The same `task_execute` path supports `operation="range.read"` with
+`action_args={"sheet":"Sheet1","address":"A1:C10"}`, returning a rectangular
+two-dimensional list. A range must have two valid cell endpoints in increasing
+row/column order, **at most 256 cells, 32 columns and 256 rows**. Both live COM
+reads must agree on shape, scalar types and every cell. Total returned scalar
+text is bounded. Any unexpected, oversized, malformed, changing or
+non-background-safe result fails closed; no UI fallback, writes or AI/model calls
+are performed.
+
+Owner Windows acceptance additionally reads a genuine three-row formula table
+A1:A3 (`[[20],[22],[42]]`) through authenticated isolated Bridge RPC and
+independently checks the separately saved .xlsx. The CI runner without Office
+reports an explicit SKIP rather than claiming native Excel proof.
+
