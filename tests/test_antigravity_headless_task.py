@@ -167,11 +167,13 @@ class TestHeadlessTask(unittest.TestCase):
                 self.root = Path("/fake/bridge")
         plane = Plane()
         with patch("cua_antigravity_task.execute_headless_task",
-                   return_value={"schema":"ff-vendor-task-result-v1"}) as task:
+                   return_value={"schema":"ff-vendor-task-result-v1"}) as task, \
+                patch("ff_win_v3_agent.BRIDGE_ROOT", self.root):
             result = plane.dispatch(self.args)
         self.assertEqual(result["schema"], "ff-vendor-task-result-v1")
         self.assertEqual(task.call_count, 1)
-        self.assertEqual(task.call_args.kwargs["bridge_root"], plane.root)
+        self.assertEqual(task.call_args.kwargs["bridge_root"], self.root / "state")
+        self.assertNotEqual(task.call_args.kwargs["bridge_root"], plane.root)
 
 
 if __name__ == "__main__":
