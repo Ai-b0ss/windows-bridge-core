@@ -1610,8 +1610,17 @@ class CuaBridgeControlPlane:
             "policy": safe_policy,
         }
         preflight = self.dispatch({"command": "plan_action", **request})
+        from cua_router import task_orchestration_gate
+        gate = task_orchestration_gate(
+            "Excel", "excel.cells", {"candidates": []},
+            semantic_preflight=preflight,
+        )
         if (preflight.get("selected_route") != "APP_API" or
-                preflight.get("action_executed") is not False):
+                preflight.get("action_executed") is not False or
+                gate.get("next_probe") != "PROBE_BACKGROUND_OPERATION_AND_POSTCONDITION" or
+                gate.get("route_exhaustion_proven") is not False or
+                gate.get("visible_last_resort_eligible") is not False or
+                (gate.get("cost_policy") or {}).get("zero_new_spend") is not True):
             raise CuaBridgeError("TASK_EXECUTE_VERIFIED_BACKGROUND_ROUTE_REQUIRED")
 
         def equivalent(actual, comparison):
@@ -1658,6 +1667,13 @@ class CuaBridgeControlPlane:
         return {
             "schema": "ff-task-execution-v1",
             "ok": True, "state": "COMPLETED", "task": "excel.cells",
+            "orchestration": {
+                "gate_schema": gate["schema"],
+                "selected_next_probe": gate["next_probe"],
+                "actual_stages": ["PROBING", "EXECUTING", "VERIFYING", "CLEANING", "COMPLETED"],
+                "visible_last_resort_used": False,
+                "unproven_model_route_escalation": False,
+            },
             "agent_id": agent, "task_id": task_id, "route": "APP_API",
             "operation": "cell.read",
             "value": observations[-1],
