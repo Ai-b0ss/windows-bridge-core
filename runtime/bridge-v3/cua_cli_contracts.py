@@ -39,7 +39,7 @@ def official_git_for_windows() -> Path | None:
             statement = ("$s = Get-AuthenticodeSignature -LiteralPath '" + literal +
                          "'; if ($s.Status -eq 'Valid' -and " +
                          "$s.SignerCertificate.Subject -match 'CN=Johannes Schindelin') " +
-                         "{ 'SIGNED_GIT_FOR_WINDOWS' }")
+                         "{ exit 0 } else { exit 7 }")
             result = subprocess.run(
                 ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                  "-Command", statement],
@@ -47,7 +47,7 @@ def official_git_for_windows() -> Path | None:
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 check=False,
             )
-            if result.returncode == 0 and result.stdout.strip() == b"SIGNED_GIT_FOR_WINDOWS":
+            if result.returncode == 0:
                 return path
         except (OSError, subprocess.TimeoutExpired, ValueError):
             continue
