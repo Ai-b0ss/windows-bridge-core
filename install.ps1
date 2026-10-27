@@ -50,6 +50,21 @@ if (($RuntimeOnly -or $Transport -eq 'Local') -and -not $StageOnly) {
         $previousLocal = Get-Content -LiteralPath $localMarker -Raw | ConvertFrom-Json
         if ($previousLocal.schema -ne 'ff-local-owned-runtime-v1') { throw 'LOCAL_RUNTIME_OWNERSHIP_INVALID' }
     }
+    # Re-installing into the exact directory used by a running Bridge would
+    # replace imported Python modules and the launch script mid-execution.
+    # Never infer a safe in-place upgrade from a valid ownership marker or
+    # -NoStartup. Explicit controlled cutover and rollback are separate steps.
+    $entry = [IO.Path]::GetFullPath((Join-Path $v3Root 'ff_win_v3_main.py'))
+    if (Test-Path -LiteralPath $entry -PathType Leaf) {
+        try {
+            $pythonProcesses = @(Get-CimInstance Win32_Process -Filter "Name = 'python.exe' OR Name = 'pythonw.exe'" -ErrorAction Stop)
+        } catch { throw 'LOCAL_RUNTIME_PROCESS_AUDIT_UNAVAILABLE' }
+        foreach ($proc in $pythonProcesses) {
+            if ($proc.CommandLine -and $proc.CommandLine.IndexOf($entry,[StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                throw 'LIVE_RUNTIME_RUNNING_SWITCH_REQUIRED'
+            }
+        }
+    }
     $localInstallLease = [IO.File]::Open((Join-Path $InstallRoot 'local-runtime.lock'),[IO.FileMode]::OpenOrCreate,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)
 }
 # Copy only hash-verified runtime entries, never extra files/profiles in a
