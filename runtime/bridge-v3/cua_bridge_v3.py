@@ -1539,7 +1539,7 @@ class CuaBridgeControlPlane:
         }
 
     def _task_execute(self, args: Mapping[str, Any]) -> dict[str, Any]:
-        """First bounded real task: a read-only Excel cell with fresh readback.
+        """First bounded real task: a bounded Excel cell or range read with fresh readback.
 
         Uses an ALREADY ATTACHED COM handle, the canonical ControlRouter and
         its real app executor. No model, installation, worksheet mutation,
@@ -1550,7 +1550,7 @@ class CuaBridgeControlPlane:
         evidence; the report states the narrower actual verification scope.
         """
         from cua_task_authority import identity, AuthorityError
-        from cua_app_api import _excel_validate_address, AppApiError
+        from cua_app_api import _excel_validate_address, _excel_cell_parts, AppApiError
         import math
         allowed = {
             "command", "app", "task", "agent_id", "task_id",
@@ -1565,7 +1565,8 @@ class CuaBridgeControlPlane:
             raise CuaBridgeError("TASK_EXECUTE_OWNER_SCOPE_REQUIRED") from exc
         if str(args.get("app") or "").strip().casefold() not in {"excel", "microsoft excel", "excel.exe"}:
             raise CuaBridgeError("TASK_EXECUTE_APP_UNSUPPORTED")
-        if args.get("task") != "excel.cells" or args.get("operation") != "cell.read":
+        operation = args.get("operation")
+        if args.get("task") != "excel.cells" or operation not in {"cell.read", "range.read"}:
             raise CuaBridgeError("TASK_EXECUTE_OPERATION_NOT_SUPPORTED")
         raw_args = args.get("action_args")
         if not isinstance(raw_args, Mapping) or set(raw_args) != {"sheet", "address"}:
@@ -1574,18 +1575,46 @@ class CuaBridgeControlPlane:
         if not isinstance(sheet, str) or not sheet.strip() or len(sheet) > 31:
             raise CuaBridgeError("TASK_EXECUTE_SHEET_INVALID")
         try:
-            address = _excel_validate_address(address, single_cell=True)
+            address = _excel_validate_address(address, single_cell=operation == "cell.read")
         except AppApiError as exc:
             raise CuaBridgeError(exc.code) from exc
+        matrix_shape = None
+        if operation == "range.read":
+            if ":" not in address:
+                raise CuaBridgeError("TASK_EXECUTE_RANGE_EXPECTED")
+            left, right = address.replace("$", "").split(":", 1)
+            start = _excel_cell_parts(left)
+            stop = _excel_cell_parts(right)
+            if start is None or stop is None:
+                raise CuaBridgeError("TASK_EXECUTE_RANGE_INVALID")
+            width, height = stop[0] - start[0] + 1, stop[1] - start[1] + 1
+            if width < 1 or height < 1 or width * height > 256 or width > 32 or height > 256:
+                raise CuaBridgeError("TASK_EXECUTE_RANGE_TOO_LARGE")
+            matrix_shape = (height, width)
+
+        def valid_scalar(value):
+            if type(value) not in (str, int, float, bool, type(None)):
+                return False
+            if isinstance(value, str) and len(value.encode("utf-8")) > 8192:
+                return False
+            if type(value) is float and not math.isfinite(value):
+                return False
+            return True
+
+        def valid_value(value):
+            if matrix_shape is None:
+                return valid_scalar(value)
+            rows, columns = matrix_shape
+            return (type(value) is list and len(value) == rows
+                    and all(type(row) is list and len(row) == columns
+                            and all(valid_scalar(item) for item in row)
+                            for row in value)
+                    and sum(len(str(item).encode("utf-8")) for row in value
+                            for item in row) <= 65536)
         has_expectation = "expected_value" in args
         expected = args.get("expected_value")
-        if has_expectation:
-            if type(expected) not in (str, int, float, bool, type(None)):
-                raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
-            if isinstance(expected, str) and len(expected) > 8192:
-                raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
-            if type(expected) is float and not math.isfinite(expected):
-                raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+        if has_expectation and not valid_value(expected):
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
 
         surface_id, surface = self._surface(args)
         handle = surface.get("app_api_handle")
@@ -1594,7 +1623,7 @@ class CuaBridgeControlPlane:
                 str(getattr(handle, "app", "") or "").casefold() not in
                 {"excel", "microsoft excel", "excel.exe"}):
             raise CuaBridgeError("TASK_EXECUTE_EXCEL_COM_SURFACE_REQUIRED")
-        capability = getattr(handle, "capabilities", {}).get("cell.read")
+        capability = getattr(handle, "capabilities", {}).get(operation)
         if (not isinstance(capability, Mapping) or
                 capability.get("mutation") is not False or
                 capability.get("background_safe") is not True or
@@ -1605,7 +1634,7 @@ class CuaBridgeControlPlane:
             "physical_input_allowed": False, "require_verified": True,
         }
         request = {
-            "surface_id": surface_id, "operation": "cell.read",
+            "surface_id": surface_id, "operation": operation,
             "action_args": {"sheet": sheet, "address": address},
             "policy": safe_policy,
         }
@@ -1624,6 +1653,10 @@ class CuaBridgeControlPlane:
             raise CuaBridgeError("TASK_EXECUTE_VERIFIED_BACKGROUND_ROUTE_REQUIRED")
 
         def equivalent(actual, comparison):
+            if type(actual) is list and type(comparison) is list:
+                return len(actual) == len(comparison) and all(
+                    equivalent(a, b) for a, b in zip(actual, comparison)
+                )
             if type(actual) in (int, float) and type(comparison) in (int, float):
                 return (math.isfinite(float(actual)) and math.isfinite(float(comparison))
                         and float(actual) == float(comparison))
@@ -1647,10 +1680,7 @@ class CuaBridgeControlPlane:
                     details={"attempted": True, "retry_safe": True},
                 )
             observed = action["value"]
-            if type(observed) not in (str, int, float, bool, type(None)):
-                raise CuaBridgeError("TASK_EXECUTE_READBACK_UNVERIFIED",
-                                     details={"attempted": True, "retry_safe": True})
-            if isinstance(observed, str) and len(observed) > 8192:
+            if not valid_value(observed):
                 raise CuaBridgeError("TASK_EXECUTE_READBACK_UNVERIFIED",
                                      details={"attempted": True, "retry_safe": True})
             if has_expectation and not equivalent(observed, expected):
@@ -1675,11 +1705,12 @@ class CuaBridgeControlPlane:
                 "unproven_model_route_escalation": False,
             },
             "agent_id": agent, "task_id": task_id, "route": "APP_API",
-            "operation": "cell.read",
+            "operation": operation,
             "value": observations[-1],
             "verified": True,
             "verification": {
-                "kind": "two_fresh_excel_com_cell_reads",
+                "kind": "two_fresh_excel_com_range_reads" if matrix_shape else
+                        "two_fresh_excel_com_cell_reads",
                 "two_fresh_reads_consistent": True,
                 "user_expectation_supplied": has_expectation,
                 "postcondition_matches_expected": True if has_expectation else None,

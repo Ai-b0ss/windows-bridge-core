@@ -148,6 +148,31 @@ def main():
                    (receipt.get("execution") or {}).get("file_or_workbook_mutated") is False,
                    "EXCEL_TASK_UNEXPECTED_EFFECT")
 
+            matrix = rpc(port, secret, "computer_use", {
+                "command": "task_execute", "app": "Excel", "task": "excel.cells",
+                "operation": "range.read", "agent_id": "ci-excel-agent",
+                "task_id": "ci-table-read", "surface_id": surface_id,
+                "action_args": {"sheet": sheet_name, "address": "A1:A3"},
+            }, "ci-excel-task-read-real-range")
+            verify(matrix.get("ok") is True,
+                   "EXCEL_REAL_RANGE_FAILED_" + str(matrix.get("error_code")))
+            matrix_result = matrix.get("result") or {}
+            verify(matrix_result.get("operation") == "range.read" and
+                   matrix_result.get("verified") is True and
+                   matrix_result.get("value") == [[20], [22], [42]],
+                   "EXCEL_REAL_RANGE_CONTENT_MISMATCH")
+            verify((matrix_result.get("verification") or {}).get("distinct_read_calls") == 2,
+                   "EXCEL_REAL_RANGE_DOUBLE_READ_MISSING")
+            oversized = rpc(port, secret, "computer_use", {
+                "command": "task_execute", "app": "Excel", "task": "excel.cells",
+                "operation": "range.read", "agent_id": "ci-excel-agent",
+                "task_id": "ci-table-too-large", "surface_id": surface_id,
+                "action_args": {"sheet": sheet_name, "address": "A1:Z100"},
+            }, "ci-excel-task-reject-giant-range")
+            verify(oversized.get("ok") is False and
+                   oversized.get("error_code") == "TASK_EXECUTE_RANGE_TOO_LARGE",
+                   "EXCEL_UNBOUNDED_READ_NOT_REJECTED")
+
             # The external artifact is checked independently from the Bridge
             # using the actual saved workbook ZIP, not the assistant's claim.
             independent = load_workbook(workbook_path, data_only=True, read_only=True)
@@ -192,6 +217,8 @@ def main():
                 "actual_excel_com_cell_read": True,
                 "independent_saved_xlsx_check": True,
                 "two_fresh_value_observations": True,
+                "bounded_table_range_verified": True,
+                "oversized_range_rejected_before_com": True,
                 "task_left_owner_workbook_open": True,
                 "task_surface_released_without_closing_excel": True,
                 "postcondition_mismatch_and_forged_grant_rejected": True,
