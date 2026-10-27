@@ -130,6 +130,12 @@ def main():
             verify(task.get("ok") is True,
                    "EXCEL_REAL_TASK_FAILED_" + str(task.get("error_code")))
             receipt = task.get("result") or {}
+            decision = receipt.get("orchestration") or {}
+            verify(decision.get("gate_schema") == "ff-task-orchestration-gate-v1" and
+                   decision.get("selected_next_probe") ==
+                   "PROBE_BACKGROUND_OPERATION_AND_POSTCONDITION" and
+                   decision.get("visible_last_resort_used") is False,
+                   "EXCEL_TASK_CANONICAL_ORCHESTRATOR_NOT_USED")
             verify(receipt.get("state") == "COMPLETED" and receipt.get("verified") is True
                    and receipt.get("value") == 42, "EXCEL_TASK_RESULT_UNVERIFIED")
             evidence = receipt.get("verification") or {}
