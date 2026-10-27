@@ -16,43 +16,6 @@ jobs:
       - name: Python sources compile
         shell: pwsh
         run: python -m compileall -q runtime
-      - name: Diagnose Git for Windows signer on clean hosted runner
-        shell: pwsh
-        run: |
-          $git = Get-Command git.exe -ErrorAction SilentlyContinue
-          if ($git) {
-            Write-Output ("GIT_PATH_KIND=" + $(if ($git.Source -like "$env:ProgramFiles\\Git\\*") { "PROGRAM_FILES_GIT" } else { "OTHER" }))
-            $signature = Get-AuthenticodeSignature -LiteralPath $git.Source
-            Write-Output ("GIT_SIGN_STATUS=" + $signature.Status)
-            Write-Output ("GIT_SIGNER=" + $signature.SignerCertificate.Subject)
-          }
-          $official = Join-Path $env:ProgramFiles 'Git\\cmd\\git.exe'
-          if (Test-Path -LiteralPath $official) {
-            $signed = Get-AuthenticodeSignature -LiteralPath $official
-            Write-Output ("GIT_OFFICIAL_STATUS=" + $signed.Status)
-            Write-Output ("GIT_OFFICIAL_SIGNER=" + $signed.SignerCertificate.Subject)
-            $info = Get-Item -LiteralPath $official -Force
-            Write-Output ("GIT_OFFICIAL_REPARSE=" + [bool]($info.Attributes -band [IO.FileAttributes]::ReparsePoint))
-          }
-          @'
-          import os,sys
-          from pathlib import Path
-          sys.path.insert(0, str(Path.cwd() / 'runtime' / 'bridge-v3'))
-          from cua_cli_contracts import official_git_for_windows
-          roots = [os.environ.get(k) for k in ('ProgramW6432','ProgramFiles','ProgramFiles(x86)')]
-          for value in roots:
-              if not value: continue
-              root = Path(value)
-              candidate = root / 'Git' / 'cmd' / 'git.exe'
-              if candidate.is_file():
-                  print('PY_GIT_CANDIDATE=YES')
-                  print('PY_GIT_ROOT_NORMALIZED=' + str(root.resolve() in candidate.resolve().parents))
-                  print('PY_GIT_PATH_LINKS=' + str([
-                      p.is_symlink() or getattr(p,'is_junction',lambda:False)()
-                      for p in (root/'Git',root/'Git'/'cmd',candidate)
-                  ]))
-          print('PY_OFFICIAL_GIT_OK=' + str(official_git_for_windows() is not None))
-          '@ | python -
       - name: Pairing permission and consent regression
         shell: pwsh
         run: python -m unittest discover -s tests -v
