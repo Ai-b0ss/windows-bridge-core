@@ -82,6 +82,25 @@ class TestRealReadOnlyTaskExecution(unittest.TestCase):
                 "require_verified": True,
             })
 
+    def test_read_unknown_user_value_is_useful_and_freshly_verified(self):
+        request = dict(self.args)
+        request.pop("expected_value")
+        receipt = self.plane._task_execute(request)
+        self.assertEqual(receipt["value"], 42.0)
+        self.assertTrue(receipt["verified"])
+        self.assertTrue(receipt["verification"]["two_fresh_reads_consistent"])
+        self.assertFalse(receipt["verification"]["user_expectation_supplied"])
+        self.assertIsNone(receipt["verification"]["postcondition_matches_expected"])
+        self.assertEqual([x[0] for x in self.plane.calls], ["preflight", "act", "act"])
+
+    def test_read_unknown_user_value_fails_if_two_live_observations_change(self):
+        request = dict(self.args)
+        request.pop("expected_value")
+        self.plane.values = [42, 99]
+        with self.assertRaises(CuaBridgeError) as caught:
+            self.plane._task_execute(request)
+        self.assertEqual(caught.exception.code, "TASK_EXECUTE_INCONSISTENT_LIVE_READS")
+
     def test_advertised_capability_without_real_route_fails_before_action(self):
         self.plane.preflight_route = None
         with self.assertRaises(CuaBridgeError) as caught:
