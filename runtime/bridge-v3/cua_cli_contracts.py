@@ -40,10 +40,17 @@ def official_git_for_windows() -> Path | None:
                          "'; if ($s.Status -eq 'Valid' -and " +
                          "$s.SignerCertificate.Subject -match 'CN=Johannes Schindelin') " +
                          "{ exit 0 } else { exit 7 }")
+            # GitHub-hosted pwsh and some user shells inherit a PSModulePath
+            # rooted in PowerShell 7. Windows PowerShell 5.1 must load its own
+            # built-in security module or signature checks fail spuriously.
+            native = Path(os.environ.get("WINDIR") or "C:/Windows")
+            windows_modules = native / "System32" / "WindowsPowerShell" / "v1.0" / "Modules"
+            environment = dict(os.environ)
+            environment["PSModulePath"] = str(windows_modules)
             result = subprocess.run(
                 ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                  "-Command", statement],
-                capture_output=True, timeout=12,
+                capture_output=True, timeout=12, env=environment,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 check=False,
             )
