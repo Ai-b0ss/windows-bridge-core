@@ -700,6 +700,8 @@ class Session:
                 "created_at": self.created_at,
                 "closed_at": self.closed_at,
                 "detached": self.detached,
+                "process_ownership_model": ("job_at_creation" if hasattr(self.process, "terminate_tree")
+                                            else "root_process_only"),
                 "events": selected,
                 "next_seq": selected[-1]["seq"] + 1 if selected else from_seq,
                 "buffer_first_seq": self.events[0]["seq"] if self.events else self.next_seq,
@@ -978,25 +980,14 @@ def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
             pass
     else:
         if os.name == "nt":
-            flags = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
-        process = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            creationflags=flags,
-        )
-        try:
-            assign_process_to_agent_job(process)
-        except RPCError:
-            terminate_pid(process.pid)
+            from ff_win_owned_job import OwnedJobProcess
             try:
-                process.wait(timeout=10)
-            except Exception:
-                pass
-            raise
+                process = OwnedJobProcess(argv, cwd=str(cwd), env=env)
+            except OSError as exc:
+                raise RPCError("OWNED_JOB_PROCESS_START_FAILED", details={"execution_started": False}) from exc
+        else:
+            process = subprocess.Popen(argv, cwd=str(cwd), env=env,
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     session = Session(
         process,
         command=command,
@@ -1068,8 +1059,10 @@ def terminate_pid(pid: int) -> None:
 def op_force_terminate(args: dict[str, Any]) -> dict[str, Any]:
     session_id = str(args.get("session_id") or "")
     session = get_session(session_id)
-    if session.is_running():
-        terminate_owned_session(session)
+    cleanup = {"termination_scope": "owned_root_process", "descendant_cleanup_verified": False}
+    # A shell can exit while its ordinary descendants remain in the owned job.
+    if session.is_running() or hasattr(session.process, "terminate_tree"):
+        cleanup = terminate_owned_session(session)
         try:
             if hasattr(session.process, "wait"):
                 session.process.wait(timeout=10)
@@ -1078,13 +1071,14 @@ def op_force_terminate(args: dict[str, Any]) -> dict[str, Any]:
     code = session.poll()
     known = getattr(session.process, "exit_code_known", True)
     return {"ok": True, "session_id": session_id, "exit_code": code if known else None,
-            "exit_code_known": known, "termination_scope": "owned_root_process",
-            "descendant_cleanup_verified": False}
+            "exit_code_known": known, **cleanup}
 
 
 def terminate_owned_session(session):
     if os.name == "nt":
         try:
+            if hasattr(session.process, "terminate_tree"):
+                return session.process.terminate_tree()
             # Popen retains its exact process handle; restored stubs use the
             # birth-bound ProcessReference. Never delegate to taskkill /PID.
             session.process.terminate()
@@ -1092,6 +1086,7 @@ def terminate_owned_session(session):
             raise RPCError("OWNED_PROCESS_TERMINATION_FAILED", details={"retry_safe": False}) from exc
     else:
         terminate_pid(session.pid)
+    return {"termination_scope": "owned_root_process", "descendant_cleanup_verified": False}
 
 
 def op_list_sessions(args: dict[str, Any]) -> dict[str, Any]:
@@ -1149,9 +1144,9 @@ def op_kill_process(args: dict[str, Any]) -> dict[str, Any]:
         raise RPCError("PROCESS_NOT_OWNED", details={"pid": pid})
     if not owned_session.is_running():
         raise RPCError("PROCESS_NOT_RUNNING", details={"pid": pid, "session_id": owned_session_id})
-    terminate_owned_session(owned_session)
+    cleanup = terminate_owned_session(owned_session)
     return {"ok": True, "pid": pid, "ownership": "bridge_session", "session_id": owned_session_id,
-            "termination_scope": "owned_root_process", "descendant_cleanup_verified": False}
+            **cleanup}
 
 
 def read_text_file(path: Path) -> tuple[str, str]:

@@ -20,6 +20,7 @@ TRACKED = (
     "ff_win_v3_agent.py", "ff_win_process_identity.py",
     "ff_win_request_journal.py", "cua_restricted_rpc.py",
     "cua_durable_recovery.py", "cua_agent_workflows.py",
+    "ff_win_owned_job.py",
 )
 MAX_MODULE_BYTES = 8 * 1024 * 1024
 
