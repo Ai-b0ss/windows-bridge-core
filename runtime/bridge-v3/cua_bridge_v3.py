@@ -1594,7 +1594,7 @@ class CuaBridgeControlPlane:
 
         allowed = {
             "command", "app", "task", "agent_id", "task_id",
-            "operation", "action_args", "expected_clean",
+            "operation", "action_args", "expected_clean", "expected_changed",
         }
         if set(args) - allowed:
             raise CuaBridgeError("TASK_EXECUTE_ARGUMENT_UNSUPPORTED")
@@ -1605,13 +1605,26 @@ class CuaBridgeControlPlane:
             raise CuaBridgeError("TASK_EXECUTE_OWNER_SCOPE_REQUIRED") from exc
         if str(args.get("app") or "").strip().casefold() not in {"git", "git.exe"}:
             raise CuaBridgeError("TASK_EXECUTE_APP_UNSUPPORTED")
-        if args.get("task") != "git.repository.status" or args.get("operation") != "status.read":
+        task_name = args.get("task")
+        operation = args.get("operation")
+        status_task = task_name == "git.repository.status" and operation == "status.read"
+        diff_task = task_name == "git.repository.diff" and operation == "diff.stat.read"
+        if not (status_task or diff_task):
             raise CuaBridgeError("TASK_EXECUTE_OPERATION_NOT_SUPPORTED")
-        if "expected_clean" in args and type(args["expected_clean"]) is not bool:
+        if ("expected_clean" in args and
+                (not status_task or type(args["expected_clean"]) is not bool)):
+            raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
+        if ("expected_changed" in args and
+                (not diff_task or type(args["expected_changed"]) is not bool)):
             raise CuaBridgeError("TASK_EXECUTE_EXPECTATION_INVALID")
         action = args.get("action_args")
-        if not isinstance(action, Mapping) or set(action) != {"repo_path"}:
+        if (not isinstance(action, Mapping) or
+                (set(action) != {"repo_path"} if status_task
+                 else set(action) not in ({"repo_path"}, {"repo_path", "scope"}))):
             raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_SCOPE_REQUIRED")
+        scope = action.get("scope", "unstaged") if diff_task else None
+        if diff_task and (type(scope) is not str or scope not in {"unstaged", "staged", "head"}):
+            raise CuaBridgeError("TASK_EXECUTE_DIFF_SCOPE_INVALID")
         raw_path = action.get("repo_path")
         if (not isinstance(raw_path, str) or not 1 <= len(raw_path) <= 1024
                 or any(ord(c) < 32 for c in raw_path)):
@@ -1674,6 +1687,95 @@ class CuaBridgeControlPlane:
         observed_root = checked_git(["rev-parse", "--show-toplevel"]).strip()
         if os.path.normcase(str(Path(observed_root).resolve())) != os.path.normcase(str(root)):
             raise CuaBridgeError("TASK_EXECUTE_REPOSITORY_ROOT_MISMATCH")
+        if diff_task:
+            # Only fixed, non-mutating Git arguments: no filters, hooks,
+            # user-supplied revisions, patch command or external diff drivers.
+            # -z gives unambiguous paths even with tabs/newlines in filenames.
+            command = ["diff"]
+            if scope == "staged":
+                command.append("--cached")
+            elif scope == "head":
+                command.append("HEAD")
+            command += [
+                "--no-ext-diff", "--no-textconv", "--no-renames",
+                "--numstat", "-z", "--",
+            ]
+            first = checked_git(command)
+            second = checked_git(command)
+            if first != second:
+                raise CuaBridgeError(
+                    "TASK_EXECUTE_INCONSISTENT_LIVE_READS",
+                    details={"attempted": True, "retry_safe": True},
+                )
+            if second and not second.endswith("\0"):
+                raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_INVALID")
+            chunks = second[:-1].split("\0") if second else []
+            if len(chunks) > 200:
+                raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_TOO_LARGE")
+            changes: list[dict[str, Any]] = []
+            total_added = total_deleted = binary_count = 0
+            for chunk in chunks:
+                fields = chunk.split("\t", 2)
+                if (len(fields) != 3 or not fields[2] or
+                        len(fields[2].encode("utf-8")) > 2048):
+                    raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_INVALID")
+                added, deleted, filename = fields
+                binary = added == "-" and deleted == "-"
+                if not binary and (
+                        not added.isascii() or not deleted.isascii()
+                        or not added.isdecimal() or not deleted.isdecimal()
+                        or len(added) > 12 or len(deleted) > 12):
+                    raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_INVALID")
+                num_added = None if binary else int(added)
+                num_deleted = None if binary else int(deleted)
+                if not binary and (num_added > 100000000 or num_deleted > 100000000):
+                    raise CuaBridgeError("TASK_EXECUTE_GIT_RESPONSE_TOO_LARGE")
+                if binary:
+                    binary_count += 1
+                else:
+                    total_added += num_added
+                    total_deleted += num_deleted
+                changes.append({
+                    "path": filename,
+                    "added": num_added, "deleted": num_deleted, "binary": binary,
+                })
+            changed = bool(changes)
+            if "expected_changed" in args and args["expected_changed"] != changed:
+                raise CuaBridgeError(
+                    "TASK_EXECUTE_POSTCONDITION_FAILED",
+                    details={"attempted": True, "retry_safe": True},
+                )
+            return {
+                "schema": "ff-task-execution-v1", "ok": True,
+                "state": "COMPLETED", "task": "git.repository.diff",
+                "agent_id": agent, "task_id": task_id,
+                "route": "OFFICIAL_GIT_CLI", "operation": "diff.stat.read",
+                "scope": scope, "changed": changed,
+                "changed_file_count": len(changes), "files": changes,
+                "total_added": total_added, "total_deleted": total_deleted,
+                "binary_file_count": binary_count,
+                "verified": True,
+                "orchestration": {
+                    "selected_route": "OFFICIAL_GIT_CLI",
+                    "actual_stages": ["PROBING", "EXECUTING", "VERIFYING", "COMPLETED"],
+                    "visible_last_resort_used": False,
+                },
+                "verification": {
+                    "kind": "two_fresh_real_git_cli_numstat_reads",
+                    "exact_repo_root_verified": True,
+                    "two_fresh_reads_consistent": True,
+                    "user_expectation_supplied": "expected_changed" in args,
+                    "independent_saved_artifact_verified": False,
+                    "untracked_files_included": False,
+                    "no_optional_git_index_lock": True,
+                },
+                "execution": {
+                    "foreground_used": False, "model_called": False,
+                    "paid_inference_used": False, "repo_mutated_by_task": False,
+                },
+                "cleanup": "no_task_owned_process_or_file_persisted",
+                "durable_mutation_journal_required": False,
+            }
         command = ["status", "--porcelain=v1", "--untracked-files=normal"]
         first = checked_git(command)
         second = checked_git(command)
