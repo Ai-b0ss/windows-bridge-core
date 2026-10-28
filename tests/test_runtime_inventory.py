@@ -121,5 +121,41 @@ class TestVersionInventory(unittest.TestCase):
         self.assertFalse(result["running_process_verified"])
 
 
+    def test_critical_control_and_execution_modules_are_allowlisted(self):
+        required = {
+            "cua_bridge_v3.py", "cua_cli_discovery.py",
+            "cua_input_arbiter.py", "cua_visual_action_gate.py",
+            "cua_session_continuation.py", "cua_task_routes.py",
+            "cua_runtime_deploy.py", "cua_restricted_execution.py",
+            "cua_app_api.py", "cua_global_resources.py",
+        }
+        self.assertTrue(required.issubset(set(TRACKED)))
+
+    def test_critical_live_drift_and_package_drift_are_independent(self):
+        source, installed, archive = self.fixture()
+        for name in TRACKED:
+            (source/name).write_bytes(b"known-public-source")
+            (installed/name).write_bytes(b"known-public-source")
+        live_drift = {"cua_bridge_v3.py", "cua_runtime_deploy.py",
+                      "cua_visual_action_gate.py"}
+        for name in live_drift:
+            (installed/name).write_bytes(b"older-live-runtime")
+        with zipfile.ZipFile(archive, "w") as z:
+            for name in TRACKED:
+                payload = (b"wrong-release-version" if name == "cua_input_arbiter.py"
+                           else b"known-public-source")
+                z.writestr("runtime/bridge-v3/" + name, payload)
+        result = compare(source, installed, archive)
+        rows = {item["file"]: item["matches"] for item in result["modules"]}
+        self.assertEqual({name for name, matches in rows.items()
+                          if not matches["source_equals_live"]}, live_drift)
+        self.assertEqual({name for name, matches in rows.items()
+                          if not matches["source_equals_package"]},
+                         {"cua_input_arbiter.py"})
+        self.assertFalse(result["all_installed_equal_source"])
+        self.assertFalse(result["all_installed_equal_package"])
+        self.assertFalse(result["running_process_verified"])
+
+
 if __name__=="__main__":
     unittest.main()
