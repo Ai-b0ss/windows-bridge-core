@@ -104,11 +104,11 @@ def _invoke(path: Path, kind: str, options: tuple[str,...],
             *, runner: Callable[..., Any], timeout_s: float) -> tuple[bool,str]:
     # Explicit safe command/argument set; no arbitrary user-supplied prompt.
     if options not in {
-        ("--version",), ("--help",), ("status",), ("models","--help"),
+        ("--version",), ("--help",), ("status",), ("models",), ("models","--help"),
     }:
         return False,""
     if kind=="cursor":
-        if options not in {("--version",),("--help",),("status",)}:
+        if options not in {("--version",),("--help",),("status",),("models",)}:
             return False,""
         # Trusted vendor-owned .cmd shim, bounded safe cmd.exe invocation.
         # Python on Windows invokes trusted .cmd shims correctly. The
@@ -136,12 +136,14 @@ def _invoke(path: Path, kind: str, options: tuple[str,...],
 
 def probe_vendor_cli(app: str, *, runner: Callable[...,Any]=subprocess.run,
                      local_appdata: Path | None=None,
-                     timeout_s:float=6.0, include_auth_status:bool=False) -> dict[str,Any]:
+                     timeout_s:float=6.0, include_auth_status:bool=False,
+                     include_model_listing:bool=False) -> dict[str,Any]:
     """Safe, opt-in source and CLI capability evidence, no AI inference."""
     result:dict[str,Any]={
         "schema":"ff-cli-contract-v1","app_family":"unknown",
         "path_verified":False,"version":None,
         "help_checked":False,"service_auth":"not_checked",
+        "models_list_checked":False,"observed_cursor_models":[],
         "observed_flags":[],"supported_by_help":[],
         "task_completed":False,"model_called":False,"paid_api_invoked":False,
         "authenticated_task_execution_verified":False,
@@ -190,4 +192,18 @@ def probe_vendor_cli(app: str, *, runner: Callable[...,Any]=subprocess.run,
         else:
             result["service_auth"]="unknown"
         # Never return status stdout: it can contain personal email/team data.
+    if include_model_listing and kind=="cursor" and help_ok:
+        # This command enumerates vendor model names, not account quota. Its
+        # raw output may contain personal metadata: return a tiny allowlist only.
+        listed, output = _invoke(path, kind, ("models",), runner=runner,
+                                 timeout_s=min(30.0, max(20.0, timeout_s)))
+        result["models_list_checked"] = listed
+        if listed:
+            models = (
+                ("composer-2.5", r"(?<![A-Za-z0-9_.-])composer[ .-]2[.]5(?![A-Za-z0-9_.-])"),
+                ("grok-4.7", r"(?<![A-Za-z0-9_.-])grok[ .-]4[.]7(?![A-Za-z0-9_.-])"),
+            )
+            result["observed_cursor_models"] = [
+                name for name, pattern in models if re.search(pattern, output, re.I)
+            ]
     return result

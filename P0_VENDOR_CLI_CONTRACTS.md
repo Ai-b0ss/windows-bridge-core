@@ -8,11 +8,12 @@ The agent platform now distinguishes five independent claims that must **not** b
 | CLI version | Only explicit `--version`, hidden subprocess, bounded timeout | Task support |
 | CLI syntax | Only `--help` with output sanitized into supported-flag booleans | The flags actually work on current plan/OS |
 | Cursor login-status | Optional `agent status` only, redacted to `authenticated` / `not_authenticated` / `unknown` | Credits, model eligibility, real task execution |
+| Cursor model listing | Optional `agent models`, returns only recognized model names | Availability of quota, zero overage, or successful inference |
 | Real app task success | **NOT YET RUN** | Needs independent postcondition and known cost/entitlement |
 
 Implementation: `runtime/bridge-v3/cua_cli_contracts.py` is called only through
 `computer_use.command="task_preflight"` with `verify_cli_contract=true`.
-The optional `include_auth_status=true` reads only Cursor status and never returns its raw email or organization. Ordinary `task_preflight` **runs no subprocess at all**. No prompt is passed to Cursor or Antigravity; there is no model inference, subscription usage or user-visible desktop operation in the CLI probe.
+The optional `include_auth_status=true` reads only Cursor status and never returns its raw email or organization. The separate opt-in `include_model_listing=true` calls only the fixed official Cursor `agent models` command (bounded to 30 seconds) and returns allowlisted model names, not raw output. It requires `verify_cli_contract=true`; it does **not** establish remaining subscription quota, pricing, or permission to purchase credits. Ordinary `task_preflight` **runs no subprocess at all**. No prompt is passed to Cursor or Antigravity; there is no model inference, subscription usage or user-visible desktop operation in the CLI probe.
 
 Example safe RPC body:
 
@@ -22,7 +23,8 @@ Example safe RPC body:
   "app": "Cursor",
   "task": "Inspect project repository status without changes",
   "verify_cli_contract": true,
-  "include_auth_status": true
+  "include_auth_status": true,
+  "include_model_listing": true
 }
 ```
 
