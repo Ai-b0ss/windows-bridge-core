@@ -52,6 +52,10 @@ def is_linked(path: Path) -> bool:
 
 
 def ensure_root(root: Path) -> Path:
+    # Resolve only after checking the caller-selected root. Otherwise a link
+    # silently redirects addon writes into a different Bridge installation.
+    if is_linked(root):
+        raise AddonError("SYMLINK_INSTALL_ROOT_REJECTED")
     root = root.resolve(strict=True)
     bridge = root / "bridge-v3"
     if not (bridge / "ff_win_v3_main.py").is_file():
@@ -64,9 +68,10 @@ def ensure_root(root: Path) -> Path:
 def checked_name(raw: str, roots: tuple[str, ...]) -> tuple[str, ...]:
     if not raw or "\\" in raw or raw.startswith("/") or ":" in raw or "\x00" in raw:
         raise AddonError("ARCHIVE_UNSAFE_PATH")
-    val = raw.rstrip("/")
-    p = PurePosixPath(val)
-    parts = p.parts
+    # PurePosixPath silently collapses '.' and repeated separators. Validate
+    # the raw ZIP member components before constructing filesystem paths.
+    val = raw[:-1] if raw.endswith("/") else raw
+    parts = tuple(val.split("/"))
     if not parts or parts[0] not in roots or any(x in ("", ".", "..") for x in parts):
         raise AddonError("ARCHIVE_FOREIGN_OR_TRAVERSAL")
     if any(x.endswith((".", " ")) or WINDOWS_RESERVED.fullmatch(x) for x in parts):
