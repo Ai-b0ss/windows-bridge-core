@@ -6,6 +6,7 @@ Does not inspect or modify the owner's installed Windows Bridge.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -144,7 +145,14 @@ class PublicCoreUpgradeRehearsal(unittest.TestCase):
             msg=(child.stderr or b"")[-800:].decode("utf-8", "replace"),
         )
         self.assertTrue((self.install / LOCK_NAME).exists())
-        self.assertTrue(verify_runtime(self.install)["error"] == "DEPLOY_LOCK_PRESENT")
+        self.assertEqual(verify_runtime(self.install)["error"], "DEPLOY_LOCK_PRESENT")
+        # The newer writer must not serialize imaginary backup files for
+        # newly created modules. Legacy placeholders are tested separately.
+        lock = json.loads((self.install / LOCK_NAME).read_text(encoding="utf-8-sig"))
+        journal = json.loads(Path(lock["journal"]).read_text(encoding="utf-8-sig"))
+        new_files = [item for item in journal["files"] if not item["existed"]]
+        self.assertTrue(new_files)
+        self.assertTrue(all(item["backup"] is None for item in new_files))
 
         recovered = recover_stale(self.install)
         self.assertTrue(recovered["recovered"])
