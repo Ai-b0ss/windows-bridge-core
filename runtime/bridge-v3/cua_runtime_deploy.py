@@ -140,11 +140,43 @@ def _runtime_source_map_from_ref(repo: Path, head: str) -> dict[str, str]:
     return result
 
 
+def _public_runtime_source_map(repo: Path, head: str) -> dict[str, str]:
+    """Use the PUBLIC Core's pinned runtime tree, not legacy private tools/."""
+    cp = subprocess.run(
+        ["git", "-C", str(repo), "ls-tree", "-r", "--name-only", head,
+         "--", "runtime/bridge-v3/"],
+        capture_output=True, text=True, timeout=30, check=False,
+    )
+    if cp.returncode != 0:
+        raise RuntimeError("PUBLIC_RUNTIME_TREE_UNAVAILABLE")
+    names = cp.stdout.splitlines()
+    if len(names) > 400:
+        raise RuntimeError("PUBLIC_RUNTIME_FILE_COUNT_INVALID")
+    mapping = {}
+    seen = set()
+    for name in names:
+        if not name.startswith("runtime/bridge-v3/"):
+            raise RuntimeError("PUBLIC_RUNTIME_SOURCE_INVALID")
+        target = name[len("runtime/bridge-v3/"):]
+        if (not target or any(part in {"", ".", ".."} for part in target.split("/"))
+                or "\\" in target or ":" in target
+                or target.casefold() in seen):
+            raise RuntimeError("PUBLIC_RUNTIME_SOURCE_INVALID")
+        seen.add(target.casefold())
+        mapping[name] = target
+    if mapping and "runtime/bridge-v3/ff_win_v3_agent.py" not in mapping:
+        raise RuntimeError("PUBLIC_RUNTIME_AGENT_MISSING")
+    return mapping
+
+
 def build_plan(repo: Path, ref: str = "HEAD") -> dict[str, Any]:
     repo = repo.resolve()
     head = resolve_ref(repo, ref)
-    current_head = resolve_ref(repo, "HEAD")
-    source_map = RUNTIME_SOURCE_MAP if head == current_head else _runtime_source_map_from_ref(repo, head)
+    source_map = _public_runtime_source_map(repo, head)
+    if not source_map:
+        current_head = resolve_ref(repo, "HEAD")
+        source_map = (RUNTIME_SOURCE_MAP if head == current_head
+                      else _runtime_source_map_from_ref(repo, head))
     files = []
     for source, target in source_map.items():
         raw = git_blob_bytes(repo, head, source)
@@ -294,28 +326,111 @@ def _acquire_lock(lock_path: Path, payload: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _recovery_target(root: Path, name: Any) -> Path:
+    """Reject path traversal, reparse points and protected deployment metadata."""
+    if (not isinstance(name, str) or not 0 < len(name) <= 512
+            or "\\" in name or ":" in name or name.startswith("/")):
+        raise RuntimeError("ROLLBACK_TARGET_UNSAFE")
+    parts = name.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise RuntimeError("ROLLBACK_TARGET_UNSAFE")
+    if parts[0] in {TX_DIR_NAME, LOCK_NAME, MANIFEST_NAME}:
+        raise RuntimeError("ROLLBACK_TARGET_UNSAFE")
+    cursor = root
+    for part in parts:
+        cursor = cursor / part
+        if cursor.is_symlink() or getattr(cursor, "is_junction", lambda: False)():
+            raise RuntimeError("ROLLBACK_TARGET_LINK_FORBIDDEN")
+    return cursor
+
+
+def _comparable_path(path: Path) -> str:
+    """Normalize Win32 extended-length spellings for equality comparisons."""
+    value = os.path.normcase(str(path.resolve()))
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
+
+
+def _backup_at(expected: Path, supplied: Any, old_sha: Any) -> Path:
+    if (not isinstance(supplied, str)
+            or not isinstance(old_sha, str)
+            or len(old_sha) != 64
+            or any(char not in "0123456789abcdef" for char in old_sha)):
+        raise RuntimeError("ROLLBACK_BACKUP_INVALID")
+    actual = Path(supplied)
+    if (not actual.is_absolute()
+            or _comparable_path(actual) != _comparable_path(expected)):
+        raise RuntimeError("ROLLBACK_BACKUP_PATH_INVALID")
+    node = expected
+    while True:
+        if node.is_symlink() or getattr(node, "is_junction", lambda: False)():
+            raise RuntimeError("ROLLBACK_BACKUP_LINK_FORBIDDEN")
+        if node.parent == node:
+            break
+        node = node.parent
+    if not expected.is_file() or sha256_file(expected) != old_sha:
+        raise RuntimeError("ROLLBACK_BACKUP_INVALID")
+    return expected
+
+
 def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
+    """Prevalidate ALL recovery inputs before writing even the first target."""
     runtime_root = extended_path(runtime_root, force=True)
-    txid = str(journal["txid"])
-    for item in journal["files"]:
-        target = runtime_root / str(item["target"])
+    if not isinstance(journal, dict) or journal.get("schema") != LOCK_SCHEMA + "/journal":
+        raise RuntimeError("ROLLBACK_JOURNAL_SCHEMA_INVALID")
+    txid = journal.get("txid")
+    if (not isinstance(txid, str) or len(txid) != 32
+            or any(char not in "0123456789abcdef" for char in txid)):
+        raise RuntimeError("ROLLBACK_TXID_INVALID")
+    rows = journal.get("files")
+    previous = journal.get("previous_manifest")
+    if not isinstance(rows, list) or len(rows) > 500 or not isinstance(previous, dict):
+        raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
+    backup_root = runtime_root / TX_DIR_NAME / txid / "backup"
+    prepared: list[tuple[Path, Path | None, str | None]] = []
+    seen: set[str] = set()
+    for item in rows:
+        if not isinstance(item, dict) or type(item.get("existed")) is not bool:
+            raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
+        name = item.get("target")
+        target = _recovery_target(runtime_root, name)
+        if name.casefold() in seen:
+            raise RuntimeError("ROLLBACK_TARGET_DUPLICATE")
+        seen.add(name.casefold())
         if item["existed"]:
-            backup = extended_path(item["backup"], force=True)
-            if not backup.is_file() or sha256_file(backup) != item["old_sha256"]:
-                raise RuntimeError(f"ROLLBACK_BACKUP_INVALID:{item['target']}")
+            expected = backup_root.joinpath(*name.split("/"))
+            backup = _backup_at(expected, item.get("backup"), item.get("old_sha256"))
+            prepared.append((target, backup, item["old_sha256"]))
+        else:
+            if item.get("backup") not in (None, "") or item.get("old_sha256") is not None:
+                raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
+            prepared.append((target, None, None))
+    manifest_target = runtime_root / MANIFEST_NAME
+    if type(previous.get("existed")) is not bool:
+        raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
+    if manifest_target.is_symlink() or getattr(manifest_target, "is_junction", lambda: False)():
+        raise RuntimeError("ROLLBACK_TARGET_LINK_FORBIDDEN")
+    if previous["existed"]:
+        manifest_backup = _backup_at(backup_root / MANIFEST_NAME,
+                                     previous.get("backup"), previous.get("old_sha256"))
+    else:
+        if previous.get("backup") is not None or previous.get("old_sha256") is not None:
+            raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
+        manifest_backup = None
+    # Every input is now validated; an invalid later entry cannot cause a
+    # partial earlier rollback (or delete arbitrary owner files).
+    for target, backup, old_sha in prepared:
+        if backup is not None:
             _copy_replace(backup, target, txid + ".rollback")
-            if sha256_file(target) != item["old_sha256"]:
-                raise RuntimeError(f"ROLLBACK_HASH_MISMATCH:{item['target']}")
+            if sha256_file(target) != old_sha:
+                raise RuntimeError("ROLLBACK_HASH_MISMATCH")
         elif target.exists():
             target.unlink()
-
-    manifest_target = runtime_root / MANIFEST_NAME
-    previous = journal["previous_manifest"]
-    if previous["existed"]:
-        backup = extended_path(previous["backup"], force=True)
-        if not backup.is_file() or sha256_file(backup) != previous["old_sha256"]:
-            raise RuntimeError("ROLLBACK_MANIFEST_BACKUP_INVALID")
-        _copy_replace(backup, manifest_target, txid + ".manifest.rollback")
+    if manifest_backup is not None:
+        _copy_replace(manifest_backup, manifest_target, txid + ".manifest.rollback")
     elif manifest_target.exists():
         manifest_target.unlink()
 
@@ -325,14 +440,30 @@ def recover_stale(runtime_root: Path) -> dict[str, Any]:
     lock_path = runtime_root / LOCK_NAME
     if not lock_path.is_file():
         return {"recovered": False}
+    if lock_path.is_symlink() or getattr(lock_path, "is_junction", lambda: False)():
+        raise RuntimeError("DEPLOY_LOCK_LINK_FORBIDDEN")
     lock = _read_json(lock_path)
+    if not isinstance(lock, dict) or lock.get("schema") != LOCK_SCHEMA:
+        raise RuntimeError("DEPLOY_LOCK_SCHEMA_INVALID")
+    txid = lock.get("txid")
+    if (not isinstance(txid, str) or len(txid) != 32
+            or any(char not in "0123456789abcdef" for char in txid)):
+        raise RuntimeError("DEPLOY_LOCK_TXID_INVALID")
+    journal_path = runtime_root / TX_DIR_NAME / txid / "journal.json"
+    recorded = lock.get("journal")
+    if (not isinstance(recorded, str) or not Path(recorded).is_absolute()
+            or _comparable_path(Path(recorded)) != _comparable_path(journal_path)):
+        raise RuntimeError("DEPLOY_JOURNAL_PATH_INVALID")
+    if (journal_path.is_symlink() or getattr(journal_path, "is_junction", lambda: False)()
+            or journal_path.parent.is_symlink()
+            or getattr(journal_path.parent, "is_junction", lambda: False)()):
+        raise RuntimeError("DEPLOY_JOURNAL_LINK_FORBIDDEN")
     pid = int(lock.get("pid") or 0)
     started = lock.get("started_at")
     alive = (_process_alive(pid, created_before=datetime.fromisoformat(started).timestamp())
              if started else _process_alive(pid))
     if pid != os.getpid() and alive:
         raise RuntimeError(f"DEPLOY_BUSY:{pid}")
-    journal_path = extended_path(str(lock.get("journal") or ""), force=True)
     if not journal_path.is_file():
         # Targets are not modified until the journal has been durably written.
         # A dead owner with no journal therefore means the transaction stopped
@@ -340,6 +471,8 @@ def recover_stale(runtime_root: Path) -> dict[str, Any]:
         lock_path.unlink()
         return {"recovered": True, "txid": lock.get("txid"), "phase": "precommit_no_journal"}
     journal = _read_json(journal_path)
+    if journal.get("txid") != txid:
+        raise RuntimeError("DEPLOY_JOURNAL_TXID_MISMATCH")
     _restore_journal(runtime_root, journal)
     lock_path.unlink()
     return {"recovered": True, "txid": journal.get("txid"), "phase": "rollback_from_journal"}
