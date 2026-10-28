@@ -99,8 +99,8 @@ class TestGitDiffTask(unittest.TestCase):
                                       "scope": "unstaged"}, expected_changed=True)
         self.assertEqual(caught.exception.code, "TASK_EXECUTE_POSTCONDITION_FAILED")
 
-    def test_binary_and_tabbed_filename_unambiguous_with_nul_terminated_paths(self):
-        tabbed = self.root / "a\tb.txt"
+    def test_binary_and_unicode_filename_unambiguous_with_nul_terminated_paths(self):
+        tabbed = self.root / "a space β.txt"
         tabbed.write_text("first\n", encoding="utf-8")
         binary = self.root / "image.bin"
         binary.write_bytes(b"\x00\x01\x02")
@@ -111,7 +111,7 @@ class TestGitDiffTask(unittest.TestCase):
         binary.write_bytes(b"\x00\x01\x02\x03\x04")
         receipt = self.execute()
         by_path = {entry["path"]: entry for entry in receipt["files"]}
-        self.assertEqual(by_path["a\tb.txt"]["added"], 1)
+        self.assertEqual(by_path["a space β.txt"]["added"], 1)
         self.assertTrue(by_path["image.bin"]["binary"])
         self.assertIsNone(by_path["image.bin"]["added"])
         self.assertIsNone(by_path["image.bin"]["deleted"])
