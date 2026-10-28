@@ -405,8 +405,19 @@ def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
             backup = _backup_at(expected, item.get("backup"), item.get("old_sha256"))
             prepared.append((target, backup, item["old_sha256"]))
         else:
-            if item.get("backup") not in (None, "") or item.get("old_sha256") is not None:
+            if item.get("old_sha256") is not None:
                 raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
+            supplied_backup = item.get("backup")
+            if supplied_backup not in (None, ""):
+                # Releases before this fix recorded the *planned* backup
+                # path even for a file that never existed. Accept only that
+                # exact, absent, transaction-owned slot for crash recovery.
+                expected = backup_root.joinpath(*name.split("/"))
+                if (not isinstance(supplied_backup, str)
+                        or not Path(supplied_backup).is_absolute()
+                        or _comparable_path(Path(supplied_backup)) != _comparable_path(expected)
+                        or expected.exists()):
+                    raise RuntimeError("ROLLBACK_BACKUP_PATH_INVALID")
             prepared.append((target, None, None))
     manifest_target = runtime_root / MANIFEST_NAME
     if type(previous.get("existed")) is not bool:
@@ -573,7 +584,7 @@ def apply_runtime(
             journal_files.append({
                 "target": target_name,
                 "existed": existed,
-                "backup": str(backup),
+                "backup": str(backup) if existed else None,
                 "old_sha256": old_sha,
             })
 
