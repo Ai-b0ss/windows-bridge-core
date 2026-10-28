@@ -121,5 +121,35 @@ class TestRecoveryGuards(unittest.TestCase):
         self.assertEqual(verified["python"], 2)
 
 
+    def test_legacy_absent_backup_placeholder_can_be_recovered_safely(self):
+        # Earlier real deployment code stored str(backup) for files that did
+        # not exist before the transaction. The slot itself never existed.
+        introduced = self.root / "introduced.py"
+        introduced.write_bytes(b"new-only-data")
+        self.journal["files"].append({
+            "target": "introduced.py", "existed": False,
+            "backup": str(self.backup.parent / "introduced.py"),
+            "old_sha256": None,
+        })
+        _restore_journal(self.root, self.journal)
+        self.assertFalse(introduced.exists())
+        self.assertEqual(self.module.read_bytes(), b"previous\n")
+        self.assertFalse(self.manifest.exists())
+
+    def test_legacy_absent_backup_must_match_owned_transaction_slot(self):
+        introduced = self.root / "introduced.py"
+        introduced.write_bytes(b"new-only-data")
+        self.journal["files"].append({
+            "target": "introduced.py", "existed": False,
+            "backup": str(self.root.parent / "foreign-placeholder"),
+            "old_sha256": None,
+        })
+        with self.assertRaisesRegex(RuntimeError, "ROLLBACK_BACKUP_PATH_INVALID"):
+            _restore_journal(self.root, self.journal)
+        self.assertEqual(self.module.read_bytes(), b"current\n")
+        self.assertEqual(introduced.read_bytes(), b"new-only-data")
+        self.assertEqual(self.manifest.read_bytes(), b"current manifest")
+
+
 if __name__ == "__main__":
     unittest.main()
