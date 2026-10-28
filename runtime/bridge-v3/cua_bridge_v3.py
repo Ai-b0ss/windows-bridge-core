@@ -314,6 +314,14 @@ class CuaBridgeControlPlane:
         state_dir: str | Path | None = None,
     ):
         self.root = Path(package_root).resolve()
+        # Route preferences are mutable runtime state, never package source bytes.
+        # Respect the caller's isolated state root; otherwise use this Bridge's
+        # FF_BRIDGE_ROOT (not the shared Python source/package directory).
+        if state_dir is not None:
+            self._experience_state_dir = Path(state_dir)
+        else:
+            default_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "FF-Windows-Bridge"
+            self._experience_state_dir = Path(os.environ.get("FF_BRIDGE_ROOT") or default_root) / "state"
         self._browser_factory = browser_factory
         self._native_factory = native_factory
         self._physical_factory = physical_factory
@@ -467,7 +475,8 @@ class CuaBridgeControlPlane:
             if self._experience_store_factory is not None:
                 self._experience_store = self._experience_store_factory(self.root)
             else:
-                path = self.root / "cua_app_route_experience.json" if self.root.name.casefold() == "bridge-v3" else None
+                path = (self._experience_state_dir / "cua_app_route_experience.json"
+                        if self.root.name.casefold() == "bridge-v3" else None)
                 self._experience_store = AppRouteExperienceStore(path)
         return self._experience_store
 
