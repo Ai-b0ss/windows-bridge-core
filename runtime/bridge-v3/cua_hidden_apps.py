@@ -84,8 +84,24 @@ def read_document_text(transport, hwnd, owns):
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-def prepare_uia(root):
+def prepare_uia(root, *, cache_root=None):
+    """Compile the verified sidecar into owner state, never into package bytes."""
     root=Path(root)
+    if cache_root is None:
+        # FF_BRIDGE_ROOT is unique per installed/isolated Bridge. A repository
+        # checkout and a read-only release must never acquire compiled artifacts.
+        state_root=os.environ.get("FF_BRIDGE_ROOT")
+        if not state_root:
+            local=os.environ.get("LOCALAPPDATA")
+            if not local:
+                raise ValueError("HIDDEN_UIA_STATE_ROOT_UNAVAILABLE")
+            state_root=str(Path(local)/"FF-Windows-Bridge")
+        cache_root=Path(state_root)/"state"/"uia3-sidecar-cache"
+    cache_root=Path(cache_root)
+    if not cache_root.is_absolute():
+        raise ValueError("HIDDEN_UIA_CACHE_ROOT_NOT_ABSOLUTE")
+    if cache_root.resolve().is_relative_to(root.resolve()):
+        raise ValueError("HIDDEN_UIA_SOURCE_CACHE_FORBIDDEN")
     framework=Path(os.environ["WINDIR"])/"Microsoft.NET/Framework64/v4.0.30319"
     compiler=framework/"csc.exe"
     references=[framework/"WPF/UIAutomationClient.dll",framework/"WPF/UIAutomationTypes.dll",framework/"System.Web.Extensions.dll"]
@@ -96,10 +112,12 @@ def prepare_uia(root):
     hashes={str(path):sha(path) for path in inputs}
     identity=hashlib.sha256(json.dumps(hashes,sort_keys=True).encode()).hexdigest()
     from cua_windows_paths import extended_path
-    cache=extended_path(root/".uia3-sidecar-cache")
-    if linked(cache):
+    cache=extended_path(cache_root)
+    if linked(cache) or linked(cache.parent):
         raise ValueError("HIDDEN_UIA_CACHE_LINK_FORBIDDEN")
-    cache.mkdir(exist_ok=True)
+    cache.mkdir(parents=True,exist_ok=True)
+    if linked(cache) or linked(cache.parent):
+        raise ValueError("HIDDEN_UIA_CACHE_LINK_FORBIDDEN")
     marker=extended_path(cache/(identity+".json"))
     with _StateLock(cache/"build.lock"):
         try:
