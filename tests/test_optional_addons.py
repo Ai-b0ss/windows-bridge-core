@@ -120,5 +120,44 @@ class TestAddonInstall(unittest.TestCase):
             addon.install(self.root, "browser", self.archive)
 
 
+    def test_ambiguous_zip_components_rejected_before_extraction(self):
+        for path in (
+            "node_modules/./plugin/index.js",
+            "node_modules//plugin/index.js",
+            "node_modules/plugin//",
+        ):
+            with self.subTest(path=path):
+                self.make_zip({
+                    path: b"payload",
+                    "browsers/chromium/readme.txt": b"browser-test",
+                })
+                self.spec.update(self.lock())
+                with self.assertRaisesRegex(addon.AddonError, "TRAVERSAL"):
+                    addon.install(self.root, "browser", self.archive)
+                self.assertFalse((self.root / "bridge-v3/node_modules").exists())
+                self.assertFalse((self.root / "bridge-v3/browsers").exists())
+                self.assertFalse((self.root / ".bridge-optional-addons.lock").exists())
+
+    def test_linked_install_root_rejected_without_writing_to_target(self):
+        # Mocked link detection is deterministic on Windows runners where
+        # creating a real symlink may require an additional privilege.
+        with patch.object(addon, "is_linked", side_effect=lambda path: path == self.root):
+            with self.assertRaisesRegex(addon.AddonError, "SYMLINK_INSTALL_ROOT"):
+                addon.install(self.root, "browser", self.archive)
+        self.assertFalse((self.root / "bridge-v3/node_modules").exists())
+        self.assertFalse((self.root / "bridge-v3/browsers").exists())
+        self.assertTrue((self.root / "bridge-v3/ff_win_v3_main.py").exists())
+
+    def test_real_symlink_install_root_rejected_if_supported(self):
+        alias = Path(self.tmp.name) / "linked-core"
+        try:
+            alias.symlink_to(self.root, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            self.skipTest("Directory symlinks unavailable on this runner")
+        with self.assertRaisesRegex(addon.AddonError, "SYMLINK_INSTALL_ROOT"):
+            addon.install(alias, "browser", self.archive)
+        self.assertFalse((self.root / "bridge-v3/node_modules").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
