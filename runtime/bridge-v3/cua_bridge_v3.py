@@ -1515,13 +1515,16 @@ class CuaBridgeControlPlane:
                 },
             })
         if any(name in args and type(args[name]) is not bool
-               for name in ("verify_cli_contract", "include_auth_status")):
+               for name in ("verify_cli_contract", "include_auth_status", "include_model_listing")):
+            raise CuaBridgeError("CLI_CONTRACT_PROBE_FLAG_INVALID")
+        if args.get("include_model_listing") is True and args.get("verify_cli_contract") is not True:
             raise CuaBridgeError("CLI_CONTRACT_PROBE_FLAG_INVALID")
         contract = None
         if args.get("verify_cli_contract") is True:
             from cua_cli_contracts import probe_vendor_cli
             contract = probe_vendor_cli(
-                app, include_auth_status=args.get("include_auth_status") is True
+                app, include_auth_status=args.get("include_auth_status") is True,
+                include_model_listing=args.get("include_model_listing") is True
             )
         office_com = None
         if "verify_office_com" in args and type(args["verify_office_com"]) is not bool:

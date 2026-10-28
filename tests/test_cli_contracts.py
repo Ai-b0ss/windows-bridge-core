@@ -24,6 +24,8 @@ class FakeRunner:
         if "--help" in argv:
             return SimpleNamespace(returncode=0,stdout=b"Usage: agent --print --mode --output-format --sandbox",
                                    stderr=b"")
+        if tuple(argv[1:]) == ("models",):
+            return SimpleNamespace(returncode=0, stdout=b"composer-2.5  grok-4.7\nsecret-person@example.net\n", stderr=b"")
         if "status" in argv:
             return SimpleNamespace(returncode=0,stdout=b"Logged in as secret-person@example.net\n",
                                    stderr=b"")
@@ -61,6 +63,23 @@ class TestVendorCliContracts(unittest.TestCase):
             self.assertFalse(active[key])
         self.assertTrue(all("timeout" in args for _,args in runner.calls))
         self.assertTrue(all(args["stdin"] is subprocess.DEVNULL for _,args in runner.calls))
+
+    def test_cursor_model_inventory_is_explicit_redacted_and_not_entitlement(self):
+        runner = FakeRunner()
+        passive = probe_vendor_cli("Cursor", runner=runner, local_appdata=self.root)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertFalse(passive["models_list_checked"])
+        self.assertEqual(passive["observed_cursor_models"], [])
+        checked = probe_vendor_cli("Cursor", runner=runner, local_appdata=self.root,
+                                   include_model_listing=True)
+        self.assertTrue(checked["models_list_checked"])
+        self.assertEqual(checked["observed_cursor_models"], ["composer-2.5", "grok-4.7"])
+        self.assertFalse(checked["quota_and_pricing_verified"])
+        self.assertFalse(checked["model_called"])
+        self.assertFalse(checked["task_completed"])
+        self.assertNotIn("secret-person", str(checked))
+        self.assertEqual(runner.calls[-1][0][1:], ("models",))
+        self.assertLessEqual(runner.calls[-1][1]["timeout"], 30)
 
     def test_antigravity_output_flags_and_no_auth_touch(self):
         runner=FakeRunner()
@@ -136,7 +155,7 @@ class TestUnifiedProbeWiring(unittest.TestCase):
             })
             self.assertEqual(active["cli_contract"],info)
             self.assertTrue(active["external_cli_readonly_probe_requested"])
-            method.assert_called_once_with("Cursor",include_auth_status=True)
+            method.assert_called_once_with("Cursor",include_auth_status=True,include_model_listing=False)
 
     def test_bad_flag_fails_closed(self):
         from test_task_preflight_unified import FakePlane
@@ -144,6 +163,12 @@ class TestUnifiedProbeWiring(unittest.TestCase):
             FakePlane()._task_preflight({"app":"cursor","task":"read",
                                          "verify_cli_contract":"true"})
         self.assertEqual(cm.exception.code,"CLI_CONTRACT_PROBE_FLAG_INVALID")
+        with self.assertRaises(CuaBridgeError):
+            FakePlane()._task_preflight({"app":"Cursor","task":"read",
+                                         "include_model_listing":True})
+        with self.assertRaises(CuaBridgeError):
+            FakePlane()._task_preflight({"app":"Cursor","task":"read",
+                                         "include_model_listing":"yes"})
 
 
 if __name__=="__main__":
