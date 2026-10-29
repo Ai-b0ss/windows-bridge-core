@@ -507,7 +507,7 @@
     "tests/test_task_execute_git_status.py": "66da028a2dc48f151673c6a43c525dae9a92d0ede473628e3754b84344f7bdf7",
     "tests/test_task_orchestration_gate.py": "7185afcb28be18fdfc4e72c778edb858b428c497f2a4a7fb0029d6588d9c1687",
     "tests/test_task_preflight_unified.py": "feeeecd83d0ba5efde72f7c11be1e1c43a9bd3c7ee6ede0641ae34b2acf9c5e3",
-    "tests/test_transport_module_paths.py": "09ac78bc07c910099e8c0fecd948920c5da1223567bfff69e050cb7b5a8e024a",
+    "tests/test_transport_module_paths.py": "82777c9307961ddca6700f55cffbf8853f134fc7efd49767bc77f04622faecfd",
     "tests/test_visual_addon_cache.py": "9f375c01b5df6165b36ec73324360595da9966bb1a3741afb3bf62dede27c59a",
     "tools/bridge_remote_gh.py": "c1affff9b047154baf3bd8bc10a20d0ca91fc11693f54a2f0eee3904db9d582f",
     "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0"

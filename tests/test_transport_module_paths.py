@@ -41,7 +41,9 @@ class TestTransportModulePaths(unittest.TestCase):
         return subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
                                "-ExecutionPolicy", "Bypass", "-Command", code, *map(str, args)],
                               cwd=root, env={**os.environ, "FF_BRIDGE_ROOT": str(root),
-                                             "FF_GH_HOME": str(root / "github-transport")},
+                                             "FF_GH_HOME": str(root / "github-transport"),
+                                             # The import gate must not rewrite caches the tests plant.
+                                             "PYTHONDONTWRITEBYTECODE": "1"},
                               capture_output=True, text=True, errors="replace", timeout=45)
 
     def test_no_shared_python_filenames_in_transport(self):
@@ -51,7 +53,7 @@ class TestTransportModulePaths(unittest.TestCase):
     def test_entrypoints_import_shared_modules_from_bridge_in_both_layouts(self):
         for installed in (False, True):
             with self.subTest(installed=installed), tempfile.TemporaryDirectory() as td:
-                root = Path(td) / ("installed" if installed else "runtime")
+                root = Path(td).resolve() / ("installed" if installed else "runtime")
                 transport = self.layout(root)
                 for entry in ENTRYPOINTS:
                     with self.subTest(entry=entry):
@@ -68,7 +70,7 @@ print(json.dumps(modules))
 
     def test_missing_bridge_fails_before_entrypoint_dependencies(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             transport = self.layout(root, bridge=False)
             for entry in (*ENTRYPOINTS, "ff_win_transport_paths"):
                 with self.subTest(entry=entry):
@@ -81,7 +83,7 @@ print(json.dumps(modules))
 
     def test_bootstrap_keeps_order_without_duplicate_paths(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             transport = self.layout(root)
             result = self.python(root, """
 import importlib, json, sys
@@ -115,7 +117,7 @@ print(json.dumps(sys.path))
         entries = sorted(file.name for file in TRANSPORT.glob("*.py")
                          if "__main__" in file.read_text(encoding="utf-8"))
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             transport = self.layout(root)
             for name in entries:
                 with self.subTest(entry=name):
@@ -129,7 +131,7 @@ print(json.dumps(sys.path))
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell required")
     def test_upgrade_removes_only_legacy_modules_and_their_caches(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             transport = self.layout(root)
             cache = transport / "__pycache__"
             cache.mkdir()
@@ -164,7 +166,7 @@ Assert-FFTransportImports $Python $Transport
     @unittest.skipUnless(os.name == "nt", "Windows PowerShell required")
     def test_staging_import_gate_reports_missing_shared_runtime(self):
         with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
+            root = Path(td).resolve()
             transport = self.layout(root, bridge=False)
             result = self.powershell(root, """
 & { param($Common,$Transport,$Python)
