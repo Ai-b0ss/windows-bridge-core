@@ -51,6 +51,31 @@ class TestInstalledPackageContract(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "SOURCE_IDENTITY_MISMATCH"):
                 verify_installed(package, installed, "different-commit")
 
+    def test_installed_transport_hashes_are_verified_when_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            package, installed, marker = self.fixture(Path(td))
+            transport = installed / "github-transport"
+            transport.mkdir()
+            file = transport / "ff_win_transport_paths.py"
+            file.write_bytes(b"# transport bootstrap\n")
+            manifest_path = package / "release-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["files"]["runtime/github-transport/ff_win_transport_paths.py"] = hashlib.sha256(file.read_bytes()).hexdigest()
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            self.assertEqual(verify_installed(package, installed, "new-commit")[1], 22)
+            file.write_bytes(b"stale transport")
+            with self.assertRaisesRegex(RuntimeError, "SOURCE_SHA_MISMATCH"):
+                verify_installed(package, installed, "new-commit")
+
+    def test_old_transport_duplicate_cannot_shadow_the_shared_runtime(self):
+        with tempfile.TemporaryDirectory() as td:
+            package, installed, marker = self.fixture(Path(td))
+            transport = installed / "github-transport"
+            transport.mkdir()
+            (transport / "module0.py").write_bytes(b"stale shared module")
+            with self.assertRaisesRegex(RuntimeError, "LEGACY_TRANSPORT_MODULE_SHADOWING"):
+                verify_installed(package, installed, "new-commit")
+
 
 if __name__ == "__main__":
     unittest.main()

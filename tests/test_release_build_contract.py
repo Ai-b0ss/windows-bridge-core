@@ -109,6 +109,40 @@ class TestReleaseBuildContract(unittest.TestCase):
         self.assertTrue(all(len(x)==64 for x in builder.ASSET_HASHES.values()))
         self.assertEqual(len(builder.PREVIOUS_RELEASE_SHA),64)
 
+    def test_transport_bundle_uses_only_bridge_shared_modules(self):
+        contents = builder.source_tree(ROOT)
+        bridge = {Path(name).name for name in contents if name.startswith("runtime/bridge-v3/") and name.endswith(".py")}
+        transport = {Path(name).name for name in contents if name.startswith("runtime/github-transport/") and name.endswith(".py")}
+        self.assertFalse(bridge & transport)
+        self.assertIn("ff_win_transport_paths.py", transport)
+        manifest = json.loads((ROOT / "release-manifest.json").read_text(encoding="utf-8"))
+        self.assertTrue(set(contents) <= set(manifest["files"]))
+        manifest_transport = {Path(name).name for name in manifest["files"]
+                              if name.startswith("runtime/github-transport/") and name.endswith(".py")}
+        self.assertEqual(manifest_transport, transport)
+
+    def test_source_manifest_refresh_replaces_stale_records_without_release_claim(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = root / "release-manifest.json"
+            path.write_text(json.dumps({"schema": "ff-gh-release-v1", "source_commit": "previous-release",
+                                        "files": {"assets/test.zip": "asset-hash", "README-FIRST.md": "readme-hash",
+                                                  "runtime/github-transport/ff_win_v3_agent.py": "stale"}}), encoding="utf-8")
+            contents = builder.source_tree(ROOT)
+            with patch.object(builder, "source_tree", return_value=contents):
+                builder.refresh_source_manifest(root)
+                first = path.read_bytes()
+                builder.refresh_source_manifest(root)
+            self.assertEqual(first, path.read_bytes())
+            manifest = json.loads(first)
+            self.assertNotIn("runtime/github-transport/ff_win_v3_agent.py", manifest["files"])
+            self.assertEqual(manifest["files"]["assets/test.zip"], "asset-hash")
+            self.assertEqual(manifest["files"]["README-FIRST.md"], "readme-hash")
+            self.assertEqual(manifest["source_commit"], "previous-release")
+            self.assertNotIn("source_bytes_verified_against_commit", manifest)
+            for name, data in contents.items():
+                self.assertEqual(manifest["files"][name], builder.sha(data))
+
 
 if __name__=="__main__":
     unittest.main()

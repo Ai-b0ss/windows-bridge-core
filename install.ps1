@@ -115,6 +115,7 @@ if ($LASTEXITCODE -ne 0) { throw 'RELEASE_RUNTIME_IMPORT_FAILED' }
 $compileTargets = @(Get-ChildItem $transportStage,$v3Stage -Filter '*.py' -File | Select-Object -ExpandProperty FullName)
 & $python -c 'import pathlib,sys; [compile(pathlib.Path(p).read_bytes(),p,''exec'') for p in sys.argv[1:]]' @compileTargets
 if ($LASTEXITCODE -ne 0) { throw 'RELEASE_PYTHON_COMPILE_FAILED' }
+Assert-FFTransportImports $python $transportStage
 foreach ($file in Get-ChildItem $transportStage -Filter '*.ps1') { [void][ScriptBlock]::Create((Get-Content $file.FullName -Raw)) }
 if ($StageOnly) {
     $keepStage = $true
@@ -154,6 +155,7 @@ if ($RuntimeOnly -or $Transport -eq 'Local') {
     New-Item -ItemType Directory -Path $v3Root -Force | Out-Null
     Write-JsonAtomic $localMarker @{schema='ff-local-owned-runtime-v1';source_commit=$manifest.source_commit}
     Copy-FFPortableTree $v3Stage $v3Root
+    Remove-FFLegacyTransportModules $root
     # Paths resolve on every launch; moving the complete InstallRoot is safe.
     $start = @'
 param([int]$Port=39073)
@@ -291,11 +293,21 @@ Get-CimInstance Win32_Process | Where-Object {
     $_.CommandLine -and (($_.Name -ieq 'python.exe' -and $_.CommandLine.Contains($daemonPath)) -or
                          ($_.Name -in @('powershell.exe','pwsh.exe') -and $_.CommandLine.Contains($keeperPath)))
 } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+# Stop the background transport before replacing any of its shared imports.
+$backgroundTaskName = 'FF-GitHub-Background' + $suffix
+$oldBackground = Get-ScheduledTask -TaskName $backgroundTaskName -ErrorAction SilentlyContinue
+if ($oldBackground) { Stop-ScheduledTask -TaskName $backgroundTaskName }
+$backgroundAgent = Join-Path $root 'ff_win_github_background_agent.py'
+$backgroundKeeper = Join-Path $root 'ff_win_github_background_keeper.ps1'
+Get-CimInstance Win32_Process | Where-Object {
+    $_.ProcessId -ne $PID -and $_.CommandLine -and
+    (($_.Name -ieq 'python.exe' -and $_.CommandLine.Contains($backgroundAgent)) -or
+     ($_.Name -ieq 'powershell.exe' -and $_.CommandLine.Contains($backgroundKeeper)))
+} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 $freshV3 = -not (Test-Path (Join-Path $v3Root 'ff_win_v3_main.py'))
 $v3OwnedMarker = Join-Path $v3Root 'ff-gh-owned-runtime.json'
 $managedV3 = $freshV3 -or (Test-Path -LiteralPath $v3OwnedMarker)
 New-Item -ItemType Directory -Path $root -Force | Out-Null
-foreach ($file in Get-ChildItem -LiteralPath $transportStage -File) { Copy-Item -LiteralPath $file.FullName -Destination $root -Force }
 if ($managedV3) {
     New-Item -ItemType Directory -Path $v3Root -Force | Out-Null
     # The marker is committed before copying, so a interrupted first install
@@ -308,6 +320,9 @@ if ($managedV3) {
     Copy-FFPortableTree $v3Stage $v3Root
     [IO.File]::WriteAllText((Join-Path $v3Root 'python-path.txt'), $python)
 }
+Remove-FFLegacyTransportModules $root
+foreach ($file in Get-ChildItem -LiteralPath $transportStage -File) { Copy-Item -LiteralPath $file.FullName -Destination $root -Force }
+Assert-FFTransportImports $python $root
 $config = [ordered]@{schema='ff-win-github-transport-config-v2';repository=$Repository;branch=$Branch;device=$device;
     inbox_issue=$InboxIssue;results_branch=$ResultsBranch;python_path=$python;gh_path=$gh;
     rpc_url=('http://127.0.0.1:' + $RpcPort + '/rpc');allowed_senders=@([string]$TrustedOperator);
@@ -349,16 +364,6 @@ finally { Unregister-ScheduledTask -TaskName $probeName -Confirm:$false -ErrorAc
 if ($prelogin) {
     $principal = $s4uPrincipal
     $trigger = @((New-ScheduledTaskTrigger -AtStartup), (New-ScheduledTaskTrigger -AtLogOn -User $user))
-    $backgroundTaskName = 'FF-GitHub-Background' + $suffix
-    $oldBackground = Get-ScheduledTask -TaskName $backgroundTaskName -ErrorAction SilentlyContinue
-    if ($oldBackground) { Stop-ScheduledTask -TaskName $backgroundTaskName }
-    $backgroundAgent = Join-Path $root 'ff_win_github_background_agent.py'
-    $backgroundKeeper = Join-Path $root 'ff_win_github_background_keeper.ps1'
-    Get-CimInstance Win32_Process | Where-Object {
-        $_.ProcessId -ne $PID -and $_.CommandLine -and
-        (($_.Name -ieq 'python.exe' -and $_.CommandLine.Contains($backgroundAgent)) -or
-         ($_.Name -ieq 'powershell.exe' -and $_.CommandLine.Contains($backgroundKeeper)))
-    } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     $backgroundPort = $RpcPort + 2
     $config.background_rpc_url = 'http://127.0.0.1:' + $backgroundPort + '/rpc'
     $config.autostart_mode = 'startup-s4u-and-logon'

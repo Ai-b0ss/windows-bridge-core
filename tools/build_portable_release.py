@@ -97,6 +97,21 @@ def verify_source_commit(repo: Path, contents: dict[str, bytes]) -> str:
     return head
 
 
+def refresh_source_manifest(repo: Path) -> dict:
+    """Refresh the checked-in template; assemble still verifies release provenance."""
+    path = repo / "release-manifest.json"
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    contents = source_tree(repo)
+    # Keep asset/README records supplied by the previous portable release.
+    files = {name: digest for name, digest in manifest["files"].items()
+             if not name.startswith(("runtime/", "tests/")) and
+             name not in ROOT_FILES | TOOL_FILES}
+    files.update({name: sha(data) for name, data in contents.items()})
+    manifest["files"] = dict(sorted(files.items()))
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return {"ok": True, "output": str(path), "source_files": len(contents)}
+
+
 def assemble(repo: Path, previous: Path, output: Path) -> dict:
     if output.resolve() == previous.resolve():
         raise ValueError("Refuse to overwrite source release")
@@ -168,10 +183,20 @@ def assemble(repo: Path, previous: Path, output: Path) -> dict:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Deterministic offline Windows Bridge portable ZIP builder")
     ap.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
-    ap.add_argument("--previous-release", type=Path, required=True)
-    ap.add_argument("--output", type=Path, required=True)
+    ap.add_argument("--previous-release", type=Path)
+    ap.add_argument("--output", type=Path)
+    ap.add_argument("--refresh-source-manifest", action="store_true",
+                    help="Refresh checked-in source hashes without building or attesting a release")
     opts = ap.parse_args(argv)
-    print(json.dumps(assemble(opts.repo, opts.previous_release, opts.output), sort_keys=True))
+    if opts.refresh_source_manifest:
+        if opts.previous_release or opts.output:
+            ap.error("--refresh-source-manifest cannot be combined with release build arguments")
+        result = refresh_source_manifest(opts.repo)
+    else:
+        if not opts.previous_release or not opts.output:
+            ap.error("release builds require --previous-release and --output")
+        result = assemble(opts.repo, opts.previous_release, opts.output)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -31,6 +31,48 @@ function Copy-FFPortableTree([string]$Source, [string]$Destination) {
     }
 }
 
+function Remove-FFLegacyTransportModules([string]$Root) {
+    $transportPath = [IO.Path]::GetFullPath($Root)
+    if (-not (Test-Path -LiteralPath $transportPath)) { return }
+    $cachePath = Join-Path $transportPath '__pycache__'
+    foreach ($directory in @($transportPath, $cachePath)) {
+        if ((Test-Path -LiteralPath $directory) -and
+            ((Get-Item -LiteralPath $directory -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'LEGACY_TRANSPORT_PATH_LINKED'
+        }
+    }
+    $legacyModules = @(
+        'ff_win_v3_security.py', 'ff_win_v3_extras.py', 'ff_win_evidence.py',
+        'cua_global_resources.py', 'cua_task_authority.py', 'ff_win_v3_agent.py'
+    )
+    foreach ($name in $legacyModules) {
+        foreach ($file in @($name, [IO.Path]::ChangeExtension($name, '.pyc'))) {
+            $target = Join-Path $transportPath $file
+            if (Test-Path -LiteralPath $target -PathType Leaf) { Remove-Item -LiteralPath $target -Force }
+        }
+        if (Test-Path -LiteralPath $cachePath -PathType Container) {
+            $prefix = [IO.Path]::GetFileNameWithoutExtension($name) + '.'
+            foreach ($cached in Get-ChildItem -LiteralPath $cachePath -File) {
+                if ($cached.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -and $cached.Extension -ieq '.pyc') {
+                    Remove-Item -LiteralPath $cached.FullName -Force
+                }
+            }
+        }
+    }
+}
+
+function Assert-FFTransportImports([string]$Python, [string]$TransportRoot) {
+    Push-Location -LiteralPath $TransportRoot
+    try {
+        # Run the real entry points: embedded Python (._pth) adds no script folder,
+        # so this proves each one bootstraps its own import path.
+        foreach ($entry in 'ff_win_github_client.py', 'ff_win_github_background_agent.py') {
+            & $Python (Join-Path $TransportRoot $entry) --help | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw ('RELEASE_TRANSPORT_IMPORT_FAILED:' + $entry) }
+        }
+    } finally { Pop-Location }
+}
+
 function Get-FFPortableExecutable([string]$Root, [string]$Name) {
     foreach ($file in [IO.Directory]::EnumerateFiles((Get-FFExtendedPath $Root),$Name,[IO.SearchOption]::AllDirectories)) {
         if ($file.StartsWith('\\?\UNC\')) { return '\\' + $file.Substring(8) }

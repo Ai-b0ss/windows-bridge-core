@@ -1,11 +1,14 @@
 """Headless V3 base operations in Session 0; no Commander or GUI startup."""
+import sys
+from pathlib import Path
+# Embedded Python (._pth) does not put the script folder on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ff_win_transport_paths
 import argparse
 import os
-import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-sys.path.insert(0, str(HERE.parent / "bridge-v3"))
 import ff_win_v3_agent as core
 import ff_win_v3_security as security
 import ff_win_v3_extras as extras
