@@ -46,4 +46,4 @@ Tests on a mocked controller do **not** prove ChatGPT host consent, OS UAC, user
 
 Until the host integration exists, do not invent a chat-signed receipt or bypass signature verification. Existing nonprivileged read-only CLI/API actions remain available as appropriate under normal user authority.
 
-Reference: [Skills/installation](CHATGPT-SKILL-INSTALL.md) · [P0 platform](P0_AGENT_PLATFORM.md) · [Core repo](README.md).
+Reference: [Skills/installation](../../CHATGPT-SKILL-INSTALL.md) · [P0 platform](P0_AGENT_PLATFORM.md) · [Core repo](../../README.md).

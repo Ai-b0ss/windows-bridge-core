@@ -50,23 +50,23 @@ installation or running-process acceptance, which must still be tested.
 
 ## P0: Verified agent orchestration and ChatGPT skill
 
-Read [P0_AGENT_PLATFORM.md](P0_AGENT_PLATFORM.md) for verified three-way runtime audit, new no-effect route preflight (computer_use.command=plan_action), the [Windows Bridge Skill source](skills/windows-bridge/SKILL.md), missing host-side permission attestation and explicit acceptance gates. Skill source committed in GitHub is not proof it auto-activates in ChatGPT. The installed home Bridge is intentionally unchanged.
+Read [P0_AGENT_PLATFORM.md](docs/design/P0_AGENT_PLATFORM.md) for verified three-way runtime audit, new no-effect route preflight (computer_use.command=plan_action), the [Windows Bridge Skill source](skills/windows-bridge/SKILL.md), missing host-side permission attestation and explicit acceptance gates. Skill source committed in GitHub is not proof it auto-activates in ChatGPT. The installed home Bridge is intentionally unchanged.
 
 ### P0 — Device-bound owner consent
 
-[Permission Broker design and test status](P0_PERMISSION_BROKER.md): signed approvals bind the exact device/agent/task/action/TTL, reject legacy unbound grants and provide local revocation. This is a local authorization foundation, **not** a claim that ChatGPT host-attested consent is integrated.
+[Permission Broker design and test status](docs/design/P0_PERMISSION_BROKER.md): signed approvals bind the exact device/agent/task/action/TTL, reject legacy unbound grants and provide local revocation. This is a local authorization foundation, **not** a claim that ChatGPT host-attested consent is integrated.
 
 ### P0 — Inspect real Cursor/Antigravity CLI contracts
 
-[Bounded and redacted CLI capability audit](P0_VENDOR_CLI_CONTRACTS.md) is implemented in `task_preflight` as an explicit opt-in. Status/Help/version checks are **not** proof of model entitlement or agent task success.
+[Bounded and redacted CLI capability audit](docs/design/P0_VENDOR_CLI_CONTRACTS.md) is implemented in `task_preflight` as an explicit opt-in. Status/Help/version checks are **not** proof of model entitlement or agent task success.
 
 ### P0 — Durable task recovery
 
-[At-most-once request admission and unknown-outcome handling](P0_DURABLE_TASK_RECOVERY.md): actual RPC duplicate suppression; isolated test-root journals; no automatic replay after lost responses. Full live-process restart still pending.
+[At-most-once request admission and unknown-outcome handling](docs/design/P0_DURABLE_TASK_RECOVERY.md): actual RPC duplicate suppression; isolated test-root journals; no automatic replay after lost responses. Full live-process restart still pending.
 
 
 ### P0 — Detached session identity
 
-[Windows PID reuse and detached log ownership verification](P0_DETACHED_SESSION_IDENTITY.md) prevents accidentally resuming or acting on a different process after restart.
+[Windows PID reuse and detached log ownership verification](docs/design/P0_DETACHED_SESSION_IDENTITY.md) prevents accidentally resuming or acting on a different process after restart.
 ### P0 — Agent discovery without separate Skills
-[Read-only agent_workflows protocol](P0_AGENT_WORKFLOW_DISCOVERY.md) through the existing MCP Bridge and capabilities; does not imply automatic activation or permissions.
+[Read-only agent_workflows protocol](docs/design/P0_AGENT_WORKFLOW_DISCOVERY.md) through the existing MCP Bridge and capabilities; does not imply automatic activation or permissions.

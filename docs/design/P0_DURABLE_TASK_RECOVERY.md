@@ -76,4 +76,4 @@ fail closed. No live source or state has been migrated.
   this journal's contract.
 
 See [P0 agent platform](P0_AGENT_PLATFORM.md) and
-[Windows Bridge Skill](skills/windows-bridge/SKILL.md).
+[Windows Bridge Skill](../../skills/windows-bridge/SKILL.md).
