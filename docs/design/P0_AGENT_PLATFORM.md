@@ -54,7 +54,7 @@ Until the trusted host integration is proven, visible control requiring such con
 5. Exact compatibility regression against old live modules; isolate and preserve rollback. **Only after this** update the live Windows Bridge.
 6. Finally repackage and update distribution/Drive with the tested exact source, not before.
 
-References: [skill](skills/windows-bridge/SKILL.md), [remote device guide](CHATGPT-REMOTE-CONTROL.md), [CI policy](CI_POLICY.md).
+References: [skill](../../skills/windows-bridge/SKILL.md), [remote device guide](../../CHATGPT-REMOTE-CONTROL.md), [CI policy](../../CI_POLICY.md).
 
 ## P0 parity follow-up: restoring the known-app CLI-first policy
 
