@@ -26,14 +26,21 @@ def verify_installed(package: Path, installed: Path, expected_commit: str):
     marker = json.loads((installed / "bridge-v3/ff-local-owned-runtime.json").read_text("utf-8-sig"))
     verify(marker.get("schema") == "ff-local-owned-runtime-v1" and
            marker.get("source_commit") == expected_commit, "INSTALL_MARKER_SOURCE_MISMATCH")
+    runtimes = {"bridge-v3"}
+    transport = installed / "github-transport"
+    if transport.is_dir():
+        runtimes.add("github-transport")
+        bridge_names = {p.name.lower() for p in (installed / "bridge-v3").glob("*.py")}
+        transport_names = {p.name.lower() for p in transport.glob("*.py")}
+        verify(not bridge_names & transport_names, "LEGACY_TRANSPORT_MODULE_SHADOWING")
     count = 0
     for name, expected in manifest["files"].items():
-        if not name.startswith("runtime/bridge-v3/"):
+        if not any(name.startswith("runtime/" + runtime + "/") for runtime in runtimes):
             continue
         parts = PurePosixPath(name).parts
         verify(not PurePosixPath(name).is_absolute() and ".." not in parts and
                "\\" not in name and ":" not in name, "MANIFEST_PATH_INVALID")
-        target = installed / "bridge-v3" / Path(*parts[2:])
+        target = installed / Path(*parts[1:])
         verify(target.is_file() and not target.is_symlink(), "INSTALLED_SOURCE_MISSING")
         verify(hashlib.sha256(target.read_bytes()).hexdigest() == expected, "INSTALLED_SOURCE_SHA_MISMATCH")
         count += 1

@@ -1,4 +1,9 @@
 """GitHub client: redirect discovery, independent fast result reads, bounded fallback."""
+import sys
+from pathlib import Path
+# Embedded Python (._pth) does not put the script folder on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ff_win_transport_paths
 import argparse
 import json
 import time

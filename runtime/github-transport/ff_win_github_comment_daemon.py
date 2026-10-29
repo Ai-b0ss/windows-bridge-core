@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+# Embedded Python (._pth) does not put the script folder on sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import ff_win_transport_paths
 import base64
 import concurrent.futures
 import gzip
@@ -20,8 +25,6 @@ from typing import Any
 from urllib.parse import quote
 
 HERE = Path(__file__).resolve().parent
-if str(HERE) not in sys.path:
-    sys.path.insert(0, str(HERE))
 
 # Keep the shared idempotency journal, but allow this transport to receive
 # larger bridge responses than the old issue/comment transport.

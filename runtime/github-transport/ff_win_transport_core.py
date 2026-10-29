@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ff_win_transport_paths
 import ctypes
 import errno
 import hashlib
@@ -13,12 +14,8 @@ import urllib.request
 from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Any
-try:
-    from ff_win_transport_faults import barrier
-    from ff_win_evidence import redact
-except ImportError:
-    from tools.ff_win_transport_faults import barrier
-    from tools.ff_win_evidence import redact
+from ff_win_transport_faults import barrier
+from ff_win_evidence import redact
 
 ROOT = Path(os.environ.get("FF_BRIDGE_ROOT") or (Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "FF-Windows-Bridge"))
 FAST_ROOT = ROOT / "fast-transport"
