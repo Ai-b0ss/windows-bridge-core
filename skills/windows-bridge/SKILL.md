@@ -27,6 +27,18 @@ Use when the owner requests work on an authorized Windows device (Cursor, Antigr
 12. Clean up only the task's own tabs, temporary files, profiles, sessions and processes. Restore focus/desktop when actually changed; preserve project edits and user data.
 13. Report exact actual device/runtime, selected/rejected routes, costs/permissions, verified outcomes, unknowns, rollback and cleanup.
 
+
+## Claude Desktop on the owner's Windows desktop (NOT Claude Code CLI)
+
+When the owner asks to control **Claude Desktop** (its windows, chat, Usage/settings, sidebar, or Cowork) from ChatGPT while away, treat the native graphical app as the exact target. **Never substitute the `claude` CLI, `remote-control`, or a new model session**: those operate Claude Code, not the existing Claude Desktop window. A user clarification "не CLI" is binding for this task.
+
+- Discover the actual installed Claude Desktop version, verified PID/HWND/process birth, and read-only window/UIA state using `gui_list_windows`, `computer_use(command="windows_mcp",tool="Snapshot")`, or an authorized no-focus observation interface. Do not conflate `Claude.exe` (WindowsApps GUI) with `claude.exe` (CLI).
+- First look for documented app/IPC, approved hidden window or exact semantic UIA controls; inspect the actual target control and independently verify page/message state. Never derive permission from a title alone. Do not execute CLI or install/authorize it unless the owner separately asks for Claude Code.
+- **Do not use arbitrary in-window mouse coordinates under a claimed read-only purpose.** An in-window click can send a message, delete content or change settings. A Usage-reading action must enforce the actual semantic target and verified postcondition, not just window bounds.
+- The 2026-10-30 live Bridge had `chat_consent_challenge_protocol.attested_host_issuer_connected=false`. A clear reply in ChatGPT is owner intent, not a Bridge-signed receipt. If signed foreground approval is required and no trusted issuer is available, report the real blocker; do not simulate approval or bypass the existing guard. A separate, explicitly owner-opted-in task-scoped trust pilot must be independently tested, have a rollback, and must not be represented as host-attested chat permission.
+- Leave existing Claude Desktop sessions untouched. Do not sign out, alter Claude Code credentials, auto-send, or close arbitrary windows. Keep the machine awake and Bridge online when remote access is needed; verify both without changing unrelated power or auth settings.
+- For a safe pilot, require negative tests for unknown controls, wrong PID/HWND, reused window handles, stale semantic generation, malicious UI content, unexpected navigation, expiry, cross-task replay and any action outside the permitted operation. Reconcile ambiguous outcomes before retrying.
+
 ## References
 
 - [API & device discovery](references/API.md)
@@ -39,3 +51,23 @@ For code development, use [public Core](../../README.md), [free CI policy](../..
 ## Real acceptance criterion
 
 In a **new** chat using an actually installed/available skill, the agent receives an authorized task, discovers the correct computer, verifies a task-capable free/covered route, executes without disturbing the owner's desktop if possible, independently verifies effects and cleans up its own resources. A green static test or the existence of this Markdown file is NOT acceptance evidence.
+
+### Optional temporary Claude Desktop trusted-input pilot
+
+On an owner-configured **temporary** installation only, inspect `trusted_skill_status`.
+If and only if it reports `enabled=true`, the owner has explicitly accepted the
+limited agent-trust model, and the exact current task is `inspect_claude_usage_readonly`,
+the agent may call `trusted_skill_begin`, `trusted_skill_act` and `trusted_skill_end`
+for the existing, independently identified Claude Desktop HWND. This is a limited
+owner opt-in, **not a host-attested signed receipt**. The pilot itself checks the
+actual process owner/birth, window identity, visibility, coordinates, expiry and
+action budget; use one session id for one task and close it afterward. Only
+focus, mouse movement, single clicks and scrolling are available; do not infer
+permission to type, send messages, delete content, alter account settings, or
+switch applications. Inspect the current screen and the semantic target before
+each action and verify effects afterward.
+
+Never use the pilot operations when disabled, expired, aimed at another app,
+or when the user has revoked consent. `gui_mouse`, `gui_keyboard`,
+`computer_use` and `set_desktop_mode` keep their existing strict checks.
+See `docs/design/TEMPORARY_SKILL_PILOT.md` for expiry, verification and rollback.

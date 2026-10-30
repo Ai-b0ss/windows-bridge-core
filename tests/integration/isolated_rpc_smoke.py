@@ -65,6 +65,23 @@ def verify_rpc(port: int,secret: str):
            "CLI_FIRST_GUARD_INACTIVE")
     checks.append("cli_first_guard")
 
+    # Opt-in Skill pilot is present but disabled on a clean profile.
+    pilot=rpc(port,secret,"trusted_skill_status",{},"ci-skill-pilot-status")
+    verify(pilot.get("ok") is True, "TRUSTED_SKILL_STATUS_MISSING")
+    pilot_info=pilot.get("result") or {}
+    verify(pilot_info.get("enabled") is False
+           and pilot_info.get("session_active") is False
+           and pilot_info.get("chat_message_attested") is False,
+           "TRUSTED_SKILL_DEFAULT_NOT_DENY")
+    denied=rpc(port,secret,"trusted_skill_begin",{
+        "agent_id":"chatgpt","task_id":"ci-readonly-pilot",
+        "purpose":"inspect_claude_usage_readonly","hwnd":1234,
+    },"ci-skill-pilot-denied")
+    verify(denied.get("ok") is False
+           and denied.get("error_code")=="TRUSTED_GUI_NOT_ENABLED",
+           "TRUSTED_SKILL_UNAUTHORIZED_START")
+    checks.append("temporary_trusted_skill_pilot_default_denied")
+
     discovery=rpc(port,secret,"agent_workflows",{},"ci-agent-workflow-bootstrap")
     verify(discovery.get("ok") is True,"AGENT_WORKFLOWS_READ_FAILED")
     flow=discovery.get("result") or {}

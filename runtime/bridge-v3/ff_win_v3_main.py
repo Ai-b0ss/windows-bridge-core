@@ -429,6 +429,31 @@ def _install_gui_guards() -> None:
     from cua_agent_workflows import agent_workflows as _agent_workflows
     core.OPS["agent_workflows"] = lambda args: _agent_workflows()
 
+    # Explicit owner-configured Skill-guided trusted agent pilot.
+    # Separate from signed approvals; only Claude usage inspection and
+    # bounded mouse navigation, never generic gui_mouse/gui_keyboard.
+    from cua_trusted_skill_input import TrustedSkillInput, TrustedSkillError
+    _trusted_skill = TrustedSkillInput(
+        core.BRIDGE_ROOT / "state" / "trusted-skill-input.json",
+        mouse=original_mouse,
+    )
+
+    def _trusted_skill_call(command, args):
+        try:
+            return {
+                "status": lambda: _trusted_skill.status(),
+                "begin": lambda: _trusted_skill.begin(args),
+                "act": lambda: _trusted_skill.act(args),
+                "end": lambda: _trusted_skill.end(args),
+            }[command]()
+        except TrustedSkillError as exc:
+            raise core.RPCError(str(exc), details={"execution_started": False}) from exc
+
+    core.OPS["trusted_skill_status"] = lambda args: _trusted_skill_call("status", args)
+    core.OPS["trusted_skill_begin"] = lambda args: _trusted_skill_call("begin", args)
+    core.OPS["trusted_skill_act"] = lambda args: _trusted_skill_call("act", args)
+    core.OPS["trusted_skill_end"] = lambda args: _trusted_skill_call("end", args)
+
     # This is a protocol endpoint, NOT an approval issuer. It can prepare an
     # exact request and accept a separately signed host receipt, but never
     # transforms an agent claim or plain chat text into a grant.
@@ -480,6 +505,18 @@ def _install_gui_guards() -> None:
             "independent_app_task_success_attested": False,
         }
         features["agent_workflows_discovery"] = True
+        features["trusted_skill_input_pilot"] = {
+            "version": 1,
+            "mode": "owner_opted_in_to_skill_guided_agent",
+            "enabled": _trusted_skill.status()["enabled"],
+            "allowed_app": "Claude Desktop",
+            "allowed_purpose": "inspect_claude_usage_readonly",
+            "allowed_actions": ["focus","move","click","scroll"],
+            "keyboard_allowed": False, "arbitrary_shell_allowed": False,
+            "max_session_seconds": 600, "max_actions": 12,
+            "independent_chat_attestation": False,
+            "signed_approval_for_other_routes_unchanged": True,
+        }
         features["chat_consent_challenge_protocol"] = {
             "version": 1, "attested_host_issuer_connected": False,
             "owner_grant_from_chat_text": False,
