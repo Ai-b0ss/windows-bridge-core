@@ -97,6 +97,32 @@ def verify_rpc(port: int,secret: str):
     checks.append("mandatory_web_research_and_explicit_in_chat_foreground_gate")
     checks.append("new_chat_readonly_agent_workflow_bootstrap")
 
+    chat_feature=features.get("chat_consent_challenge_protocol") or {}
+    verify(chat_feature.get("requires_signed_receipt") is True
+           and chat_feature.get("attested_host_issuer_connected") is False
+           and chat_feature.get("owner_grant_from_chat_text") is False,
+           "CHAT_CHALLENGE_FALSE_HOST_ATTESTATION")
+    challenge=rpc(port,secret,"chat_consent_prepare",{
+        "operation":"set_desktop_mode",
+        "action":{"mode":"dedicated","targets":[],
+                  "agent_id":"ci-chat-consent","task_id":"ci-consent-task"},
+    },"ci-consent-prepare")
+    verify(challenge.get("ok") is True,"CHAT_CHALLENGE_PREPARE_FAILED")
+    info=challenge.get("result") or {}
+    verify(info.get("schema")=="ff-chat-owner-consent-challenge-v1"
+           and info.get("approved") is False and info.get("authorization_id") is None,
+           "CHAT_CHALLENGE_FALSE_APPROVAL")
+    state=rpc(port,secret,"chat_consent_status",
+              {"challenge_id":info["challenge_id"]},"ci-consent-status")
+    verify(state.get("ok") is True
+           and (state.get("result") or {}).get("status")=="awaiting_attested_host_receipt",
+           "CHAT_CHALLENGE_STATUS_FAILED")
+    fake=rpc(port,secret,"chat_consent_commit",{
+        "challenge_id":info["challenge_id"],"signed_approval":{"approved":True}
+    },"ci-consent-forgery")
+    verify(fake.get("ok") is False,"CHAT_CHALLENGE_FORGED_APPROVAL_ACCEPTED")
+    checks.append("chat_consent_challenge_requires_independent_signed_host_receipt")
+
     task=rpc(port,secret,"computer_use",{
         "command":"task_preflight","app":"git",
         "task":"inspect the repository status without modifying files",
