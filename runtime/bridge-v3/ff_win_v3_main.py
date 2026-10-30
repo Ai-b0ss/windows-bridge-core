@@ -429,6 +429,29 @@ def _install_gui_guards() -> None:
     from cua_agent_workflows import agent_workflows as _agent_workflows
     core.OPS["agent_workflows"] = lambda args: _agent_workflows()
 
+    # This is a protocol endpoint, NOT an approval issuer. It can prepare an
+    # exact request and accept a separately signed host receipt, but never
+    # transforms an agent claim or plain chat text into a grant.
+    from cua_chat_consent import ChatConsentBroker, ChatConsentError
+    _chat_consent = ChatConsentBroker(core.BRIDGE_ROOT / "state" / "chat-consent", _TASK_AUTHORITY)
+
+    def _chat_consent_rpc(operation, args):
+        try:
+            if operation == "prepare":
+                return _chat_consent.prepare(args.get("operation"), args.get("action"))
+            if operation == "status":
+                return _chat_consent.status(args.get("challenge_id"))
+            if operation == "commit":
+                return _chat_consent.commit(args.get("challenge_id"), args.get("signed_approval"))
+        except (ChatConsentError, AuthorityError, OSError, ValueError) as exc:
+            code = str(exc) if isinstance(exc, (ChatConsentError, AuthorityError)) else "CHAT_CONSENT_STORAGE_ERROR"
+            raise core.RPCError(code, details={"execution_started": False}) from exc
+        raise core.RPCError("CHAT_CONSENT_OPERATION_UNKNOWN", details={"execution_started": False})
+
+    core.OPS["chat_consent_prepare"] = lambda args: _chat_consent_rpc("prepare", args)
+    core.OPS["chat_consent_status"] = lambda args: _chat_consent_rpc("status", args)
+    core.OPS["chat_consent_commit"] = lambda args: _chat_consent_rpc("commit", args)
+
     def capabilities(args: dict[str, Any]) -> dict[str, Any]:
         result = original_capabilities(args) if original_capabilities else {}
         features = result.setdefault("features", {})
@@ -457,6 +480,12 @@ def _install_gui_guards() -> None:
             "independent_app_task_success_attested": False,
         }
         features["agent_workflows_discovery"] = True
+        features["chat_consent_challenge_protocol"] = {
+            "version": 1, "attested_host_issuer_connected": False,
+            "owner_grant_from_chat_text": False,
+            "requires_signed_receipt": True,
+            "operations": ["chat_consent_prepare", "chat_consent_status", "chat_consent_commit"],
+        }
         result["agent_workflows"] = _agent_workflows()
         from cua_hidden_apps import available_apps
         features["hidden_desktop_supported_apps"] = available_apps()
