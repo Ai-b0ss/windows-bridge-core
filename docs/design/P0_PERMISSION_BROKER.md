@@ -1,5 +1,7 @@
 # P0 — Owner approval / permission broker: secure local contract
 
+> **Status (2026-10-31):** the default permission flow is now the owner's chat "yes" described in [SKILL_FIRST_PERMISSION.md](SKILL_FIRST_PERMISSION.md). What follows describes the optional strict signed mode and earlier work; do not rebuild it as the default.
+
 **Status:** offline authority checks implemented and tested; **NOT** connected to a host-attested chat approval event. The user should not manually exchange cryptographic keys. Do not claim a ChatGPT confirmation is cryptographic proof until a supported trusted transport is demonstrated.
 
 ## Trust boundary
