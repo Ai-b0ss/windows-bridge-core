@@ -1,5 +1,7 @@
 # WB-02: challenge-bound ChatGPT consent protocol (2026-10-30)
 
+> **Status (2026-10-31):** the default permission flow is now the owner's chat "yes" described in [SKILL_FIRST_PERMISSION.md](SKILL_FIRST_PERMISSION.md). What follows describes the optional strict signed mode and earlier work; do not rebuild it as the default.
+
 ## Implemented locally
 
 The Bridge now exposes three read/permission-broker operations:

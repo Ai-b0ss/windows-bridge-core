@@ -1,5 +1,7 @@
 # Windows Bridge agent platform — P0 state (25 October 2026)
 
+> **Status (2026-10-31):** the default permission flow is now the owner's chat "yes" described in [SKILL_FIRST_PERMISSION.md](SKILL_FIRST_PERMISSION.md). What follows describes the optional strict signed mode and earlier work; do not rebuild it as the default.
+
 The objective is a *verified task-level agent*, not just RPC tool coverage:
 requested task → device identity → programmatic discovery & suitability → hidden/semantic routes → trusted foreground consent → action → independent postcondition → recovery & task-owned cleanup.
 
