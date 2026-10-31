@@ -25,6 +25,10 @@ This core was derived from the archived, checked source snapshot `c034e527a77b73
 
 For a **separate private GitHub transport**, see [REMOTE-PAIRING.md](REMOTE-PAIRING.md). The friend must accept the repository collaboration invitation and explicitly run `PAIR-REMOTE-SUPPORT.cmd` from a release ZIP. **Do not use the public source repository as the remote execution inbox.**
 
+## Operator guide (Russian)
+
+[docs/OPERATOR_GUIDE_RU.md](docs/OPERATOR_GUIDE_RU.md): how the two layers fit together, how the owner's chat "yes" opens a bounded desktop grant, how to enable/disable it, the on-screen notice and Stop button, the journal and `scope_report`, the owner's-Chrome route, deploy/rollback steps and error codes.
+
 ## Managing paired devices from ChatGPT
 
 [CHATGPT-REMOTE-CONTROL.md](CHATGPT-REMOTE-CONTROL.md) documents exact device discovery, private GitHub transport command/results, owner authentication, required friend consent and safe shutdown. Optional no-token CLI: `python tools/bridge_remote_gh.py --list`.
