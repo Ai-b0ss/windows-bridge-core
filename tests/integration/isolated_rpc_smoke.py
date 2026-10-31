@@ -112,6 +112,29 @@ def verify_rpc(port: int,secret: str):
            and visible.get("visible_input_allowed_without_host_receipt") is False,
            "MANIFEST_MISSING_ALWAYS_ASK_SAME_CHAT_WITH_TRUSTED_BROKER")
     checks.append("mandatory_web_research_and_explicit_in_chat_foreground_gate")
+
+    perm=features.get("owner_chat_permission") or {}
+    verify(perm.get("enabled") is False and perm.get("quote_verified_by_bridge") is False,
+           "CHAT_PERMISSION_NOT_DEFAULT_OFF")
+    status=rpc(port,secret,"chat_permission_status",{},"ci-chat-permission")
+    verify(status.get("ok") is True and (status.get("result") or {}).get("enabled") is False,
+           "CHAT_PERMISSION_STATUS_FAILED")
+    grant=rpc(port,secret,"set_desktop_mode",{
+        "mode":"dedicated","agent_id":"ci-agent","task_id":"ci-chat-permission","targets":[],
+        "owner_chat_permission":{"quote":"yes"}},"ci-chat-permission")
+    verify(grant.get("ok") is False and "CHAT_PERMISSION_DISABLED" in json.dumps(grant),
+           "CHAT_PERMISSION_ACCEPTED_WHILE_DISABLED")
+    mode=rpc(port,secret,"desktop_mode_status",{},"ci-chat-permission")
+    verify((mode.get("result") or {}).get("mode")=="coexist","DESKTOP_MODE_CHANGED_WITHOUT_GRANT")
+    click=rpc(port,secret,"computer_use",{
+        "command":"windows_mcp","tool":"Click","arguments":{"loc":[1,1]},
+        "agent_id":"ci-agent","task_id":"ci-chat-permission","mode_generation":0},"ci-chat-permission")
+    verify(click.get("ok") is False and "INTERACTIVE_FOREGROUND_DISABLED" in json.dumps(click),
+           "WINDOWS_MCP_CLICK_WITHOUT_GRANT")
+    report=rpc(port,secret,"scope_report",{"hours":1},"ci-chat-permission")
+    verify((report.get("result") or {}).get("violations",{}).get("VISIBLE_INPUT_WITHOUT_PERMISSION",0)>=1,
+           "SCOPE_REPORT_MISSING_REFUSED_ATTEMPT")
+    checks.append("owner_chat_permission_default_off_and_refused_attempts_logged")
     checks.append("new_chat_readonly_agent_workflow_bootstrap")
 
     chat_feature=features.get("chat_consent_challenge_protocol") or {}
