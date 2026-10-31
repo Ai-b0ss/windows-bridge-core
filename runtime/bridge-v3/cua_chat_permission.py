@@ -25,13 +25,18 @@ DEFAULT_TTL = 3600
 DEFAULT_MAX_TTL = 7200
 MIN_TTL = 60
 HARD_MAX_TTL = 86400
+# Sending a message in the owner's name and owner interference are not listed on
+# purpose: the Bridge cannot see what an app sends (the Skill covers that), and
+# interference is prevented by the OWNER_ACTIVE pause instead of logged afterwards.
 VIOLATION_KINDS = frozenset({
     "VISIBLE_INPUT_WITHOUT_PERMISSION",
     "PERMISSION_EXPIRED",
     "OUT_OF_SCOPE_APP",
     "ROUTE_SEARCH_SKIPPED",
-    "UNAPPROVED_SEND",
-    "OWNER_INTERFERENCE",
+})
+ROUTE_SEARCH_COMMANDS = frozenset({
+    "task_preflight", "programmatic_plan", "plan_action", "discover_cli",
+    "prepare_tool", "app_api_probe", "resolve_app",
 })
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 
@@ -49,6 +54,7 @@ class ChatPermissionPolicy:
         self.config_path = Path(config_path)
         self.state_dir = Path(state_dir)
         self.clock = clock
+        self._route_searched = set()
 
     # -- configuration (local file only) -------------------------------------
     def _config(self) -> dict:
@@ -109,7 +115,31 @@ class ChatPermissionPolicy:
             "quote": quote.strip(), "apps": apps, "duration_seconds": duration,
             "expires": expires,
         }, required=True)
+        if not self.has_route_search(args["agent_id"], args["task_id"]):
+            # Log only: the owner reviews this and decides whether to enforce it.
+            self.log_violation("ROUTE_SEARCH_SKIPPED", agent_id=args["agent_id"],
+                               task_id=args["task_id"])
         return expires
+
+    # -- evidence that programmatic routes were looked at first ----------------
+    def note_route_search(self, agent, task, command) -> None:
+        if command not in ROUTE_SEARCH_COMMANDS:
+            return
+        if not (isinstance(agent, str) and isinstance(task, str)
+                and _ID.fullmatch(agent) and _ID.fullmatch(task)):
+            return
+        key = (agent, task)
+        if key in self._route_searched:
+            return
+        self._route_searched.add(key)
+        self._append("route-search.jsonl", {"agent_id": agent, "task_id": task,
+                                            "command": command}, required=False)
+
+    def has_route_search(self, agent, task) -> bool:
+        if (agent, task) in self._route_searched:
+            return True
+        return any(row.get("agent_id") == agent and row.get("task_id") == task
+                   for row in self._read("route-search.jsonl"))
 
     # -- trap: record what went outside the owner's words --------------------
     def log_violation(self, kind: str, **details) -> None:

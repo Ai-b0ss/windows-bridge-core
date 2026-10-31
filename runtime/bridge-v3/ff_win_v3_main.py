@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import ctypes
 import ctypes.wintypes
 import os
@@ -176,34 +177,65 @@ def _desktop_grant_active(args: dict[str, Any]) -> bool:
 core.desktop_grant_active = _desktop_grant_active
 
 
+def _owner_stop_check() -> None:
+    """The owner pressed Stop on the notice: revoke the grant for good."""
+    if _OWNER_NOTICE.stop_requested():
+        _OWNER_NOTICE.clear_stop()
+        _DESKTOP_MODES.transition({"mode": "coexist"})
+        raise core.RPCError("OWNER_STOPPED", details={"retry_safe": False})
+
+
+@contextmanager
+def _visible_input_guard(args: dict[str, Any]):
+    """Around every action that really sends input to the visible desktop:
+    wait while the owner is typing, show the notice, remember when we finished."""
+    try:
+        _OWNER_ACTIVITY.check()
+    except OwnerActive as exc:
+        raise core.RPCError("OWNER_ACTIVE", details={
+            "idle_ms": exc.idle_ms, "retry_safe": True, "retry_after_ms": 2000,
+            "next_step": "the owner is using the mouse or keyboard; wait and retry"}) from exc
+    try:
+        _OWNER_NOTICE.action(str(args.get("agent_id")), str(args.get("task_id")),
+                             args.get("mode_generation"))
+    except OSError:
+        pass  # the notice is a courtesy; it must not break an approved action
+    try:
+        yield
+    finally:
+        _OWNER_ACTIVITY.agent_input_done()
+
+
+_SCOPE_FAILURES = {
+    "DESKTOP_TARGET_OUTSIDE_SCOPE": "OUT_OF_SCOPE_APP",
+    "DESKTOP_MODE_SCOPE_MISMATCH": "OUT_OF_SCOPE_APP",
+    "DESKTOP_MODE_EXPIRED": "PERMISSION_EXPIRED",
+    "DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH": "PERMISSION_EXPIRED",
+}
+
+
+def _note_scope_failure(exc: Exception, args: dict[str, Any]) -> None:
+    """Remember an attempt that left the owner's grant (trap for the owner's review)."""
+    kind = _SCOPE_FAILURES.get(str(exc))
+    if kind:
+        _CHAT_PERMISSION.log_violation(
+            kind, code=str(exc), agent_id=str(args.get("agent_id")),
+            task_id=str(args.get("task_id")),
+            command=str(args.get("command") or args.get("tool") or ""))
+
+
 def _windows_mcp_physical(args: dict[str, Any], invoke) -> dict[str, Any]:
     """Windows-MCP click/type/scroll: only on the granted foreground window."""
     try:
-        if _OWNER_NOTICE.stop_requested():
-            # The owner pressed Stop on the notice: revoke the grant for good.
-            _OWNER_NOTICE.clear_stop()
-            _DESKTOP_MODES.transition({"mode": "coexist"})
-            raise core.RPCError("OWNER_STOPPED", details={"retry_safe": False})
+        _owner_stop_check()
         if _DESKTOP_MODES.status()["mode"] != "dedicated":
             _deny_interactive_gui("explicit dedicated task mode required")
         hwnd = int(ctypes.windll.user32.GetForegroundWindow())
         with _DESKTOP_MODES.action(args, hwnd):
-            try:
-                _OWNER_ACTIVITY.check()
-            except OwnerActive as exc:
-                raise core.RPCError("OWNER_ACTIVE", details={
-                    "idle_ms": exc.idle_ms, "retry_safe": True, "retry_after_ms": 2000,
-                    "next_step": "the owner is using the mouse or keyboard; wait and retry"}) from exc
-            try:
-                _OWNER_NOTICE.action(str(args.get("agent_id")), str(args.get("task_id")),
-                                     args.get("mode_generation"))
-            except OSError:
-                pass  # the notice is a courtesy; it must not break an approved action
-            try:
+            with _visible_input_guard(args):
                 return invoke(args.get("tool"), args.get("arguments"), allow_physical=True)
-            finally:
-                _OWNER_ACTIVITY.agent_input_done()
     except AuthorityError as exc:
+        _note_scope_failure(exc, args)
         raise core.RPCError(str(exc), details={"retry_safe": False}) from exc
     except (ValueError, RuntimeError) as exc:
         if isinstance(exc, core.RPCError):
@@ -214,6 +246,7 @@ def _windows_mcp_physical(args: dict[str, Any], invoke) -> dict[str, Any]:
 def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
     from cua_cli_first_policy import enforce as enforce_cli_first
     enforce_cli_first(core, "computer_use", args)
+    _CHAT_PERMISSION.note_route_search(args.get("agent_id"), args.get("task_id"), args.get("command"))
     if args.get("command") == "windows_mcp":
         from cua_windows_mcp import PHYSICAL_TOOLS, invoke_windows_mcp
         if args.get("tool") in PHYSICAL_TOOLS:
@@ -245,9 +278,12 @@ def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
         # A launch has no HWND yet. Its separate exact grant is serialized
         # with mode changes; observed HWNDs still need a fresh input scope.
         try:
+            _owner_stop_check()
             with _DESKTOP_MODES.launch_action(args):
-                return _CUA_CONTROL_PLANE.dispatch(args)
+                with _visible_input_guard(args):
+                    return _CUA_CONTROL_PLANE.dispatch(args)
         except AuthorityError as exc:
+            _note_scope_failure(exc, args)
             raise core.RPCError(str(exc), details={"retry_safe": False}) from exc
         except cua_bridge_v3.CuaBridgeError as exc:
             raise core.RPCError(exc.code, exc.message, details=exc.details) from exc
@@ -263,10 +299,13 @@ def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
                 if _DESKTOP_MODES.status()["mode"] == "coexist":
                     _deny_interactive_gui("explicit dedicated task mode required")
                 raise core.RPCError("DESKTOP_SCOPED_SURFACE_REQUIRED")
+            _owner_stop_check()
             with _DESKTOP_MODES.action(args, hwnd):
-                return _CUA_CONTROL_PLANE.dispatch(args)
+                with _visible_input_guard(args):
+                    return _CUA_CONTROL_PLANE.dispatch(args)
         return _CUA_CONTROL_PLANE.dispatch(args)
     except AuthorityError as exc:
+        _note_scope_failure(exc, args)
         raise core.RPCError(str(exc), details={"retry_safe": False}) from exc
     except cua_bridge_v3.CuaBridgeError as exc:
         raise core.RPCError(exc.code, exc.message, details=exc.details) from exc
