@@ -279,6 +279,30 @@ class DesktopModes:
         tmp.write_text(canonical(state), encoding="utf-8")
         os.replace(tmp, self.path)
 
+    @staticmethod
+    def _verified_target(target, observed):
+        """Compare a transport-safe decimal uint64 without weakening exact window binding.
+
+        JavaScript JSON decoders can round a process birth timestamp above 2**53.
+        Accept its canonical decimal string; retain the verified integer in state.
+        """
+        if not isinstance(target, dict) or not isinstance(observed, dict) or set(target) != set(observed):
+            raise AuthorityError("DESKTOP_TARGET_CHANGED")
+        candidate = dict(target)
+        start = candidate.get("process_start_ns")
+        if type(start) is str:
+            if not re.fullmatch(r"[1-9][0-9]{0,19}", start):
+                raise AuthorityError("DESKTOP_TARGET_CHANGED")
+            number = int(start)
+            if number > 2**64 - 1:
+                raise AuthorityError("DESKTOP_TARGET_CHANGED")
+            candidate["process_start_ns"] = number
+        elif type(start) is not int:
+            raise AuthorityError("DESKTOP_TARGET_CHANGED")
+        if candidate != observed:
+            raise AuthorityError("DESKTOP_TARGET_CHANGED")
+        return dict(observed)
+
     def transition(self, args):
         from cua_global_resources import _StateLock
         mode = args.get("mode")
@@ -292,12 +316,11 @@ class DesktopModes:
                 targets = args.get("targets")
                 if not isinstance(targets, list) or not 0 <= len(targets) <= 32:
                     raise AuthorityError("DESKTOP_TARGET_SCOPE_REQUIRED")
-                for target in targets:
-                    if target != self.target_fingerprint(target.get("hwnd")):
-                        raise AuthorityError("DESKTOP_TARGET_CHANGED")
+                verified_targets = [self._verified_target(target, self.target_fingerprint(target.get("hwnd")))
+                                    for target in targets]
                 expires = self._grant_expiry(args, "set_desktop_mode")
                 self.stop_input()
-                state = {"mode": mode, "agent_id": args["agent_id"], "task_id": args["task_id"], "targets": targets, "expires": expires, "generation": state["generation"]+1}
+                state = {"mode": mode, "agent_id": args["agent_id"], "task_id": args["task_id"], "targets": verified_targets, "expires": expires, "generation": state["generation"]+1}
             else:
                 # Any client may request a safe return; no permission needed to stop input.
                 self.stop_input()
