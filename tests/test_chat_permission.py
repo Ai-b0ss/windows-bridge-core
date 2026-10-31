@@ -104,6 +104,21 @@ class ChatPermissionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.policy.log_violation(kind)
 
+    def test_journal_rotates_and_keeps_one_older_generation(self):
+        import cua_chat_permission as mod
+        old=mod.MAX_JOURNAL_BYTES
+        mod.MAX_JOURNAL_BYTES=300
+        try:
+            for i in range(12):
+                self.policy.log_violation("OUT_OF_SCOPE_APP",app="x"*40,n=i)
+        finally:
+            mod.MAX_JOURNAL_BYTES=old
+        folder=self.root/"log"
+        self.assertTrue((folder/"scope-violations.jsonl.1").exists())
+        self.assertLess((folder/"scope-violations.jsonl").stat().st_size,600)
+        self.assertEqual(sorted(p.name for p in folder.glob("scope-violations*")),
+                         ["scope-violations.jsonl","scope-violations.jsonl.1"])
+
     def test_desktop_mode_accepts_chat_permission_without_signature(self):
         self.enable()
         store=AuthorityStore(self.root/"authority")

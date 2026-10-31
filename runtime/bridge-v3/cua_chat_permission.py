@@ -16,6 +16,7 @@ can review them (`scope_report`) and later switch on blocking per violation type
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -38,6 +39,7 @@ ROUTE_SEARCH_COMMANDS = frozenset({
     "task_preflight", "programmatic_plan", "plan_action", "discover_cli",
     "prepare_tool", "app_api_probe", "resolve_app",
 })
+MAX_JOURNAL_BYTES = 2 * 1024 * 1024
 _ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 
 
@@ -173,7 +175,13 @@ class ChatPermissionPolicy:
         row = {"ts": self.clock(), **row}
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
-            with open(self.state_dir / name, "a", encoding="utf-8") as handle:
+            target = self.state_dir / name
+            try:
+                if target.stat().st_size >= MAX_JOURNAL_BYTES:
+                    os.replace(target, target.with_name(name + ".1"))  # keep one older generation
+            except FileNotFoundError:
+                pass
+            with open(target, "a", encoding="utf-8") as handle:
                 handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
         except OSError as exc:
             if required:
