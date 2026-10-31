@@ -399,7 +399,7 @@
     "runtime/bridge-v3/cua_programmatic_discovery.py": "6849e3ad8e27407fcb3aa8497a1a05082e43130e3b0f1937fd04f596247b097d",
     "runtime/bridge-v3/cua_release_manifest.py": "920383638650c71b004b9ecd729cdaad773eaeac02f00799caf36fae48107cbc",
     "runtime/bridge-v3/cua_restricted_execution.py": "1db62c66f546ab9bd347ad5b2bcdeb6b40e59c1e4070ebcabc005607ce7dbea1",
-    "runtime/bridge-v3/cua_restricted_rpc.py": "5cf88eab7750404773fa9fcac53eda9748153cc7170b2c6f3957c6b7b782bb54",
+    "runtime/bridge-v3/cua_restricted_rpc.py": "c0b7a4d584bb12ee063942e67384429a1f6b73fd5d9b2bd24f209d666075177a",
     "runtime/bridge-v3/cua_router.py": "329b9f1a40279102282af0a48a9d2d547e86503137a51d303a5e537832e5e511",
     "runtime/bridge-v3/cua_runtime_deploy.py": "5a60190e7dfae076cd38b3dba1ca120d79a3c590a257553f16c401e7c7e8f1e9",
     "runtime/bridge-v3/cua_semantic_resources.py": "05a8d47bdab8a9c48015742703d74c33468fdffa8b9caf9dd4d251036a525646",
@@ -467,7 +467,7 @@
     "tests/integration/excel_task_com_rpc_smoke.py": "b8096f6992a24e1ad3ec27bbfeb00b88af50f9cb4dd7f62cb8c88e11f6c0a98d",
     "tests/integration/hidden_native_smoke.py": "0ee7addb0bd4cb8c432165c369a297267ba8e0017a1f3940f9a756cd3af093bb",
     "tests/integration/installed_package_smoke.py": "d1b56885ed342a6caa8577af788fb068ebf8e338d39adaab82ad1264bf305491",
-    "tests/integration/isolated_rpc_smoke.py": "c1aea59878c46537e10ebbaca67c01fd9dde6ccb86c0a5c00f3f1ea899fcc47a",
+    "tests/integration/isolated_rpc_smoke.py": "3ef0186be15b420a637c24863794be5ddee0fa995b6eba7e41a732293c0b4b29",
     "tests/integration/owned_job_cleanup_smoke.py": "e93d58dda50fa0b4b75713bcb900a4f5b3d254d2193748657e7220d24d74d5cc",
     "tests/integration/owner_signed_approval_real_rpc_smoke.py": "ef8c6ba1ff2005fbca1662fbe85058689ccb58feb837d609f649904e37642ab8",
     "tests/integration/two_agent_isolated_rpc_smoke.py": "04f961e3c50659a94becb910bb929e7b6ce43cf7534118e60ad9a8385f2bf315",
@@ -524,6 +524,6 @@
     "tests/test_owner_activity_notice.py": "ff097f61156a633ed281fd4ddb352837a5bdc20bc02b7066fc5cd2c7b7da20d4",
     "tests/sidecar_observed_change.test.mjs": "36466deaeaad00315907ee0376ec8c47f93c676ba35df93b3ed2e459ae8e31ba",
     "tests/test_browser_observed_change.py": "fae1ae761133a261082b5cd1207351467b54c69e1375ec673e9b6f8ba1807522",
-    "tests/test_windows_mcp_pool.py": "74fa442481ba171a8306adf13eb54165e4488d1c22f06780211a592bedcf9823"
+    "tests/test_windows_mcp_pool.py": "3b57065449531a73a9bdb25a832d4394a97a07afee65a0b166d494e2fab977e5"
   }
 }

@@ -135,6 +135,11 @@ def verify_rpc(port: int,secret: str):
     verify((report.get("result") or {}).get("violations",{}).get("VISIBLE_INPUT_WITHOUT_PERMISSION",0)>=1,
            "SCOPE_REPORT_MISSING_REFUSED_ATTEMPT")
     checks.append("owner_chat_permission_default_off_and_refused_attempts_logged")
+
+    unscoped=rpc(port,secret,"list_sessions",{},"ci-identity-hint")
+    verify(unscoped.get("ok") is False and unscoped.get("error_code")=="AUTHORITY_IDENTITY_INVALID"
+           and "agent_id and task_id" in json.dumps(unscoped),"IDENTITY_ERROR_HAS_NO_HINT")
+    checks.append("missing_agent_task_ids_explained_by_hint")
     checks.append("new_chat_readonly_agent_workflow_bootstrap")
 
     chat_feature=features.get("chat_consent_challenge_protocol") or {}

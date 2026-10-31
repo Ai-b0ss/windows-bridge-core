@@ -4,6 +4,8 @@ from threading import BoundedSemaphore
 
 _RUN_SLOTS = BoundedSemaphore(4)
 TRUSTED_SHELL_OVERRIDE_ENV = "FF_WIN_TRUSTED_SHELL_OPERATOR_OVERRIDE"
+IDENTITY_HINT = ("pass agent_id and task_id in args: 1 to 128 characters of letters, digits, "
+                 "underscore, dot, colon or hyphen; sessions are visible only to the same pair")
 
 from cua_restricted_execution import RestrictedExecutionError, run_python
 
@@ -19,7 +21,8 @@ def install(core, *, shell_policy="restricted", authority=None):
             try:
                 owner = (identity(args.get("agent_id")), identity(args.get("task_id")))
             except AuthorityError as exc:
-                raise core.RPCError(str(exc), details={"execution_started": False}) from exc
+                raise core.RPCError(str(exc), details={"execution_started": False,
+                                                       "hint": IDENTITY_HINT}) from exc
             if name != "start_process":
                 session = core.get_session(str(args.get("session_id") or ""))
                 if getattr(session, "owner_scope", None) != owner:
@@ -90,7 +93,8 @@ def install(core, *, shell_policy="restricted", authority=None):
                 try:
                     owner = (identity(args.get("agent_id")), identity(args.get("task_id")))
                 except AuthorityError as exc:
-                    raise core.RPCError(str(exc), details={"execution_started": False}) from exc
+                    raise core.RPCError(str(exc), details={"execution_started": False,
+                                                           "hint": IDENTITY_HINT}) from exc
                 result = original_list(args)
                 with core.STATE.lock:
                     owned = {sid for sid, session in core.STATE.sessions.items()
