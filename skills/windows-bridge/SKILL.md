@@ -58,6 +58,17 @@ Technical limits you cannot and must not work around: UAC elevation prompts and 
 - **Windows-MCP physical tools** (`computer_use(command="windows_mcp", tool=..., arguments=..., agent_id, task_id, mode_generation)`): `Click`, `Type`, `Scroll`, `Move`, `Shortcut`, `Clipboard`, `MultiSelect`, `MultiEdit`, `Wait`. They work only after `set_desktop_mode` has granted the desktop to your `agent_id`/`task_id`, and only while the granted window is in the foreground. Pattern: `Snapshot`, act on the element it lists, `Snapshot` again to verify. `Shell`, `Registry`, `Process` and `App` are not exposed through this route.
 - If a CAPTCHA or UAC prompt appears, stop, tell the owner in the chat what you see, and wait.
 
+## Owner's Chrome: the precise, no-mouse route (use this before clicking)
+
+The Bridge can drive the owner's real, signed-in Chrome through the Playwright extension: no mouse, no keyboard, no focus change, no permission dialog. Verified on the live Bridge:
+
+1. `computer_use {command:"attach", surface_kind:"browser", transport:"extension", agent_id, task_id}` returns a `surface_id` (an existing one is reused).
+2. `{command:"new_tab", surface_id, url}` opens a tab that is yours. You act only on tabs you own; never read or change the owner's other tabs.
+3. `{command:"observe", surface_id}` returns the page as an accessibility tree. `{command:"find", surface_id, query:{role:"link"|"button"|"textbox"|..., text:"visible name", limit:20}}` returns matches, each with a `ref` (like `g2e1`) and the `generation`. `query` must be an object.
+4. `{command:"act", surface_id, ref, generation, operation:"click"|"fill"|"type"|"press"|"hover"|"focus"|"scroll_into_view"|"select"|"check"|..., policy:{background_required:true}, postcondition:{...}}`. Always pass a `postcondition` when you know the expected result: `{url:"..."}`, `{text:"..."}`, or `{value:"..."}`.
+5. Without a postcondition, a click or key press is reported as done only if the page visibly changed (`verification.kind="observed_change"`, a weak proof). `ACTION_UNVERIFIED` means "attempted, effect unknown": observe the page before retrying and never click twice blindly. Re-run `find` after the page changes (`STALE_TARGET` means your refs are old).
+6. Finish with `{command:"close", surface_id}`; it closes only the tabs you opened.
+
 ## Runtime status (keep this honest)
 
 Check `capabilities.features.owner_chat_permission`. If `enabled` is true, after the owner's yes call `set_desktop_mode` with `mode="dedicated"`, your `agent_id`/`task_id`, the exact `targets`, and `owner_chat_permission={"quote": "<the owner's message, verbatim>", "apps": [...], "duration_seconds": N}`. The Bridge caps the duration and records the quote. If `enabled` is false, the owner has not switched the feature on locally; tell the owner, do not try to enable it. If the runtime still answers `INTERACTIVE_FOREGROUND_DISABLED` or `OWNER_APPROVAL_*`, report the exact error code and do not work around it. `scope_report` shows the owner what was attempted. See `docs/design/SKILL_FIRST_PERMISSION.md`.

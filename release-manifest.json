@@ -360,7 +360,7 @@
     "runtime/bridge-v3/cua_browser_playwright.mjs": "050e7e888dd9914d32a69dd57d5d946a062a00cc8525d682d5a474831ca20da0",
     "runtime/bridge-v3/cua_browser_profiles.py": "13353e1724565d1419e7e424e70129568efd35a969fdc926ef9e18a2e76862ae",
     "runtime/bridge-v3/cua_browser_rpc.mjs": "3876f2e51a3a1d568e458e74e0c44d21b92fd3fc574f02aa387f6044c9e4cb2c",
-    "runtime/bridge-v3/cua_browser_sidecar.mjs": "3cddd919a58fc1d206168f9400b186069d5889739e23a7e5c0837569ae758eee",
+    "runtime/bridge-v3/cua_browser_sidecar.mjs": "83379b02531eff8f9bde00390599ba0bb3f82c57e6f9cf25983dec137d418911",
     "runtime/bridge-v3/cua_capture_contract.py": "b1d0f52861605dcba3d25347c1da42294a03c73d4a429a8c99c65213309972dd",
     "runtime/bridge-v3/cua_chat_consent.py": "eddac2b848d857341627acb25609a0130a3f764a8e227f2e000fbf4083425adb",
     "runtime/bridge-v3/cua_cli_contracts.py": "580b35042bbef906f636dd37c3c40cbb0b2813a8d9a0d23e66b4016d48825194",
@@ -521,6 +521,8 @@
     "runtime/bridge-v3/cua_owner_activity.py": "2b7a86a622604e7326e3a5cf9357b6afbcbf6e22be6207ca781484d0be60a411",
     "runtime/bridge-v3/cua_owner_notice.ps1": "4f9b8ebf6cafbe14b38069ff465a1a97bd5913fdf7567c976a0be542f8eb785f",
     "runtime/bridge-v3/cua_owner_notice.py": "83cc628dda093f02ed986e11a2d3da8b464b45c1771841afffc3646e4b6d76fb",
-    "tests/test_owner_activity_notice.py": "8b99c0911b548b125658e9d20022cdee437d60f879e764599e2e3b34be2b0adc"
+    "tests/test_owner_activity_notice.py": "8b99c0911b548b125658e9d20022cdee437d60f879e764599e2e3b34be2b0adc",
+    "tests/sidecar_observed_change.test.mjs": "c945208702e98fdd2b6eb9b7a0d21096118ce950dfe41d69d1575f7ee59d6a75",
+    "tests/test_browser_observed_change.py": "e360318884294df9c34588bf3afabb784ba1840d7c1e6856763f37272864eb24"
   }
 }
