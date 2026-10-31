@@ -423,7 +423,7 @@
     "runtime/bridge-v3/cua_wgc_native_probe/packages.lock.json": "fd00fe1a726555ace15a148e7fd81f9ab4b78032017ee3ef3defb4b2fdaa87b6",
     "runtime/bridge-v3/cua_wgc_native_probe/run_probe.ps1": "81896f47f96173ae2aad24299ce11f907d493cee44e21f162c336a03d277bbe6",
     "runtime/bridge-v3/cua_winapp_persistent.py": "c612897c309357ddf3499f12fe0faf443b659d519e6dd660a68767a36b5594d1",
-    "runtime/bridge-v3/cua_windows_mcp.py": "167faac08a72a84f332543ff248fa216c3246c11c13a252b62ebc1ca0145bc74",
+    "runtime/bridge-v3/cua_windows_mcp.py": "37a372ac413d426bcacef5cfc2c7b59695835c2d490828c43f9350a7df920bd9",
     "runtime/bridge-v3/cua_windows_ocr_sidecar.ps1": "f671328843086283d1f5cabb504fc191ff2b7ca7acef48beb7efc973324ba842",
     "runtime/bridge-v3/cua_windows_paths.py": "27c063181c48462f21c77c510eff88575b050a84cbbaeb1ad5d3524df060220f",
     "runtime/bridge-v3/ff_win_evidence.py": "d9f539428d94d1c202ff9b87e9046bf5fa8c367624197fbd0cd5d2db24e32f05",
@@ -523,6 +523,7 @@
     "runtime/bridge-v3/cua_owner_notice.py": "2dd027f9f636e086fccbbaa2f97978051896e1acffa0827024e874db40e4fe7f",
     "tests/test_owner_activity_notice.py": "ff097f61156a633ed281fd4ddb352837a5bdc20bc02b7066fc5cd2c7b7da20d4",
     "tests/sidecar_observed_change.test.mjs": "36466deaeaad00315907ee0376ec8c47f93c676ba35df93b3ed2e459ae8e31ba",
-    "tests/test_browser_observed_change.py": "fae1ae761133a261082b5cd1207351467b54c69e1375ec673e9b6f8ba1807522"
+    "tests/test_browser_observed_change.py": "fae1ae761133a261082b5cd1207351467b54c69e1375ec673e9b6f8ba1807522",
+    "tests/test_windows_mcp_pool.py": "74fa442481ba171a8306adf13eb54165e4488d1c22f06780211a592bedcf9823"
   }
 }
