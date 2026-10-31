@@ -430,8 +430,8 @@ def _install_gui_guards() -> None:
     core.OPS["agent_workflows"] = lambda args: _agent_workflows()
 
     # Explicit owner-configured Skill-guided trusted agent pilot.
-    # Separate from signed approvals; only Claude usage inspection and
-    # bounded mouse navigation, never generic gui_mouse/gui_keyboard.
+    # Separate from signed approvals; bounded Claude-only navigation or
+    # empty-chat creation, never generic gui_mouse/gui_keyboard.
     from cua_trusted_skill_input import TrustedSkillInput, TrustedSkillError
     _trusted_skill = TrustedSkillInput(
         core.BRIDGE_ROOT / "state" / "trusted-skill-input.json",
@@ -510,7 +510,7 @@ def _install_gui_guards() -> None:
             "mode": "owner_opted_in_to_skill_guided_agent",
             "enabled": _trusted_skill.status()["enabled"],
             "allowed_app": "Claude Desktop",
-            "allowed_purpose": "inspect_claude_usage_readonly",
+            "allowed_purpose": _trusted_skill.status()["allowed_purpose"],
             "allowed_actions": ["focus","move","click","scroll"],
             "keyboard_allowed": False, "arbitrary_shell_allowed": False,
             "max_session_seconds": 600, "max_actions": 12,

@@ -7,7 +7,7 @@ import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"runtime/bridge-v3"))
-from cua_trusted_skill_input import TrustedSkillInput, TrustedSkillError, APPROVAL_SCHEMA, ALLOWED_PURPOSE
+from cua_trusted_skill_input import TrustedSkillInput, TrustedSkillError, APPROVAL_SCHEMA, ALLOWED_PURPOSE, NEW_CHAT_PURPOSE
 
 class FakeWindows:
     def __init__(self):
@@ -16,7 +16,10 @@ class FakeWindows:
         self.path=(r"C:\Program Files\WindowsApps\Claude_4.4212.0.0_x64__pzs8sxrjxfjjc\app\Claude.exe").lower()
         self.active=0
         self.topmost=True
-    def snapshot(self, hwnd):
+        self.hidden=False
+    def snapshot(self, hwnd, *, allow_hidden=False):
+        if self.hidden and not allow_hidden:
+            raise TrustedSkillError("TRUSTED_GUI_WINDOW_HIDDEN")
         return {"hwnd":hwnd, "pid":self.pid, "birth":self.birth,
                 "executable":self.path,"rect":(0,0,800,600)}
     def point_on_target(self,hwnd,x,y):
@@ -24,6 +27,7 @@ class FakeWindows:
     def foreground(self):
         return self.active
     def focus(self,hwnd):
+        self.hidden=False
         self.active=hwnd
         return True
 
@@ -39,9 +43,9 @@ class TrustedSkillPilotTests(unittest.TestCase):
                                      mouse=self.events.append, clock=lambda:self.now[0])
         self.action={"agent_id":"chatgpt","task_id":"read-claude-usage",
                      "purpose":ALLOWED_PURPOSE,"hwnd":100}
-    def enable(self):
+    def enable(self, purpose=ALLOWED_PURPOSE):
         self.path.write_text(json.dumps({"schema":APPROVAL_SCHEMA,"enabled":True,
-            "agent_id":"chatgpt","purpose":ALLOWED_PURPOSE,
+            "agent_id":"chatgpt","purpose":purpose,
             "owner_opt_in_until":self.now[0]+7200}))
     def start(self):
         return self.pilot.begin(self.action)["session_id"]
@@ -103,6 +107,37 @@ class TrustedSkillPilotTests(unittest.TestCase):
             with self.subTest(extra=extra):
                 with self.assertRaises(TrustedSkillError):
                     self.pilot.act({"session_id":sid,"task_id":self.action["task_id"],**extra})
+        self.assertFalse(self.events)
+
+    def test_hidden_claude_new_empty_chat_permission(self):
+        self.enable(NEW_CHAT_PURPOSE)
+        self.action["purpose"] = NEW_CHAT_PURPOSE
+        self.windows.hidden = True
+        sid = self.start()
+        self.assertEqual(self.pilot.status()["allowed_purpose"], NEW_CHAT_PURPOSE)
+        self.act(sid, "focus")
+        self.assertFalse(self.windows.hidden)
+        self.assertEqual(self.windows.active, 100)
+        with self.assertRaises(TrustedSkillError):
+            self.act(sid, "keyboard", text="secret")
+        self.assertFalse(self.events)
+
+    def test_hidden_rejected_for_readonly_purpose_and_scope_mismatch(self):
+        self.enable()
+        self.windows.hidden = True
+        with self.assertRaisesRegex(TrustedSkillError, "TRUSTED_GUI_WINDOW_HIDDEN"):
+            self.start()
+        self.enable(NEW_CHAT_PURPOSE)
+        with self.assertRaisesRegex(TrustedSkillError, "TRUSTED_GUI_PURPOSE_DENIED"):
+            self.start()
+
+    def test_config_scope_change_revokes_existing_session(self):
+        self.enable(NEW_CHAT_PURPOSE)
+        self.action["purpose"] = NEW_CHAT_PURPOSE
+        sid = self.start()
+        self.enable(ALLOWED_PURPOSE)
+        with self.assertRaisesRegex(TrustedSkillError, "TRUSTED_GUI_SESSION_SCOPE_DENIED"):
+            self.act(sid, "focus")
         self.assertFalse(self.events)
 
 if __name__=="__main__":

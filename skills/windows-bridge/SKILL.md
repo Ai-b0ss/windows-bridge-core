@@ -56,12 +56,16 @@ In a **new** chat using an actually installed/available skill, the agent receive
 
 On an owner-configured **temporary** installation only, inspect `trusted_skill_status`.
 If and only if it reports `enabled=true`, the owner has explicitly accepted the
-limited agent-trust model, and the exact current task is `inspect_claude_usage_readonly`,
+limited agent-trust model, and `allowed_purpose` **exactly matches the current task**
+(`inspect_claude_usage_readonly` or `create_empty_new_claude_chat`),
 the agent may call `trusted_skill_begin`, `trusted_skill_act` and `trusted_skill_end`
 for the existing, independently identified Claude Desktop HWND. This is a limited
 owner opt-in, **not a host-attested signed receipt**. The pilot itself checks the
 actual process owner/birth, window identity, visibility, coordinates, expiry and
 action budget; use one session id for one task and close it afterward. Only
+`create_empty_new_claude_chat` can restore a hidden existing Claude window;
+verify the actual New Chat control before clicking and confirm the new composer
+is empty afterward. Never use Usage inspection scope to open a new chat. Only
 focus, mouse movement, single clicks and scrolling are available; do not infer
 permission to type, send messages, delete content, alter account settings, or
 switch applications. Inspect the current screen and the semantic target before

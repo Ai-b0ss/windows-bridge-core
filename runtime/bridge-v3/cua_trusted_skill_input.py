@@ -32,6 +32,8 @@ CLAUDE_EXE_SUFFIX = r"\app\claude.exe"
 CLAUDE_PACKAGE_MARKER = r"\windowsapps\claude_"
 CLAUDE_PUBLISHER = "__pzs8sxrjxfjjc"
 ALLOWED_PURPOSE = "inspect_claude_usage_readonly"
+NEW_CHAT_PURPOSE = "create_empty_new_claude_chat"
+ALLOWED_PURPOSES = frozenset({ALLOWED_PURPOSE, NEW_CHAT_PURPOSE})
 
 
 def _require(condition: bool, code: str):
@@ -45,11 +47,12 @@ class WindowsWindowAPI:
         self.user32 = ctypes.windll.user32
         self.kernel32 = ctypes.windll.kernel32
 
-    def snapshot(self, hwnd):
+    def snapshot(self, hwnd, *, allow_hidden=False):
         _require(type(hwnd) is int and hwnd > 0, "TRUSTED_GUI_HWND_INVALID")
         user32, kernel32 = self.user32, self.kernel32
         _require(bool(user32.IsWindow(hwnd)), "TRUSTED_GUI_WINDOW_GONE")
-        _require(bool(user32.IsWindowVisible(hwnd)), "TRUSTED_GUI_WINDOW_HIDDEN")
+        if not allow_hidden:
+            _require(bool(user32.IsWindowVisible(hwnd)), "TRUSTED_GUI_WINDOW_HIDDEN")
         pid = wintypes.DWORD()
         _require(bool(user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))), "TRUSTED_GUI_PID_UNKNOWN")
         # PROCESS_QUERY_LIMITED_INFORMATION, non-elevated query only.
@@ -114,7 +117,7 @@ class TrustedSkillInput:
             or cfg.get("schema") != APPROVAL_SCHEMA
             or cfg.get("enabled") is not True
             or cfg.get("agent_id") != "chatgpt"
-            or cfg.get("purpose") != ALLOWED_PURPOSE
+            or cfg.get("purpose") not in ALLOWED_PURPOSES
             or type(cfg.get("owner_opt_in_until")) not in (int, float)
             or not self.clock() < cfg["owner_opt_in_until"] <= self.clock() + 86400):
             return None
@@ -139,7 +142,7 @@ class TrustedSkillInput:
                 "chat_message_attested": False,
                 "signed_approval_required_for_other_operations": True,
                 "allowed_app": "Claude Desktop" if cfg else None,
-                "allowed_purpose": ALLOWED_PURPOSE if cfg else None,
+                "allowed_purpose": cfg["purpose"] if cfg else None,
                 "expires_at": cfg["owner_opt_in_until"] if cfg else None,
                 "session_active": valid,
                 "actions_remaining": max(0, s["remaining"]) if valid else 0,
@@ -156,32 +159,35 @@ class TrustedSkillInput:
             task = args["task_id"]
             _require(isinstance(task, str) and 8 <= len(task) <= 128 and all(ch.isalnum() or ch in "-_." for ch in task),
                      "TRUSTED_GUI_TASK_INVALID")
-            _require(args["purpose"] == ALLOWED_PURPOSE, "TRUSTED_GUI_PURPOSE_DENIED")
+            _require(args["purpose"] == cfg["purpose"], "TRUSTED_GUI_PURPOSE_DENIED")
             now = self.clock()
             if self._session and self._session["expires_at"] > now:
                 _require(self._session["task_id"] == task, "TRUSTED_GUI_SESSION_BUSY")
+                _require(self._session["purpose"] == cfg["purpose"] and self._session["identity"][0] == args["hwnd"],
+                         "TRUSTED_GUI_SESSION_SCOPE_DENIED")
                 # Idempotent request does not reissue or prolong the session.
                 return {"session_id": self._session["id"], "expires_at": self._session["expires_at"],
                         "actions_remaining": self._session["remaining"], "reused": True}
-            window = self.windows.snapshot(args["hwnd"])
+            window = self.windows.snapshot(args["hwnd"], allow_hidden=(cfg["purpose"] == NEW_CHAT_PURPOSE))
             _require(self._claude(window), "TRUSTED_GUI_APP_NOT_ALLOWLISTED")
             remaining_seconds = min(MAX_SESSION_SECONDS, cfg["owner_opt_in_until"] - now)
             _require(remaining_seconds > 0, "TRUSTED_GUI_CONFIG_EXPIRED")
             sid = secrets.token_urlsafe(32)
-            self._session = {"id": sid, "task_id": task, "identity": (window["hwnd"], window["pid"], window["birth"], window["executable"]),
+            self._session = {"id": sid, "task_id": task, "purpose": cfg["purpose"], "identity": (window["hwnd"], window["pid"], window["birth"], window["executable"]),
                              "expires_at": now + remaining_seconds, "remaining": MAX_ACTIONS}
             return {"session_id": sid, "expires_at": self._session["expires_at"],
                     "actions_remaining": MAX_ACTIONS, "reused": False}
 
-    def _verify(self, args):
+    def _verify(self, args, *, allow_hidden=False):
         cfg = self._config()
         _require(cfg is not None, "TRUSTED_GUI_NOT_ENABLED")
         s = self._session
         _require(s is not None and s["expires_at"] > self.clock(), "TRUSTED_GUI_SESSION_EXPIRED")
+        _require(cfg["purpose"] == s["purpose"], "TRUSTED_GUI_SESSION_SCOPE_DENIED")
         _require(args.get("session_id") == s["id"] and args.get("task_id") == s["task_id"],
                  "TRUSTED_GUI_SESSION_SCOPE_DENIED")
         _require(s["remaining"] > 0, "TRUSTED_GUI_ACTION_LIMIT")
-        snapshot = self.windows.snapshot(s["identity"][0])
+        snapshot = self.windows.snapshot(s["identity"][0], allow_hidden=allow_hidden)
         actual = (snapshot["hwnd"], snapshot["pid"], snapshot["birth"], snapshot["executable"])
         _require(actual == s["identity"] and self._claude(snapshot), "TRUSTED_GUI_WINDOW_IDENTITY_CHANGED")
         return snapshot, s
@@ -192,7 +198,7 @@ class TrustedSkillInput:
                      "TRUSTED_GUI_ARGS_INVALID")
             action = args.get("action")
             _require(action in {"focus", "click", "move", "scroll"}, "TRUSTED_GUI_ACTION_DENIED")
-            snap, session = self._verify(args)
+            snap, session = self._verify(args, allow_hidden=(action == "focus" and self._session is not None and self._session.get("purpose") == NEW_CHAT_PURPOSE))
             hwnd = snap["hwnd"]
             x, y = args.get("x"), args.get("y")
             if action in {"click", "move"}:

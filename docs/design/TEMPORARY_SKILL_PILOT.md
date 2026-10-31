@@ -12,8 +12,16 @@ particular utterance. This is a separate risk acceptance by the owner.
   permanent bypass, and the server rejects timestamps farther than 24h away.
 - **Only existing Claude Desktop** with exact validated WindowsApps executable
   identity (not the Claude Code CLI).
+- Two **mutually exclusive, owner-configured** task purposes:
+  `inspect_claude_usage_readonly` (existing visible window only) and
+  `create_empty_new_claude_chat` (may restore a previously hidden verified
+  Claude window, then click the verified New Chat control). A configuration
+  purpose change invalidates the current session.
 - Requires exact target HWND, owning PID, process birth timestamp and window
   rectangle; verifies foreground and unobscured click coordinates each time.
+  Only `focus` under `create_empty_new_claude_chat` may inspect a hidden window;
+  clicking or moving while hidden is still denied. Restore/show is limited to
+  the exact already-running Claude window, not an arbitrary application launch.
 - **Only focus, mouse move, single left click and bounded scroll**; no keyboard,
   text entry, hotkeys, global click, process execution or automatic message
   sending via this pilot. Max 12 actions per session and 600-second session TTL.
@@ -41,7 +49,10 @@ The local controller writes:
   "owner_opt_in_until": 0
 }
 ```
-Replace 0 with an expiry between now and now+86400. This file is NOT a
+For empty-chat creation, replace `purpose` with
+`create_empty_new_claude_chat`. Do **not** claim a Usage inspection request
+covers creating conversations. Replace 0 with an expiry between now and
+now+86400. This file is NOT a
 password or a new signing key. If removed, disabled or expired, the pilot
 fails closed without restarting the Bridge.
 
