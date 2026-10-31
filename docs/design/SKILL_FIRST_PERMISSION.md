@@ -10,7 +10,11 @@ Implemented in this branch (tests in `tests/test_chat_permission.py`, `tests/tes
 - `cua_owner_activity.py`: Windows-MCP input pauses with `OWNER_ACTIVE` (retry after 2 s) while the owner uses the mouse or keyboard.
 - `cua_owner_notice.py/.ps1`: always-on-top notice without focus stealing, one per task, heartbeat-driven "finished" message, Stop button that writes `state/chat-permission/stop.flag`; the next agent action then revokes the grant (`OWNER_STOPPED`). Verified visually on the owner's PC. It needs an interactive session; the session-0 Bridge instance simply shows nothing.
 
-Not yet implemented: the same notice and pause for the legacy `computer_use` physical path, `autoConnect` for Chrome DevTools MCP, the browser companion upgrade (section 4), and violation kinds other than `VISIBLE_INPUT_WITHOUT_PERMISSION`.
+- The same pause, notice and Stop now wrap every path that sends visible input: Windows-MCP tools, `computer_use` physical commands and legacy `gui_mouse`/`gui_keyboard` (they route through `computer_use`), and visible launches (`_visible_input_guard`, `_owner_stop_check`).
+- Journal kinds written by the Bridge: `VISIBLE_INPUT_WITHOUT_PERMISSION` (refused attempt), `OUT_OF_SCOPE_APP` (input aimed at a window outside the granted targets, refused before any input), `PERMISSION_EXPIRED` (grant ran out), `ROUTE_SEARCH_SKIPPED` (a chat grant for a task that never ran `task_preflight`/`programmatic_plan`/`plan_action`/... first; logged, not blocked). `UNAPPROVED_SEND` and `OWNER_INTERFERENCE` are not logged: the Bridge cannot see what an app sends (the Skill covers it) and interference is prevented by the `OWNER_ACTIVE` pause.
+- Verified on a separate Bridge with real input: grant, click and type into Notepad (text arrived), input aimed at another Notepad window refused with nothing typed, violation logged. Known limit: each Windows-MCP call starts its own server and the first call took about 11 s.
+
+Not yet implemented: `autoConnect` for Chrome DevTools MCP (the Playwright extension route already covers the owner's Chrome), a persistent Windows-MCP server to cut per-call latency, and detection of sending in the owner's name.
 
 ## 1. Owner's intended architecture
 
@@ -43,8 +47,6 @@ Needed so the owner can decide after about a day of use whether a technical limi
 | Permission quote older than its expiry | `PERMISSION_EXPIRED` |
 | Target process or window outside the permitted apps | `OUT_OF_SCOPE_APP` |
 | No preflight or plan for this task before the first visible input | `ROUTE_SEARCH_SKIPPED` |
-| Sending a message or post in the owner's name without a specific "да" | `UNAPPROVED_SEND` |
-| Input while the owner was actively using mouse or keyboard | `OWNER_INTERFERENCE` |
 
 **Report.** A command `scope_report` (read-only) summarises the last 24 hours: counts per violation type and the first examples. After a day, zero violations means the skill is enough. Any violation is the signal to turn on blocking for that type, one type at a time.
 

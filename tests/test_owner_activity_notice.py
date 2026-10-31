@@ -107,10 +107,13 @@ class NoticeTests(unittest.TestCase):
         ps=(MODULES/"cua_owner_notice.ps1").read_text(encoding="utf-8")
         self.assertIn("ShowWithoutActivation",ps); self.assertIn("0x08000000",ps)
         main=(MODULES/"ff_win_v3_main.py").read_text(encoding="utf-8")
-        i=main.index("def _windows_mcp_physical")
-        block=main[i:i+1800]
-        for needle in ("_OWNER_NOTICE.stop_requested()","_OWNER_ACTIVITY.check()","_OWNER_NOTICE.action(","agent_input_done()"):
-            self.assertIn(needle,block)
+        guard=main[main.index("def _owner_stop_check"):main.index("def _windows_mcp_physical")]
+        for needle in ("_OWNER_NOTICE.stop_requested()","_OWNER_ACTIVITY.check()",
+                       "_OWNER_NOTICE.action(","agent_input_done()","OWNER_ACTIVE","OWNER_STOPPED"):
+            self.assertIn(needle,guard)
+        # every path that really sends input goes through the same guard
+        self.assertEqual(main.count("with _visible_input_guard(args):"),3)
+        self.assertEqual(main.count("_owner_stop_check()"),4)  # definition + three call sites
 
 
 if __name__=="__main__":

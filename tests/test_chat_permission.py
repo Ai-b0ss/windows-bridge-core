@@ -77,6 +77,33 @@ class ChatPermissionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.policy.log_violation("MADE_UP")
 
+    def test_grant_without_prior_route_search_is_logged(self):
+        self.enable()
+        self.policy.authorize(request())
+        rows=self.policy.scope_report(24)
+        self.assertEqual(rows["violations"].get("ROUTE_SEARCH_SKIPPED"),1)
+
+    def test_grant_after_route_search_is_clean(self):
+        self.enable()
+        self.policy.note_route_search("chatgpt","task-1","task_preflight")
+        self.policy.authorize(request())
+        self.assertEqual(self.policy.scope_report(24)["violations"],{})
+        # survives a restart (new policy object reads the file)
+        again=ChatPermissionPolicy(self.config,self.root/"log",self.clock)
+        self.assertTrue(again.has_route_search("chatgpt","task-1"))
+        self.assertFalse(again.has_route_search("chatgpt","other"))
+
+    def test_only_route_search_commands_and_valid_ids_count(self):
+        self.policy.note_route_search("chatgpt","t","act")
+        self.policy.note_route_search("bad id","t","task_preflight")
+        self.policy.note_route_search(None,None,"task_preflight")
+        self.assertFalse(self.policy.has_route_search("chatgpt","t"))
+
+    def test_unlogged_kinds_are_rejected(self):
+        for kind in ("UNAPPROVED_SEND","OWNER_INTERFERENCE"):
+            with self.assertRaises(ValueError):
+                self.policy.log_violation(kind)
+
     def test_desktop_mode_accepts_chat_permission_without_signature(self):
         self.enable()
         store=AuthorityStore(self.root/"authority")
