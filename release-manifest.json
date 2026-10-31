@@ -524,6 +524,7 @@
     "tests/test_owner_activity_notice.py": "acfcb8908b71c9998f935eb5cbb069f206396d9bab101e8b0bc0c55027f054c9",
     "tests/sidecar_observed_change.test.mjs": "c945208702e98fdd2b6eb9b7a0d21096118ce950dfe41d69d1575f7ee59d6a75",
     "tests/test_browser_observed_change.py": "e360318884294df9c34588bf3afabb784ba1840d7c1e6856763f37272864eb24",
-    "tests/test_windows_mcp_pool.py": "74fa442481ba171a8306adf13eb54165e4488d1c22f06780211a592bedcf9823"
+    "tests/test_windows_mcp_pool.py": "74fa442481ba171a8306adf13eb54165e4488d1c22f06780211a592bedcf9823",
+    "tests/test_manifest_matches_git.py": "5fee61fa61e6b56e838835c207da04a88117be0669764355b33ec0e3715ac5f9"
   }
 }
