@@ -18,7 +18,7 @@ Read this before changing anything. The owner is a Russian-speaking individual w
 
 ## Deploying to the owner's PC
 
-See `docs/OPERATOR_GUIDE_RU.md`, section "Обновление и откат". In short: the installed runtime is not a git checkout; wait until the agent has been idle for about two minutes (`audit.jsonl`), back up the files to `bridge-v3/backups/<name>/` with a `ROLLBACK.txt`, copy the exact bytes of `git show <ref>:<path>`, compile with the bundled Python, kill only the interactive Bridge process (the keeper restarts it), then verify `ping`, `capabilities`, `chat_permission_status` and `scope_report`. Never stop the keeper or unrelated processes.
+See `docs/OPERATOR_GUIDE_RU.md`, section "Обновление и откат". In short: the installed runtime is not a git checkout; wait until the agent has been idle for about two minutes (`audit.jsonl`), back up the files to `bridge-v3/backups/<name>/` with a `ROLLBACK.txt`, copy the exact bytes of `git show <ref>:<path>`, compile with the bundled Python, kill only the interactive Bridge process (the keeper restarts it), then verify `ping`, `capabilities`, `chat_permission_status` and `scope_report`. `python tools/runtime_parity.py --installed <bridge-v3> --ref origin/main --disk` confirms the install matches Git and reports free disk space. Never stop the keeper or unrelated processes.
 
 ## Where things are
 
