@@ -65,6 +65,23 @@ def verify_rpc(port: int,secret: str):
            "CLI_FIRST_GUARD_INACTIVE")
     checks.append("cli_first_guard")
 
+    # Opt-in Skill pilot is present but disabled on a clean profile.
+    pilot=rpc(port,secret,"trusted_skill_status",{},"ci-skill-pilot-status")
+    verify(pilot.get("ok") is True, "TRUSTED_SKILL_STATUS_MISSING")
+    pilot_info=pilot.get("result") or {}
+    verify(pilot_info.get("enabled") is False
+           and pilot_info.get("session_active") is False
+           and pilot_info.get("chat_message_attested") is False,
+           "TRUSTED_SKILL_DEFAULT_NOT_DENY")
+    denied=rpc(port,secret,"trusted_skill_begin",{
+        "agent_id":"chatgpt","task_id":"ci-readonly-pilot",
+        "purpose":"inspect_claude_usage_readonly","hwnd":1234,
+    },"ci-skill-pilot-denied")
+    verify(denied.get("ok") is False
+           and denied.get("error_code")=="TRUSTED_GUI_NOT_ENABLED",
+           "TRUSTED_SKILL_UNAUTHORIZED_START")
+    checks.append("temporary_trusted_skill_pilot_default_denied")
+
     discovery=rpc(port,secret,"agent_workflows",{},"ci-agent-workflow-bootstrap")
     verify(discovery.get("ok") is True,"AGENT_WORKFLOWS_READ_FAILED")
     flow=discovery.get("result") or {}
@@ -95,6 +112,29 @@ def verify_rpc(port: int,secret: str):
            and visible.get("visible_input_allowed_without_host_receipt") is False,
            "MANIFEST_MISSING_ALWAYS_ASK_SAME_CHAT_WITH_TRUSTED_BROKER")
     checks.append("mandatory_web_research_and_explicit_in_chat_foreground_gate")
+
+    perm=features.get("owner_chat_permission") or {}
+    verify(perm.get("enabled") is False and perm.get("quote_verified_by_bridge") is False,
+           "CHAT_PERMISSION_NOT_DEFAULT_OFF")
+    status=rpc(port,secret,"chat_permission_status",{},"ci-chat-permission")
+    verify(status.get("ok") is True and (status.get("result") or {}).get("enabled") is False,
+           "CHAT_PERMISSION_STATUS_FAILED")
+    grant=rpc(port,secret,"set_desktop_mode",{
+        "mode":"dedicated","agent_id":"ci-agent","task_id":"ci-chat-permission","targets":[],
+        "owner_chat_permission":{"quote":"yes"}},"ci-chat-permission")
+    verify(grant.get("ok") is False and "CHAT_PERMISSION_DISABLED" in json.dumps(grant),
+           "CHAT_PERMISSION_ACCEPTED_WHILE_DISABLED")
+    mode=rpc(port,secret,"desktop_mode_status",{},"ci-chat-permission")
+    verify((mode.get("result") or {}).get("mode")=="coexist","DESKTOP_MODE_CHANGED_WITHOUT_GRANT")
+    click=rpc(port,secret,"computer_use",{
+        "command":"windows_mcp","tool":"Click","arguments":{"loc":[1,1]},
+        "agent_id":"ci-agent","task_id":"ci-chat-permission","mode_generation":0},"ci-chat-permission")
+    verify(click.get("ok") is False and "INTERACTIVE_FOREGROUND_DISABLED" in json.dumps(click),
+           "WINDOWS_MCP_CLICK_WITHOUT_GRANT")
+    report=rpc(port,secret,"scope_report",{"hours":1},"ci-chat-permission")
+    verify((report.get("result") or {}).get("violations",{}).get("VISIBLE_INPUT_WITHOUT_PERMISSION",0)>=1,
+           "SCOPE_REPORT_MISSING_REFUSED_ATTEMPT")
+    checks.append("owner_chat_permission_default_off_and_refused_attempts_logged")
     checks.append("new_chat_readonly_agent_workflow_bootstrap")
 
     chat_feature=features.get("chat_consent_challenge_protocol") or {}
