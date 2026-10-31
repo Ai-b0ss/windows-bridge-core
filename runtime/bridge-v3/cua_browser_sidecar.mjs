@@ -186,7 +186,7 @@ export class BrowserSidecar {
       targetResolved = target.resolved;
     }
     const result = await this.engine.act(surface.handle, resolved, action, args, {targetResolved});
-    const post = await this.engine.verify(surface.handle, verify ?? result?.postcondition ?? null, {
+    let post = await this.engine.verify(surface.handle, verify ?? result?.postcondition ?? null, {
       resolved,
       entity,
       action,
@@ -194,6 +194,14 @@ export class BrowserSidecar {
       targetResolved,
     });
     const after = await this.engine.fingerprint(surface.handle);
+    // A click or key press that visibly changed the page is reported as done
+    // instead of as a failure, so agents do not repeat an action that worked.
+    // This is weaker than a caller-supplied postcondition and says so.
+    if (!post?.verified && post?.reason === 'postcondition_required' && verify == null &&
+        (action === 'click' || action === 'press') && after !== before) {
+      post = {verified: true, kind: 'observed_change', strength: 'observed_change_only',
+              before, after};
+    }
     const pageIdentity = typeof this.engine.identity === 'function' ? await this.engine.identity(surface.handle) : null;
     const ended = now();
     return {
