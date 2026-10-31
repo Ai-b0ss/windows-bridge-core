@@ -85,8 +85,32 @@ class WindowsWindowAPI:
         return int(self.user32.GetForegroundWindow())
 
     def focus(self, hwnd):
-        self.user32.ShowWindow(hwnd, 9)  # SW_RESTORE; do not bring other windows forward.
-        self.user32.SetForegroundWindow(hwnd)
+        # Restore only the already-verified Claude HWND. Windows may refuse a
+        # direct SetForegroundWindow from a non-foreground RPC worker thread.
+        user32, kernel32 = self.user32, self.kernel32
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+        user32.SetForegroundWindow(hwnd)
+        if self.foreground() == hwnd:
+            return True
+
+        # Attach input queues temporarily instead of injecting keystrokes,
+        # clicking other windows, or weakening the app/owner-scope check.
+        source_tid = kernel32.GetCurrentThreadId()
+        foreground = self.foreground()
+        foreground_tid = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        target_tid = user32.GetWindowThreadProcessId(hwnd, None)
+        attached = []
+        try:
+            for tid in (foreground_tid, target_tid):
+                if tid and tid != source_tid and tid not in attached:
+                    if bool(user32.AttachThreadInput(source_tid, tid, True)):
+                        attached.append(tid)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetActiveWindow(hwnd)
+        finally:
+            for tid in reversed(attached):
+                user32.AttachThreadInput(source_tid, tid, False)
         return self.foreground() == hwnd
 
     def point_on_target(self, hwnd, x, y):

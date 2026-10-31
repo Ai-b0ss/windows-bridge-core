@@ -140,5 +140,47 @@ class TrustedSkillPilotTests(unittest.TestCase):
             self.act(sid, "focus")
         self.assertFalse(self.events)
 
+    def test_foreground_thread_queue_attachment_fallback(self):
+        from cua_trusted_skill_input import WindowsWindowAPI
+        class Kernel:
+            def GetCurrentThreadId(self):
+                return 10
+        class User:
+            def __init__(self):
+                self.fg=900
+                self.attach_log=[]
+                self.attached=[]
+            def ShowWindow(self,hwnd,mode):
+                self.restored=(hwnd,mode)
+            def SetForegroundWindow(self,hwnd):
+                if self.attached:
+                    self.fg=hwnd
+                return 1
+            def GetForegroundWindow(self):
+                return self.fg
+            def GetWindowThreadProcessId(self,hwnd,pid):
+                return 20 if hwnd==900 else 30
+            def AttachThreadInput(self,source,tid,enabled):
+                self.attach_log.append((source,tid,enabled))
+                if enabled:
+                    self.attached.append(tid)
+                else:
+                    self.attached.remove(tid)
+                return 1
+            def BringWindowToTop(self,hwnd):
+                self.raised=hwnd
+            def SetActiveWindow(self,hwnd):
+                self.activated=hwnd
+        win=WindowsWindowAPI.__new__(WindowsWindowAPI)
+        win.user32=User()
+        win.kernel32=Kernel()
+        self.assertTrue(win.focus(100))
+        self.assertEqual(win.user32.restored,(100,9))
+        self.assertEqual(win.user32.raised,100)
+        self.assertEqual(win.user32.fg,100)
+        self.assertEqual(win.user32.attached,[])
+        self.assertEqual(win.user32.attach_log,
+                         [(10,20,True),(10,30,True),(10,30,False),(10,20,False)])
+
 if __name__=="__main__":
     unittest.main()
