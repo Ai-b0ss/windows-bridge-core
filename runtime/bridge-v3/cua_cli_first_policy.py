@@ -434,6 +434,11 @@ def enforce(core, op: str, args: dict) -> None:
             return
         _approval(core, op, args)
         return
+    # Owner granted the desktop for this exact agent/task (chat permission or
+    # signed approval) through set_desktop_mode: the grant is the exception.
+    active = getattr(core, "desktop_grant_active", None)
+    if callable(active) and active(args):
+        return
     entry = KNOWN[app]
     raise core.RPCError(
         "CLI_FIRST_POLICY_VIOLATION",

@@ -11,7 +11,8 @@ class TestWindowsBridgeSkillSource(unittest.TestCase):
         for phrase in ("Cursor", "Antigravity", "computer agent", "device_status", "programmatic_plan", "plan_action"):
             self.assertIn(phrase,text)
         for phrase in ("not proof that this skill has been installed",
-                       "trusted permission receipt", "independently verify", "clean"):
+                       "owner permission", "must not move the visible mouse",
+                       "independently verify", "clean"):
             self.assertIn(phrase.lower(),text.lower())
 
     def test_reference_bundle_and_no_embedded_machine_identifier(self):

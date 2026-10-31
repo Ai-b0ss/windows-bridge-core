@@ -243,11 +243,25 @@ class DesktopModes:
     Scope contains exact hwnd/pid/process birth, not a caller supplied title.
     Dedicated mode expires and never follows mouse inactivity.
     """
-    def __init__(self, root, store, target_fingerprint, stop_input=lambda: None):
+    def __init__(self, root, store, target_fingerprint, stop_input=lambda: None, chat_permission=None):
         self.root, self.store = Path(root), store
+        # Optional owner chat-permission policy; None keeps signed-only behaviour.
+        self.chat_permission = chat_permission
         self.target_fingerprint, self.stop_input = target_fingerprint, stop_input
         self.path = self.root / "desktop-mode.json"
         self.lock_path = self.root / "desktop-mode.lock"
+
+    def _grant_expiry(self, args, op):
+        """Expiry from a signed grant, or from the owner's chat permission."""
+        if "signed_approval" not in args and "authorization_id" not in args and "owner_chat_permission" in args:
+            if self.chat_permission is None:
+                raise AuthorityError("CHAT_PERMISSION_DISABLED")
+            try:
+                return self.chat_permission.authorize(args)
+            except ValueError as exc:
+                raise AuthorityError(str(exc)) from exc
+        grant = self.store.provision(signed_approval=args["signed_approval"]) if "signed_approval" in args else args.get("authorization_id")
+        return self.store.consume(grant, agent=args.get("agent_id"), task=args.get("task_id"), request=invocation(op, args))
 
     def _read(self):
         if not self.path.exists():
@@ -281,8 +295,7 @@ class DesktopModes:
                 for target in targets:
                     if target != self.target_fingerprint(target.get("hwnd")):
                         raise AuthorityError("DESKTOP_TARGET_CHANGED")
-                grant = self.store.provision(signed_approval=args["signed_approval"]) if "signed_approval" in args else args.get("authorization_id")
-                expires = self.store.consume(grant, agent=args.get("agent_id"), task=args.get("task_id"), request=invocation("set_desktop_mode", args))
+                expires = self._grant_expiry(args, "set_desktop_mode")
                 self.stop_input()
                 state = {"mode": mode, "agent_id": args["agent_id"], "task_id": args["task_id"], "targets": targets, "expires": expires, "generation": state["generation"]+1}
             else:
@@ -324,9 +337,7 @@ class DesktopModes:
                 raise AuthorityError("DESKTOP_MODE_SCOPE_MISMATCH")
             if args.get("command") not in {"launch_app", "ensure_app"} or args.get("visible_launch_allowed") is not True:
                 raise AuthorityError("VISIBLE_LAUNCH_SCOPE_INVALID")
-            grant = self.store.provision(signed_approval=args["signed_approval"]) if "signed_approval" in args else args.get("authorization_id")
-            expires = self.store.consume(grant, agent=args.get("agent_id"), task=args.get("task_id"),
-                                         request=invocation("computer_use", args))
+            expires = self._grant_expiry(args, "computer_use")
             expiry = min(expires, state["expires"])
             token = DESKTOP_ACTION_EXPIRY.set(expiry)
             try:

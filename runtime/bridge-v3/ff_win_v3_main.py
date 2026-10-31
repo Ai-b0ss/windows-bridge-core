@@ -60,8 +60,16 @@ def _stop_desktop_input():
         _CUA_CONTROL_PLANE._physical = None
 
 
+from cua_chat_permission import ChatPermissionPolicy, ChatPermissionError
+_CHAT_PERMISSION = ChatPermissionPolicy(core.BRIDGE_ROOT / "state" / "chat-permission.json",
+                                        core.BRIDGE_ROOT / "state" / "chat-permission")
+from cua_owner_activity import OwnerActivityGuard, OwnerActive
+from cua_owner_notice import OwnerNotice
+_OWNER_ACTIVITY = OwnerActivityGuard()
+_OWNER_NOTICE = OwnerNotice(core.BRIDGE_ROOT / "state" / "chat-permission")
 _DESKTOP_MODES = DesktopModes(core.BRIDGE_ROOT / "state" / "desktop-mode", _TASK_AUTHORITY,
-                             _desktop_fingerprint, _stop_desktop_input)
+                             _desktop_fingerprint, _stop_desktop_input,
+                             chat_permission=_CHAT_PERMISSION)
 
 
 def _set_desktop_mode(args):
@@ -80,6 +88,9 @@ def _deny_interactive_gui(reason: str, *, violations: list[str] | None = None) -
     }
     if violations:
         details["violations"] = list(violations)
+    # Trap: remember every refused visible-input attempt for the owner's review.
+    _CHAT_PERMISSION.log_violation("VISIBLE_INPUT_WITHOUT_PERMISSION", reason=reason,
+                                   violations=list(violations or []))
     raise core.RPCError("INTERACTIVE_FOREGROUND_DISABLED", details=details)
 
 
@@ -149,9 +160,64 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
     except HiddenDesktopError as exc:
         raise core.RPCError(exc.code, details={**exc.details,"retry_safe": False}) from exc
 
+def _desktop_grant_active(args: dict[str, Any]) -> bool:
+    """True when the desktop is dedicated to exactly this agent/task/generation."""
+    if _OWNER_NOTICE.stop_requested():
+        return False
+    try:
+        state = _DESKTOP_MODES.status()
+    except (OSError, ValueError):
+        return False
+    return (state.get("mode") == "dedicated"
+            and (state.get("agent_id"), state.get("task_id"), state.get("generation"))
+            == (args.get("agent_id"), args.get("task_id"), args.get("mode_generation")))
+
+
+core.desktop_grant_active = _desktop_grant_active
+
+
+def _windows_mcp_physical(args: dict[str, Any], invoke) -> dict[str, Any]:
+    """Windows-MCP click/type/scroll: only on the granted foreground window."""
+    try:
+        if _OWNER_NOTICE.stop_requested():
+            # The owner pressed Stop on the notice: revoke the grant for good.
+            _OWNER_NOTICE.clear_stop()
+            _DESKTOP_MODES.transition({"mode": "coexist"})
+            raise core.RPCError("OWNER_STOPPED", details={"retry_safe": False})
+        if _DESKTOP_MODES.status()["mode"] != "dedicated":
+            _deny_interactive_gui("explicit dedicated task mode required")
+        hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+        with _DESKTOP_MODES.action(args, hwnd):
+            try:
+                _OWNER_ACTIVITY.check()
+            except OwnerActive as exc:
+                raise core.RPCError("OWNER_ACTIVE", details={
+                    "idle_ms": exc.idle_ms, "retry_safe": True, "retry_after_ms": 2000,
+                    "next_step": "the owner is using the mouse or keyboard; wait and retry"}) from exc
+            try:
+                _OWNER_NOTICE.action(str(args.get("agent_id")), str(args.get("task_id")),
+                                     args.get("mode_generation"))
+            except OSError:
+                pass  # the notice is a courtesy; it must not break an approved action
+            try:
+                return invoke(args.get("tool"), args.get("arguments"), allow_physical=True)
+            finally:
+                _OWNER_ACTIVITY.agent_input_done()
+    except AuthorityError as exc:
+        raise core.RPCError(str(exc), details={"retry_safe": False}) from exc
+    except (ValueError, RuntimeError) as exc:
+        if isinstance(exc, core.RPCError):
+            raise
+        raise core.RPCError(str(exc), details={"retry_safe": False}) from exc
+
+
 def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
     from cua_cli_first_policy import enforce as enforce_cli_first
     enforce_cli_first(core, "computer_use", args)
+    if args.get("command") == "windows_mcp":
+        from cua_windows_mcp import PHYSICAL_TOOLS, invoke_windows_mcp
+        if args.get("tool") in PHYSICAL_TOOLS:
+            return _windows_mcp_physical(args, invoke_windows_mcp)
     if args.get("command") in {
         "assistant_step", "assistant_task", "assistant_task_status",
         "assistant_task_reconcile",
@@ -505,6 +571,7 @@ def _install_gui_guards() -> None:
             "independent_app_task_success_attested": False,
         }
         features["agent_workflows_discovery"] = True
+        features["owner_chat_permission"] = _CHAT_PERMISSION.status()
         features["trusted_skill_input_pilot"] = {
             "version": 1,
             "mode": "owner_opted_in_to_skill_guided_agent",
@@ -549,6 +616,14 @@ def _install_gui_guards() -> None:
 
     core.OPS["capabilities"] = capabilities
     core.OPS["set_desktop_mode"] = _set_desktop_mode
+    core.OPS["chat_permission_status"] = lambda args: _CHAT_PERMISSION.status()
+
+    def _scope_report(args):
+        try:
+            return _CHAT_PERMISSION.scope_report(args.get("hours", 24))
+        except ChatPermissionError as exc:
+            raise core.RPCError(str(exc)) from exc
+    core.OPS["scope_report"] = _scope_report
     core.OPS["desktop_mode_status"] = lambda args: _DESKTOP_MODES.status()
 
 
