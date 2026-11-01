@@ -432,7 +432,7 @@
     "runtime/bridge-v3/ff_win_process_identity.py": "875409d8fba363f7ff7c5afb4519fe15b2c6fd6fb7ee11b4080054c56b156e5c",
     "runtime/bridge-v3/ff_win_request_journal.py": "887fdbc2ffcbd846eb226ee019fa395e05efa9dbbc5100159064ff67dcff1c61",
     "runtime/bridge-v3/ff_win_stop_bridge.ps1": "2891c0d004ae2d02f8761820b3b9e6a34c33ccd8e18fc8f3583aa8b21e6d9fdb",
-    "runtime/bridge-v3/ff_win_v3_agent.py": "a89020e269d9cdb4b78589eca623796f7ea09dd6034e2ca9ee9e76aff78111e2",
+    "runtime/bridge-v3/ff_win_v3_agent.py": "91bc5ba19c35152320415eaaf5966817c30b96ac46ff2143751d79b6250babd7",
     "runtime/bridge-v3/ff_win_v3_direct.py": "eec71c6207fd77b11875025d042010b3af17c6b0ad7ecbe3348a4192aaca91e6",
     "runtime/bridge-v3/ff_win_v3_documents.py": "95c7ec5fe6b35541e0d2e2235ad5d7ab668c8cece2a6587d85cd05c2a6afe00e",
     "runtime/bridge-v3/ff_win_v3_extras.py": "ecf92375e6eec6bffb23cd45f4f31827bbb920b45d672eda4496163436f6e3b0",
@@ -524,9 +524,11 @@
     "tests/test_owner_activity_notice.py": "acfcb8908b71c9998f935eb5cbb069f206396d9bab101e8b0bc0c55027f054c9",
     "tests/sidecar_observed_change.test.mjs": "c945208702e98fdd2b6eb9b7a0d21096118ce950dfe41d69d1575f7ee59d6a75",
     "tests/test_browser_observed_change.py": "e360318884294df9c34588bf3afabb784ba1840d7c1e6856763f37272864eb24",
-    "tests/test_windows_mcp_pool.py": "74fa442481ba171a8306adf13eb54165e4488d1c22f06780211a592bedcf9823",
+    "tests/test_windows_mcp_pool.py": "9711f00fbe40e615a5fb4b5a85a5ced69747682aea4b8ad6f2f24dd6aaa71cd6",
     "tests/test_manifest_matches_git.py": "5fee61fa61e6b56e838835c207da04a88117be0669764355b33ec0e3715ac5f9",
     "tests/test_runtime_parity.py": "803e51e998b2924b7f3b330c42e160fed581363957912f3a8d85b8d279bc615a",
-    "tests/test_build_chatgpt_plugin.py": "a1785a7ea20a7149e38535b1fb3b5fc1a17ffbd3b96c38b65cd797b0eca6a760"
+    "tests/test_build_chatgpt_plugin.py": "a1785a7ea20a7149e38535b1fb3b5fc1a17ffbd3b96c38b65cd797b0eca6a760",
+    "tests/integration/seamless_handover.py": "f176a89d26f1e4c09fa666a88addcb8e9a1ae0d67acbe92246a47f5b7dc866bb",
+    "tests/test_seamless_handover.py": "d1550eee95323ea9bbf93e7b0ff0d4bcd13064f347224d459c2c1422ad2f9362"
   }
 }
