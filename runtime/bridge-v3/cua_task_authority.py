@@ -237,17 +237,24 @@ def guard_effect(core, store, op, original):
         return original(args)
     return guarded
 
-class DesktopModes:
-    """One machine-wide mode; transitions serialize with foreground dispatch.
+MAX_GRANTS = 16
 
-    Scope contains exact hwnd/pid/process birth, not a caller supplied title.
-    Dedicated mode expires and never follows mouse inactivity.
+
+class DesktopModes:
+    """Independent per-agent/per-task grants, each bound to exact windows.
+
+    Every grant holds its own scope (hwnd + pid + process birth), expiry and generation. Agents
+    never block each other because their windows differ; the shared mouse, keyboard and focus are
+    serialized separately by short leases (see cua_resource_leases). The owner's Stop revokes all.
     """
-    def __init__(self, root, store, target_fingerprint, stop_input=lambda: None, chat_permission=None):
+    def __init__(self, root, store, target_fingerprint, stop_input=lambda: None, chat_permission=None,
+                 holds_input=None):
         self.root, self.store = Path(root), store
         # Optional owner chat-permission policy; None keeps signed-only behaviour.
         self.chat_permission = chat_permission
         self.target_fingerprint, self.stop_input = target_fingerprint, stop_input
+        # (agent_id, task_id) -> True while that task is inside a physical action.
+        self.holds_input = holds_input or (lambda agent, task: False)
         self.path = self.root / "desktop-mode.json"
         self.lock_path = self.root / "desktop-mode.lock"
 
@@ -265,13 +272,21 @@ class DesktopModes:
 
     def _read(self):
         if not self.path.exists():
-            return {"mode": "coexist", "generation": 0}
-        state = json.loads(self.path.read_text(encoding="utf-8"))
-        if state.get("mode") == "dedicated" and state["expires"] <= time.time():
-            self.stop_input()
-            state = {"mode": "coexist", "generation": state["generation"]+1}
-            self._write(state)
-        return state
+            return {"generation": 0, "grants": []}
+        raw = json.loads(self.path.read_text(encoding="utf-8"))
+        if "grants" not in raw:  # single-grant file written by an older Bridge
+            grants = []
+            if raw.get("mode") == "dedicated":
+                grants = [{key: raw[key] for key in ("agent_id", "task_id", "targets", "expires", "generation")}]
+            raw = {"generation": raw.get("generation", 0), "grants": grants}
+        now = time.time()
+        live = [g for g in raw["grants"] if g["expires"] > now]
+        if len(live) != len(raw["grants"]):
+            if any(self.holds_input(g["agent_id"], g["task_id"]) for g in raw["grants"] if g["expires"] <= now):
+                self.stop_input()
+            raw = {"generation": raw["generation"] + 1, "grants": live}
+            self._write(raw)
+        return raw
 
     def _write(self, state):
         self.root.mkdir(parents=True, exist_ok=True)
@@ -295,77 +310,149 @@ class DesktopModes:
             raise AuthorityError("DESKTOP_TARGET_CHANGED")
         return actual
 
+    @staticmethod
+    def _find(state, agent, task):
+        return next((g for g in state["grants"] if (g["agent_id"], g["task_id"]) == (agent, task)), None)
+
+    @staticmethod
+    def _view(state, grant=None):
+        """Single-grant shaped answer (what clients of the old global mode read)."""
+        if grant is None:
+            return {"mode": "coexist", "generation": state["generation"], "other_grants": len(state["grants"])}
+        return {"mode": "dedicated", "agent_id": grant["agent_id"], "task_id": grant["task_id"],
+                "targets": grant["targets"], "expires": grant["expires"], "generation": grant["generation"],
+                "other_grants": len(state["grants"]) - 1}
+
     def transition(self, args):
         from cua_global_resources import _StateLock
         mode = args.get("mode")
         if mode not in {"coexist", "dedicated"}:
             raise AuthorityError("DESKTOP_MODE_INVALID")
+        agent, task = args.get("agent_id"), args.get("task_id")
         with _StateLock(self.lock_path):
             state = self._read()
             if mode == "dedicated":
-                if state["mode"] == "dedicated" and (state["agent_id"], state["task_id"]) != (args.get("agent_id"), args.get("task_id")):
-                    raise AuthorityError("DESKTOP_MODE_BUSY")
+                if not isinstance(agent, str) or not isinstance(task, str) or not agent or not task:
+                    raise AuthorityError("AUTHORITY_IDENTITY_INVALID")
                 targets = args.get("targets")
                 if not isinstance(targets, list) or not 0 <= len(targets) <= 32:
                     raise AuthorityError("DESKTOP_TARGET_SCOPE_REQUIRED")
                 targets = [self._resolve_target(target) for target in targets]
+                mine = self._find(state, agent, task)
+                if mine is None and len(state["grants"]) >= MAX_GRANTS:
+                    raise AuthorityError("DESKTOP_GRANT_LIMIT")
                 expires = self._grant_expiry(args, "set_desktop_mode")
-                self.stop_input()
-                state = {"mode": mode, "agent_id": args["agent_id"], "task_id": args["task_id"], "targets": targets, "expires": expires, "generation": state["generation"]+1}
-            else:
-                # Any client may request a safe return; no permission needed to stop input.
-                self.stop_input()
-                state = {"mode": mode, "generation": state["generation"]+1}
+                if mine is not None and self.holds_input(agent, task):
+                    self.stop_input()
+                generation = state["generation"] + 1
+                grant = {"agent_id": agent, "task_id": task, "targets": targets, "expires": expires, "generation": generation}
+                state = {"generation": generation,
+                         "grants": [g for g in state["grants"] if g is not mine] + [grant]}
+                self._write(state)
+                return self._view(state, grant)
+            # Returning is always allowed, but only for one's own grant: another agent's work is protected.
+            if not isinstance(agent, str) or not isinstance(task, str) or not agent or not task:
+                raise AuthorityError("AUTHORITY_IDENTITY_INVALID")
+            mine = self._find(state, agent, task)
+            if mine is not None:
+                if self.holds_input(agent, task):
+                    self.stop_input()
+                state = {"generation": state["generation"] + 1, "grants": [g for g in state["grants"] if g is not mine]}
+                self._write(state)
+            return self._view(state)
+
+    def revoke_all(self):
+        """Owner override (Stop): every grant ends and in-flight input is cancelled."""
+        from cua_global_resources import _StateLock
+        with _StateLock(self.lock_path):
+            state = self._read()
+            self.stop_input()
+            state = {"generation": state["generation"] + 1, "grants": []}
             self._write(state)
-            return state
+            return self._view(state)
+
+    def grant_for(self, agent, task, generation=None):
+        from cua_global_resources import _StateLock
+        with _StateLock(self.lock_path):
+            grant = self._find(self._read(), agent, task)
+        if grant is None or (generation is not None and grant["generation"] != generation):
+            return None
+        return grant
+
+    def grant_active(self, agent, task, generation) -> bool:
+        return self.grant_for(agent, task, generation) is not None
+
+    def _check_grant(self, state, args):
+        grant = self._find(state, args.get("agent_id"), args.get("task_id"))
+        if grant is None:
+            raise AuthorityError("INTERACTIVE_FOREGROUND_DISABLED")
+        if grant["generation"] != args.get("mode_generation"):
+            raise AuthorityError("DESKTOP_MODE_SCOPE_MISMATCH")
+        return grant
+
+    def _still_granted(self, args, grant, error):
+        from cua_global_resources import _StateLock
+        with _StateLock(self.lock_path):
+            now = self._find(self._read(), args.get("agent_id"), args.get("task_id"))
+        if now is None or now["generation"] != grant["generation"]:
+            raise AuthorityError(error)
+
+    def check_scope(self, args, hwnd):
+        """Raise unless `hwnd` is, right now, exactly one of this agent's granted windows."""
+        from cua_global_resources import _StateLock
+        with _StateLock(self.lock_path):
+            grant = self._check_grant(self._read(), args)
+            try:
+                fingerprint = self.target_fingerprint(hwnd)
+            except Exception:
+                fingerprint = None
+            if fingerprint is None or fingerprint not in grant["targets"]:
+                raise AuthorityError("DESKTOP_TARGET_OUTSIDE_SCOPE")
+            return grant
 
     @contextmanager
     def action(self, args, hwnd):
-        from cua_global_resources import _StateLock
-        with _StateLock(self.lock_path):
-            state = self._read()
-            if state["mode"] != "dedicated":
-                raise AuthorityError("INTERACTIVE_FOREGROUND_DISABLED")
-            if (state["agent_id"], state["task_id"], state["generation"]) != (args.get("agent_id"), args.get("task_id"), args.get("mode_generation")):
-                raise AuthorityError("DESKTOP_MODE_SCOPE_MISMATCH")
-            if self.target_fingerprint(hwnd) not in state["targets"]:
-                raise AuthorityError("DESKTOP_TARGET_OUTSIDE_SCOPE")
-            token = DESKTOP_ACTION_EXPIRY.set(state["expires"])
-            try:
-                yield state
-                if state["expires"] <= time.time():
-                    self._read() # stop input and invalidate the old generation
-                    raise AuthorityError("DESKTOP_MODE_EXPIRED")
-            finally:
-                DESKTOP_ACTION_EXPIRY.reset(token)
+        """One physical action inside this agent's own grant. The state lock is held only to check,
+        so other agents' grants and actions are never blocked for the length of the action."""
+        grant = self.check_scope(args, hwnd)
+        token = DESKTOP_ACTION_EXPIRY.set(grant["expires"])
+        try:
+            yield grant
+            self._still_granted(args, grant, "DESKTOP_MODE_EXPIRED")  # revoked or expired while it ran
+        finally:
+            DESKTOP_ACTION_EXPIRY.reset(token)
 
     @contextmanager
     def launch_action(self, args):
-        """Serialize one exact visible launch with desktop-mode transitions."""
+        """One exact visible launch inside this agent's grant."""
         from cua_global_resources import _StateLock
         with _StateLock(self.lock_path):
-            state = self._read()
-            if state["mode"] != "dedicated":
-                raise AuthorityError("INTERACTIVE_FOREGROUND_DISABLED")
-            if (state["agent_id"], state["task_id"], state["generation"]) != (args.get("agent_id"), args.get("task_id"), args.get("mode_generation")):
-                raise AuthorityError("DESKTOP_MODE_SCOPE_MISMATCH")
+            grant = self._check_grant(self._read(), args)
             if args.get("command") not in {"launch_app", "ensure_app"} or args.get("visible_launch_allowed") is not True:
                 raise AuthorityError("VISIBLE_LAUNCH_SCOPE_INVALID")
             expires = self._grant_expiry(args, "computer_use")
-            expiry = min(expires, state["expires"])
-            token = DESKTOP_ACTION_EXPIRY.set(expiry)
-            try:
-                yield state
-                if expiry <= time.time():
-                    self._read()
-                    raise AuthorityError("DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH")
-            finally:
-                DESKTOP_ACTION_EXPIRY.reset(token)
+        expiry = min(expires, grant["expires"])
+        token = DESKTOP_ACTION_EXPIRY.set(expiry)
+        try:
+            yield grant
+            if expiry <= time.time():
+                raise AuthorityError("DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH")
+            self._still_granted(args, grant, "DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH")
+        finally:
+            DESKTOP_ACTION_EXPIRY.reset(token)
 
-    def status(self):
+    def status(self, agent=None, task=None):
         from cua_global_resources import _StateLock
         with _StateLock(self.lock_path):
-            return self._read()
+            state = self._read()
+        grants = [{"agent_id": g["agent_id"], "task_id": g["task_id"], "targets": g["targets"],
+                   "expires": g["expires"], "generation": g["generation"]} for g in state["grants"]]
+        answer = {"mode": "dedicated" if grants else "coexist", "generation": state["generation"], "grants": grants}
+        mine = self._find(state, agent, task) if agent is not None and task is not None else None
+        if mine is not None:
+            answer["your_grant"] = self._view(state, mine)
+        return answer
+
 
 def main():
     parser = argparse.ArgumentParser(description="Trusted LOCAL owner/controller approval provisioning; never an RPC operation")

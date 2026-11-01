@@ -113,7 +113,7 @@ class NoticeTests(unittest.TestCase):
             self.assertIn(needle,guard)
         # every path that really sends input goes through the same guard
         self.assertEqual(main.count("with _visible_input_guard(args):"),3)
-        self.assertEqual(main.count("_owner_stop_check()"),4)  # definition + three call sites
+        self.assertEqual(main.count("_owner_stop_check()"),5)  # definition + three call sites + lease cancellation
 
 
 if __name__=="__main__":
