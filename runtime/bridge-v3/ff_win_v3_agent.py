@@ -21,7 +21,9 @@ import stat
 import subprocess
 import sys
 import threading
+import select
 import time
+import urllib.error
 import urllib.request
 import uuid
 from collections import deque
@@ -836,6 +838,11 @@ class State:
         self.sessions: dict[str, Session] = recover_detached_sessions()
         self.lock = threading.RLock()
         self.server: http.server.ThreadingHTTPServer | None = None
+        self.draining = False
+        self.drain_requested = False
+        self.drain_private_port: int | None = None
+        self.private_server: http.server.ThreadingHTTPServer | None = None
+        self.inflight = 0
 
 
 STATE = State()
@@ -1673,10 +1680,98 @@ OPS = {
 }
 
 
+PEERS_PATH = V3_ROOT / "state" / "peers.json"
+SESSION_OPS = {"read_process_output", "interact_with_process", "force_terminate"}
+DRAIN_LINGER_SECONDS = 1800.0
+
+
+def _peer_ports() -> list[int]:
+    try:
+        raw = json.loads(PEERS_PATH.read_text("utf-8"))
+    except Exception:
+        return []
+    return [int(info["port"]) for info in raw.values() if isinstance(info, dict) and isinstance(info.get("port"), int)]
+
+
+def _write_peer(entry: dict[str, Any] | None) -> None:
+    try:
+        raw = json.loads(PEERS_PATH.read_text("utf-8"))
+        if not isinstance(raw, dict):
+            raw = {}
+    except Exception:
+        raw = {}
+    if entry is None:
+        raw.pop(str(os.getpid()), None)
+    else:
+        raw[str(os.getpid())] = entry
+    PEERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(PEERS_PATH, json.dumps(raw), "utf-8")
+
+
+def _forward_to_peer(request: dict[str, Any]) -> dict[str, Any] | None:
+    """Hand a session request to a draining older instance that still owns the session."""
+    body = json.dumps(request, ensure_ascii=False).encode("utf-8")
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for port in _peer_ports():
+        call = urllib.request.Request(
+            f"http://127.0.0.1:{port}/rpc", data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-FF3-Key": STATE.secret},
+        )
+        try:
+            with opener.open(call, timeout=60) as response:
+                answer = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            try:
+                answer = json.loads(exc.read().decode("utf-8"))
+            except Exception:
+                continue
+        except Exception:
+            continue
+        if isinstance(answer, dict) and answer.get("error_code") != "SESSION_NOT_FOUND":
+            return answer
+    return None
+
+
+def op_drain(args: dict[str, Any]) -> dict[str, Any]:
+    """Stop taking new connections on the public port while this process keeps its sessions.
+
+    A standby instance must already share the public port and answer on its own check port;
+    otherwise draining would be an outage and is refused.
+    """
+    standby = args.get("standby_port")
+    if isinstance(standby, bool) or not isinstance(standby, int) or not 1024 <= standby <= 65535:
+        raise RPCError("DRAIN_STANDBY_PORT_REQUIRED")
+    if STATE.draining or STATE.drain_requested:
+        raise RPCError("DRAIN_ALREADY_REQUESTED")
+    try:
+        probe = client_request("127.0.0.1", standby, "ping", {})
+    except Exception as exc:
+        raise RPCError("DRAIN_STANDBY_NOT_READY", details={"error": type(exc).__name__})
+    other = (probe.get("result") or {}).get("pid")
+    if probe.get("ok") is not True or not isinstance(other, int) or other == os.getpid():
+        raise RPCError("DRAIN_STANDBY_NOT_READY", details={"standby_pid": other})
+    private = BridgeHTTPServer(("127.0.0.1", 0), Handler)
+    port = int(private.server_address[1])
+    threading.Thread(target=_serve_direct, args=(private,), daemon=True).start()
+    STATE.private_server = private
+    STATE.drain_private_port = port
+    _write_peer({"port": port, "started": now_ms()})
+    STATE.drain_requested = True
+    return {"draining": True, "private_port": port, "standby_pid": other, "pid": os.getpid()}
+
+
+OPS["drain"] = op_drain
+
+
 def dispatch(request: dict[str, Any]) -> dict[str, Any]:
     started = now_ms()
     op = request.get("op")
     args = request.get("args", {})
+    if (op in SESSION_OPS and isinstance(args, dict) and not STATE.draining
+            and str(args.get("session_id") or "") not in STATE.sessions):
+        forwarded = _forward_to_peer(request)
+        if forwarded is not None:
+            return forwarded
     request_id = request.get("request_id") or request.get("task_id")
     if not isinstance(op, str) or op not in OPS:
         raise RPCError("OP_UNSUPPORTED", details={"op": op, "supported": sorted(OPS)})
@@ -1758,6 +1853,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(413, {"ok": False, "error_code": "REQUEST_SIZE_INVALID"})
             return
         raw = self.rfile.read(length)
+        with STATE.lock:
+            STATE.inflight += 1
+        try:
+            self._handle_rpc(raw)
+        finally:
+            with STATE.lock:
+                STATE.inflight -= 1
+
+    def _handle_rpc(self, raw: bytes) -> None:
         try:
             request = json.loads(raw.decode("utf-8"))
         except Exception:
@@ -1787,6 +1891,11 @@ def _serve_direct(server: http.server.ThreadingHTTPServer) -> None:
     server.socket.settimeout(0.5)
     try:
         while not server._BaseServer__shutdown_request:
+            if server is STATE.server and STATE.drain_requested:
+                # Leave only when nothing is queued, so closing cannot reset a waiting client.
+                if not select.select([server.socket], [], [], 0)[0]:
+                    STATE.draining = True
+                    break
             try:
                 request, client_address = server.get_request()
             except socket.timeout:
@@ -1816,19 +1925,42 @@ class BridgeHTTPServer(http.server.ThreadingHTTPServer):
     request_queue_size = 64
 
 
-def serve(host: str, port: int) -> int:
+def _drain_wait() -> None:
+    """The public listener is closed; stay for sessions and forwarded requests, then leave."""
+    quiet_since = time.monotonic()
+    linger = float(os.environ.get("FF_DRAIN_LINGER_SECONDS") or DRAIN_LINGER_SECONDS)
+    while True:
+        time.sleep(0.5)
+        with STATE.lock:
+            running = any(session.poll() is None for session in STATE.sessions.values())
+            busy = STATE.inflight > 0
+        if running or busy:
+            quiet_since = time.monotonic()
+        elif time.monotonic() - quiet_since >= linger:
+            return
+
+
+def serve(host: str, port: int, also_listen: list[int] | None = None) -> int:
     ensure_dirs()
     atomic_write_text(PID_PATH, str(os.getpid()) + "\n", "ascii")
     try:
         server = BridgeHTTPServer((host, port), Handler)
+        extras = [BridgeHTTPServer((host, extra), Handler) for extra in (also_listen or [])]
     except OSError as exc:
         print(f"FF3_BIND_FAILED:{exc}", file=sys.stderr)
         return 3
     STATE.server = server
+    for extra in extras:
+        threading.Thread(target=_serve_direct, args=(extra,), daemon=True).start()
     try:
         _serve_direct(server)
+        if STATE.draining:
+            server.server_close()
+            _drain_wait()
     finally:
         server.server_close()
+        if STATE.drain_private_port is not None:
+            _write_peer(None)
         try:
             if PID_PATH.is_file() and PID_PATH.read_text(encoding="ascii").strip() == str(os.getpid()):
                 PID_PATH.unlink(missing_ok=True)
@@ -1856,12 +1988,14 @@ def main() -> int:
     serve_parser = subparsers.add_parser("serve")
     serve_parser.add_argument("--host", default=HOST)
     serve_parser.add_argument("--port", type=int, default=PORT)
+    serve_parser.add_argument("--also-listen", type=int, action="append", default=[],
+                              help="extra loopback port to check a standby before it takes over")
     ping_parser = subparsers.add_parser("ping")
     ping_parser.add_argument("--host", default=HOST)
     ping_parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
     if args.cmd == "serve":
-        return serve(args.host, args.port)
+        return serve(args.host, args.port, args.also_listen)
     if args.cmd == "ping":
         try:
             print(json.dumps(client_request(args.host, args.port, "ping"), ensure_ascii=False))
