@@ -279,6 +279,22 @@ class DesktopModes:
         tmp.write_text(canonical(state), encoding="utf-8")
         os.replace(tmp, self.path)
 
+    def _resolve_target(self, target):
+        """Build the exact window fingerprint from an hwnd and check anything else the caller states.
+
+        Agents cannot list a process start time, so {"hwnd": N} is enough; a given pid or
+        process_start_ns must still match the live window.
+        """
+        if not isinstance(target, dict) or "hwnd" not in target or set(target) - {"hwnd", "pid", "process_start_ns"}:
+            raise AuthorityError("DESKTOP_TARGET_INVALID")
+        try:
+            actual = self.target_fingerprint(target["hwnd"])
+        except Exception as exc:
+            raise AuthorityError("DESKTOP_TARGET_INVALID") from exc
+        if any(str(actual.get(key)) != str(value) for key, value in target.items()):
+            raise AuthorityError("DESKTOP_TARGET_CHANGED")
+        return actual
+
     def transition(self, args):
         from cua_global_resources import _StateLock
         mode = args.get("mode")
@@ -292,9 +308,7 @@ class DesktopModes:
                 targets = args.get("targets")
                 if not isinstance(targets, list) or not 0 <= len(targets) <= 32:
                     raise AuthorityError("DESKTOP_TARGET_SCOPE_REQUIRED")
-                for target in targets:
-                    if target != self.target_fingerprint(target.get("hwnd")):
-                        raise AuthorityError("DESKTOP_TARGET_CHANGED")
+                targets = [self._resolve_target(target) for target in targets]
                 expires = self._grant_expiry(args, "set_desktop_mode")
                 self.stop_input()
                 state = {"mode": mode, "agent_id": args["agent_id"], "task_id": args["task_id"], "targets": targets, "expires": expires, "generation": state["generation"]+1}

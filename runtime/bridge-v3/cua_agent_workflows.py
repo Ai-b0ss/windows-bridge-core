@@ -109,7 +109,7 @@ def agent_workflows() -> dict:
                     "op": "set_desktop_mode",
                     "args": {
                         "mode": "dedicated", "agent_id": "<agent>", "task_id": "<task>",
-                        "targets": ["<exact window fingerprints>"],
+                        "targets": [{"hwnd": "<hwnd from gui_list_windows>"}],
                         "owner_chat_permission": {
                             "quote": "<owner's own message, verbatim>",
                             "apps": ["<app names>"], "duration_seconds": 3600,
