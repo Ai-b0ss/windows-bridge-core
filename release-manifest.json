@@ -438,7 +438,7 @@
     "runtime/bridge-v3/ff_win_v3_extras.py": "ecf92375e6eec6bffb23cd45f4f31827bbb920b45d672eda4496163436f6e3b0",
     "runtime/bridge-v3/ff_win_v3_gui.py": "2c40a0f724d88ef8903e074a5d54442f54425c98a1f880f5d827eedbdb0a555f",
     "runtime/bridge-v3/ff_win_v3_keeper.ps1": "9bcd741c93ec762969100a6b8a97642bf14d0599f737970dc058d6d796e0c70c",
-    "runtime/bridge-v3/ff_win_v3_main.py": "4cd435735469ba31307d20661956ac856e1ca98f273ea743441b95e9c20e2e2d",
+    "runtime/bridge-v3/ff_win_v3_main.py": "969ece7b402c393087f48602e7a5a84043eee440e4d60c6acf631ec670f8a683",
     "runtime/bridge-v3/ff_win_v3_security.py": "f8d38cf578860ffe8f2e8578cd9c645d6e20fb51ad16be7976df921ed7ff8a7e",
     "runtime/bridge-v3/ff_win_v3_upgrade.py": "8bf000d2dfe15d55bf0f0050bdae57bcc3933192ea44757941b7f226e69f6085",
     "runtime/bridge-v3/ff_win_v3_workflow_deploy.ps1": "b87875c45127a1f0024e9ac0d0a20d7104ddcf9c12edbe52414391793717c057",

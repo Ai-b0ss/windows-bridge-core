@@ -51,7 +51,7 @@ def _interactive_gui_override_enabled() -> bool:
 def _desktop_fingerprint(hwnd):
     from cua_physical_runtime import Win32TargetApi
     target = Win32TargetApi().fingerprint(int(hwnd), 0)
-    return {"hwnd": target.hwnd, "pid": target.pid, "process_start_ns": target.process_start_ns}
+    return {"hwnd": target.hwnd, "pid": target.pid, "process_start_ns": str(target.process_start_ns)}
 
 
 def _stop_desktop_input():
