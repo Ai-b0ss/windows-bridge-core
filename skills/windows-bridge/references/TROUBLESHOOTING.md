@@ -4,7 +4,11 @@
 - `CUA_COMMAND_UNSUPPORTED`: check live `computer_use.command` and the deployed version; new `plan_action` requires a new runtime and will not work on old installed Bridge.
 - `NO_BACKGROUND_ROUTE`: inspect prior route attempts; research official software/API and owned hidden alternatives before requesting foreground authority.
 - `OWNER_APPROVAL_VERIFIER_NOT_CONFIGURED`: only the optional strict signed mode uses it. With the owner's chat permission, call `set_desktop_mode` with `owner_chat_permission`; never mint keys or disable checks.
-- `INTERACTIVE_FOREGROUND_DISABLED`: no granted desktop yet. Finish the route search, ask the owner, then `set_desktop_mode`.
+- `LEASE_TIMEOUT` (retry-safe): another agent is using the mouse/keyboard right now; `details.blocked_on` names the holder. Retry shortly.
+- `DESKTOP_MODE_REVOKED` / `OWNER_STOPPED`: your grant ended (released, expired or the owner pressed Stop). Stop and ask the owner again.
+- `FOCUS_FAILED` (retry-safe): the granted window could not be brought to the front; retry once, then report.
+- `DESKTOP_TARGET_INVALID` / `DESKTOP_TARGET_CHANGED` / `DESKTOP_GRANT_LIMIT`: bad `targets`, window replaced by another process, or 16 grants already active.
+- `INTERACTIVE_FOREGROUND_DISABLED`: you have no grant yet. Finish the route search, ask the owner, then `set_desktop_mode`.
 - `CHAT_PERMISSION_DISABLED`: the owner has not enabled the feature locally. Tell the owner; do not try to enable it.
 - `OWNER_ACTIVE`: the owner is using mouse or keyboard. Wait about 2 s and retry; do not fight for input.
 - `OWNER_STOPPED`: the owner pressed Stop on the on-screen notice. Stop work and ask again.

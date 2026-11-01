@@ -68,9 +68,11 @@ from cua_owner_activity import OwnerActivityGuard, OwnerActive
 from cua_owner_notice import OwnerNotice
 _OWNER_ACTIVITY = OwnerActivityGuard()
 _OWNER_NOTICE = OwnerNotice(core.BRIDGE_ROOT / "state" / "chat-permission")
+from cua_resource_leases import ResourceLeases, LeaseError, INPUT, window_resource
+_LEASES = ResourceLeases()
 _DESKTOP_MODES = DesktopModes(core.BRIDGE_ROOT / "state" / "desktop-mode", _TASK_AUTHORITY,
                              _desktop_fingerprint, _stop_desktop_input,
-                             chat_permission=_CHAT_PERMISSION)
+                             chat_permission=_CHAT_PERMISSION, holds_input=_LEASES.holds)
 
 
 def _set_desktop_mode(args):
@@ -166,12 +168,9 @@ def _desktop_grant_active(args: dict[str, Any]) -> bool:
     if _OWNER_NOTICE.stop_requested():
         return False
     try:
-        state = _DESKTOP_MODES.status()
+        return _DESKTOP_MODES.grant_active(args.get("agent_id"), args.get("task_id"), args.get("mode_generation"))
     except (OSError, ValueError):
         return False
-    return (state.get("mode") == "dedicated"
-            and (state.get("agent_id"), state.get("task_id"), state.get("generation"))
-            == (args.get("agent_id"), args.get("task_id"), args.get("mode_generation")))
 
 
 core.desktop_grant_active = _desktop_grant_active
@@ -181,8 +180,58 @@ def _owner_stop_check() -> None:
     """The owner pressed Stop on the notice: revoke the grant for good."""
     if _OWNER_NOTICE.stop_requested():
         _OWNER_NOTICE.clear_stop()
-        _DESKTOP_MODES.transition({"mode": "coexist"})
+        _DESKTOP_MODES.revoke_all()  # Stop is the owner's override over every agent's grant
         raise core.RPCError("OWNER_STOPPED", details={"retry_safe": False})
+
+
+LEASE_WAIT_SECONDS = 10.0
+
+
+@contextmanager
+def _physical_lease(args: dict[str, Any], resources: list[str]):
+    """Queue for the shared mouse/keyboard/focus for ONE action; give up cleanly after a bounded wait."""
+    owner = (args.get("agent_id"), args.get("task_id"))
+    wait = args.get("lease_wait_seconds", LEASE_WAIT_SECONDS)
+    if type(wait) not in (int, float) or not 0 < wait <= 60:
+        raise core.RPCError("LEASE_WAIT_INVALID", details={"allowed": "0 < seconds <= 60"})
+
+    def still_valid() -> bool:
+        return not _OWNER_NOTICE.stop_requested() and _desktop_grant_active(args)
+
+    try:
+        with _LEASES.acquire(owner, resources, timeout=float(wait), still_valid=still_valid):
+            yield
+    except LeaseError as exc:
+        if exc.code == "LEASE_CANCELLED":
+            _owner_stop_check()
+            raise core.RPCError("DESKTOP_MODE_REVOKED", details={"retry_safe": False}) from exc
+        raise core.RPCError(exc.code, details=dict(exc.details)) from exc
+
+
+def _focus_window(hwnd: int) -> None:
+    """Bring one of the agent's own granted windows to the front (call only inside the input lease)."""
+    import time as _time
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    if not user32.IsWindow(hwnd):
+        raise core.RPCError("GUI_WINDOW_NOT_FOUND", details={"hwnd": hwnd})
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    if int(user32.GetForegroundWindow()) != hwnd:
+        front = user32.GetForegroundWindow()
+        front_thread = user32.GetWindowThreadProcessId(front, None) if front else 0
+        mine = kernel32.GetCurrentThreadId()
+        attached = bool(front_thread and front_thread != mine and user32.AttachThreadInput(mine, front_thread, True))
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(mine, front_thread, False)
+    for _ in range(40):
+        if int(user32.GetForegroundWindow()) == hwnd:
+            return
+        _time.sleep(0.025)
+    raise core.RPCError("FOCUS_FAILED", details={"hwnd": hwnd, "retry_safe": True})
 
 
 @contextmanager
@@ -209,6 +258,7 @@ def _visible_input_guard(args: dict[str, Any]):
 _SCOPE_FAILURES = {
     "DESKTOP_TARGET_OUTSIDE_SCOPE": "OUT_OF_SCOPE_APP",
     "DESKTOP_MODE_SCOPE_MISMATCH": "OUT_OF_SCOPE_APP",
+    "INTERACTIVE_FOREGROUND_DISABLED": "VISIBLE_INPUT_WITHOUT_PERMISSION",
     "DESKTOP_MODE_EXPIRED": "PERMISSION_EXPIRED",
     "DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH": "PERMISSION_EXPIRED",
 }
@@ -225,15 +275,28 @@ def _note_scope_failure(exc: Exception, args: dict[str, Any]) -> None:
 
 
 def _windows_mcp_physical(args: dict[str, Any], invoke) -> dict[str, Any]:
-    """Windows-MCP click/type/scroll: only on the granted foreground window."""
+    """Windows-MCP click/type/scroll: only on a window inside THIS agent's own grant.
+
+    Optional `target_hwnd` names the granted window to work in; it is checked against the grant
+    first and only then brought to the front, all inside one short input lease. Without it the
+    current foreground window must already be granted.
+    """
     try:
         _owner_stop_check()
         if _DESKTOP_MODES.status()["mode"] != "dedicated":
             _deny_interactive_gui("explicit dedicated task mode required")
-        hwnd = int(ctypes.windll.user32.GetForegroundWindow())
-        with _DESKTOP_MODES.action(args, hwnd):
-            with _visible_input_guard(args):
-                return invoke(args.get("tool"), args.get("arguments"), allow_physical=True)
+        target = args.get("target_hwnd")
+        if target is not None and (type(target) is not int or target <= 0):
+            raise core.RPCError("GUI_HWND_INVALID")
+        resources = [INPUT] + ([window_resource(target)] if target is not None else [])
+        with _physical_lease(args, resources):
+            if target is not None:
+                _DESKTOP_MODES.check_scope(args, target)  # never focus a window the grant does not name
+                _focus_window(target)
+            hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+            with _DESKTOP_MODES.action(args, hwnd):
+                with _visible_input_guard(args):
+                    return invoke(args.get("tool"), args.get("arguments"), allow_physical=True)
     except AuthorityError as exc:
         _note_scope_failure(exc, args)
         raise core.RPCError(str(exc), details={"retry_safe": False}) from exc
@@ -279,7 +342,7 @@ def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
         # with mode changes; observed HWNDs still need a fresh input scope.
         try:
             _owner_stop_check()
-            with _DESKTOP_MODES.launch_action(args):
+            with _physical_lease(args, [INPUT]), _DESKTOP_MODES.launch_action(args):
                 with _visible_input_guard(args):
                     return _CUA_CONTROL_PLANE.dispatch(args)
         except AuthorityError as exc:
@@ -300,7 +363,7 @@ def _computer_use(args: dict[str, Any]) -> dict[str, Any]:
                     _deny_interactive_gui("explicit dedicated task mode required")
                 raise core.RPCError("DESKTOP_SCOPED_SURFACE_REQUIRED")
             _owner_stop_check()
-            with _DESKTOP_MODES.action(args, hwnd):
+            with _physical_lease(args, [INPUT, window_resource(hwnd)]), _DESKTOP_MODES.action(args, hwnd):
                 with _visible_input_guard(args):
                     return _CUA_CONTROL_PLANE.dispatch(args)
         return _CUA_CONTROL_PLANE.dispatch(args)
@@ -597,6 +660,9 @@ def _install_gui_guards() -> None:
         features["interactive_foreground_default_denied"] = True
         features["interactive_foreground_operator_override"] = False
         features["desktop_modes"] = ["coexist", "dedicated"]
+        features["per_window_grants"] = {"independent_grants": True, "max_grants": 16,
+                                         "shared_resources_leased": [INPUT, "window:<hwnd>"],
+                                         "background_routes_need_no_lease": True}
         features["dedicated_mode_requires_task_approval"] = True
         features["durable_request_outcomes"] = True
         # This attests that the currently loaded dispatcher supports real
@@ -665,7 +731,8 @@ def _install_gui_guards() -> None:
         except ChatPermissionError as exc:
             raise core.RPCError(str(exc)) from exc
     core.OPS["scope_report"] = _scope_report
-    core.OPS["desktop_mode_status"] = lambda args: _DESKTOP_MODES.status()
+    core.OPS["desktop_mode_status"] = lambda args: {
+        **_DESKTOP_MODES.status(args.get("agent_id"), args.get("task_id")), "leases": _LEASES.snapshot()}
 
 
 _install_gui_guards()
