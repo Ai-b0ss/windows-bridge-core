@@ -405,7 +405,7 @@
     "runtime/bridge-v3/cua_semantic_resources.py": "05a8d47bdab8a9c48015742703d74c33468fdffa8b9caf9dd4d251036a525646",
     "runtime/bridge-v3/cua_session_continuation.py": "eda8a607cb44dec24d88a5d4d895b763a7d43f58f964d950008429901c351e20",
     "runtime/bridge-v3/cua_sidecar_supervisor.py": "a1b751af113aa5db5834b6976e11d00363e0342ee07c4bcc2b941041a7234eb1",
-    "runtime/bridge-v3/cua_task_authority.py": "5f61cdb73504116a326fd78c64bedf6fe16f9bb0db2512f250033e0ab600ff03",
+    "runtime/bridge-v3/cua_task_authority.py": "afe59d5c1851e974f33146f3728d7bd46e7e9cbbac0f4c620f78c8088bdfdc4e",
     "runtime/bridge-v3/cua_task_routes.py": "0eb086fa03d906528920afa36699d4987cd17ae3e61a1f312a306733029d1e8a",
     "runtime/bridge-v3/cua_tool_preparation.py": "e890e4f851ec1a5d461bbfb306d55778611f2a7f192f296e05260db4b2793085",
     "runtime/bridge-v3/cua_trusted_skill_input.py": "48b7026912e9bf1ec384e8b497605de576731b7b2d0a52ec7cc047a4b06d5530",
@@ -526,7 +526,6 @@
     "tests/test_browser_observed_change.py": "e360318884294df9c34588bf3afabb784ba1840d7c1e6856763f37272864eb24",
     "tests/test_windows_mcp_pool.py": "74fa442481ba171a8306adf13eb54165e4488d1c22f06780211a592bedcf9823",
     "tests/test_manifest_matches_git.py": "5fee61fa61e6b56e838835c207da04a88117be0669764355b33ec0e3715ac5f9",
-    "tests/test_runtime_parity.py": "803e51e998b2924b7f3b330c42e160fed581363957912f3a8d85b8d279bc615a",
-    "tests/test_desktop_target_exactness.py": "4c9b3224f7b5093557d63b7587ecd25f4251c875fbd6e04c292b80ff808556d3"
+    "tests/test_runtime_parity.py": "803e51e998b2924b7f3b330c42e160fed581363957912f3a8d85b8d279bc615a"
   }
 }
