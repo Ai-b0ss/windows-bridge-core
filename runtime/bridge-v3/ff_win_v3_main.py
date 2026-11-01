@@ -625,6 +625,8 @@ def _install_gui_guards() -> None:
         }
         features["chat_consent_challenge_protocol"] = {
             "version": 1, "attested_host_issuer_connected": False,
+            "status": "optional_strict_mode_not_required",
+            "default_route": "owner_chat_permission",
             "owner_grant_from_chat_text": False,
             "requires_signed_receipt": True,
             "operations": ["chat_consent_prepare", "chat_consent_status", "chat_consent_commit"],

@@ -144,6 +144,25 @@ class ChatPermissionTests(unittest.TestCase):
         with self.assertRaises(AuthorityError):
             modes.transition(args)
 
+    def test_targets_are_resolved_from_hwnd_and_checked(self):
+        self.enable()
+        store=AuthorityStore(self.root/"authority")
+        live={"hwnd":42,"pid":7,"process_start_ns":"123456789012345678"}
+        modes=DesktopModes(self.root/"mode",store,lambda hwnd:dict(live) if hwnd==42 else (_ for _ in ()).throw(OSError("gone")),
+                           chat_permission=self.policy)
+        def ask(*targets):
+            args=request(duration_seconds=300); args["targets"]=list(targets); return args
+        state=modes.transition(ask({"hwnd":42}))
+        self.assertEqual(state["targets"],[live])
+        modes.transition({"mode":"coexist","agent_id":"chatgpt","task_id":"task-1"})
+        modes.transition(ask({"hwnd":42,"pid":7,"process_start_ns":123456789012345678}))
+        modes.transition({"mode":"coexist","agent_id":"chatgpt","task_id":"task-1"})
+        for bad,code in (("notepad.exe","DESKTOP_TARGET_INVALID"),({"pid":7},"DESKTOP_TARGET_INVALID"),
+                         ({"hwnd":42,"title":"x"},"DESKTOP_TARGET_INVALID"),({"hwnd":99},"DESKTOP_TARGET_INVALID"),
+                         ({"hwnd":42,"pid":8},"DESKTOP_TARGET_CHANGED")):
+            with self.assertRaisesRegex(AuthorityError,code):
+                modes.transition(ask(bad))
+
 
 if __name__=="__main__":
     unittest.main()
