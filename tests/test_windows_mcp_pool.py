@@ -64,7 +64,7 @@ class PoolTests(unittest.TestCase):
                             idle_seconds=1)
         try:
             first=pool.call({"tool":"Snapshot","arguments":{}})
-            time.sleep(2.5)
+            time.sleep(6)  # idle timer is 1 s; CI runners can be slow to fire it
             second=pool.call({"tool":"Snapshot","arguments":{}})
             self.assertNotEqual(first["pid"],second["pid"])
         finally:
