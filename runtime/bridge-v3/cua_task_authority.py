@@ -209,7 +209,7 @@ class AuthorityStore:
             con.commit()
         return bool(changed)
 
-def guard_effect(core, store, op, original):
+def guard_effect(core, store, op, original, *, chat_permission=None):
     def guarded(args):
         consequence = args.get("consequences")
         if consequence is not None and (not isinstance(consequence, dict) or consequence.get("kind") not in {"ordinary", "destructive", "irreversible"}):
@@ -224,11 +224,26 @@ def guard_effect(core, store, op, original):
         if dangerous or hint or op in {"delete_path", "kill_process"}:
             if not consequence or not consequence.get("purpose") or not consequence.get("targets") or not consequence.get("risk"):
                 raise core.RPCError("EFFECT_SCOPE_REQUIRED", details={"execution_started": False})
-            try:
-                grant = store.provision(signed_approval=args["signed_approval"]) if "signed_approval" in args else args.get("authorization_id")
-                store.consume(grant, agent=args.get("agent_id"), task=args.get("task_id"), request=invocation(op, args))
-            except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
-                raise core.RPCError(str(exc) if isinstance(exc, AuthorityError) else "APPROVAL_STORAGE_UNAVAILABLE", details={"execution_started": False}) from exc
+            if "owner_chat_permission" in args and not any(
+                    key in args for key in ("signed_approval", "authorization_id")):
+                # Owner's opt-in skill-first path, not a cryptographic receipt.
+                if chat_permission is None:
+                    raise core.RPCError("CHAT_PERMISSION_DISABLED", details={"execution_started": False})
+                from cua_chat_permission import ChatPermissionError
+                import hashlib
+                exact_request = invocation(op, {k: v for k, v in args.items()
+                                                if k != "owner_chat_permission"})
+                digest = hashlib.sha256(canonical(exact_request).encode("utf-8")).hexdigest()
+                try:
+                    chat_permission.authorize_effect(args, operation=op, request_digest=digest)
+                except ChatPermissionError as exc:
+                    raise core.RPCError(str(exc), details={"execution_started": False}) from exc
+            else:
+                try:
+                    grant = store.provision(signed_approval=args["signed_approval"]) if "signed_approval" in args else args.get("authorization_id")
+                    store.consume(grant, agent=args.get("agent_id"), task=args.get("task_id"), request=invocation(op, args))
+                except (AuthorityError, sqlite3.Error, OSError, ValueError) as exc:
+                    raise core.RPCError(str(exc) if isinstance(exc, AuthorityError) else "APPROVAL_STORAGE_UNAVAILABLE", details={"execution_started": False}) from exc
             token = APPROVED_EFFECT.set(True)
             try:
                 return original(args)

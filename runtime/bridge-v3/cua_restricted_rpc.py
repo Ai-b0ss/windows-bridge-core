@@ -9,14 +9,14 @@ IDENTITY_HINT = ("pass agent_id and task_id in args: 1 to 128 characters of lett
 
 from cua_restricted_execution import RestrictedExecutionError, run_python
 
-def install(core, *, shell_policy="restricted", authority=None):
+def install(core, *, shell_policy="restricted", authority=None, chat_permission=None):
     if shell_policy not in {"restricted", "user"}:
         raise ValueError("SHELL_POLICY_INVALID")
     # Capture local startup policy. Request args/config cannot enable this.
     trusted_shell = shell_policy == "user" or os.environ.get(TRUSTED_SHELL_OVERRIDE_ENV) == "1"
     def scoped_process(name, original):
         from cua_task_authority import identity, AuthorityError, guard_effect
-        checked = guard_effect(core, authority, name, original)
+        checked = guard_effect(core, authority, name, original, chat_permission=chat_permission)
         def call(args):
             try:
                 owner = (identity(args.get("agent_id")), identity(args.get("task_id")))
@@ -81,7 +81,7 @@ def install(core, *, shell_policy="restricted", authority=None):
         from cua_task_authority import guard_effect
         for name in ("run_code", "delete_path", "kill_process"):
             if name in core.OPS:
-                core.OPS[name] = guard_effect(core, authority, name, core.OPS[name])
+                core.OPS[name] = guard_effect(core, authority, name, core.OPS[name], chat_permission=chat_permission)
         if "force_terminate" in core.OPS:
             core.OPS["force_terminate"] = scoped_process("force_terminate", core.OPS["force_terminate"])
         if "read_process_output" in core.OPS:

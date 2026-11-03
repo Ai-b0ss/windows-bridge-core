@@ -33,7 +33,6 @@ extras.register(core)
 documents.register(core, extras)
 upgrade.register(core)
 _TASK_AUTHORITY = AuthorityStore(core.BRIDGE_ROOT / "state" / "task-authority")
-cua_restricted_rpc.install(core, shell_policy="user", authority=_TASK_AUTHORITY)
 
 _CUA_CONTROL_PLANE = cua_bridge_v3.CuaBridgeControlPlane(Path(__file__).resolve().parent)
 # Register exact owned CUA surface targets for CLI-first policy; no title guessing.
@@ -64,6 +63,8 @@ def _stop_desktop_input():
 from cua_chat_permission import ChatPermissionPolicy, ChatPermissionError
 _CHAT_PERMISSION = ChatPermissionPolicy(core.BRIDGE_ROOT / "state" / "chat-permission.json",
                                         core.BRIDGE_ROOT / "state" / "chat-permission")
+cua_restricted_rpc.install(core, shell_policy="user", authority=_TASK_AUTHORITY,
+                           chat_permission=_CHAT_PERMISSION)
 from cua_owner_activity import OwnerActivityGuard, OwnerActive
 from cua_owner_notice import OwnerNotice
 _OWNER_ACTIVITY = OwnerActivityGuard()
