@@ -41,6 +41,14 @@ Breaking this rule is the worst thing you can do in this system. A failed task i
 - A grant applies to the **same task and the apps it named**, until it expires or the owner revokes it. A new app, a longer time, or a new kind of risk needs a new question.
 - Record the owner's words: when you use the desktop, quote the owner's permission message in your report and pass it to the Bridge when the runtime supports an `owner_chat_permission` field. Never invent a quote.
 
+## Protected RPC commands (shell/process/file changes)
+
+- Ordinary, unblocked programmatic operations run unattended with an exact `agent_id` and `task_id`. They do not need a per-action signature.
+- A command that Bridge marks protected (for example a blocked executable, `kill_process` or `delete_path`) needs an **additional, explicit yes from the owner in this chat** for the concrete action, target and risk. Do not use a general permission to configure Bridge as approval to run a destructive command.
+- Set `consequences` with `kind`, `purpose`, `targets` and `risk` on the protected call. Compute SHA-256 of the exact canonical JSON `{"op": op, "args": args}` excluding the `owner_chat_permission`, `authorization_id` and `signed_approval` fields. The canonical serialization is `json.dumps(...,sort_keys=True,separators=(",",":"),ensure_ascii=False,allow_nan=False)`.
+- After the owner's yes, send `owner_chat_permission={"quote": verbatim_owner_text, "operation": op, "request_digest": sha256_hex}` on the **same protected operation**, scoped to the current `agent_id`/`task_id`. Do not invent or recycle an approval for another action. Use `durable_call` with a stable key for mutations and `request_status` on unknown outcomes.
+- Bridge records the quote but cannot independently attest its origin (`quote_verified_by_bridge=false`). This is the owner's chosen skill-first trust model, **not** cryptographic user verification. Signed receipts remain an optional strict mode. If the runtime does not advertise the protected-RPC chat route, do not assume it exists or bypass a refused call.
+
 ## What stays outside the permission
 
 Once the owner has said yes, ordinary desktop work is allowed, including deleting files and clearing memory or caches, and changing system settings the task needs. The owner has no payment card attached to this PC, so purchases are not a concern here.

@@ -123,6 +123,43 @@ class ChatPermissionPolicy:
                                task_id=args["task_id"])
         return expires
 
+    def authorize_effect(self, args: dict, *, operation: str, request_digest: str) -> float:
+        """Log explicit chat approval for one protected RPC invocation.
+
+        The chat quote is agent-reported, not host-attested, and the approval
+        is not a reusable credential for other operations.
+        """
+        cfg = self._config()
+        if not cfg["enabled"]:
+            raise ChatPermissionError("CHAT_PERMISSION_DISABLED")
+        permission = args.get("owner_chat_permission")
+        if not isinstance(permission, dict) or set(permission) != {"quote", "operation", "request_digest"}:
+            raise ChatPermissionError("CHAT_PERMISSION_EFFECT_SCOPE_REQUIRED")
+        quote = permission.get("quote")
+        if not isinstance(quote, str) or not 2 <= len(quote.strip()) <= 2000:
+            raise ChatPermissionError("CHAT_PERMISSION_QUOTE_REQUIRED")
+        for name in ("agent_id", "task_id"):
+            value = args.get(name)
+            if not isinstance(value, str) or not _ID.fullmatch(value):
+                raise ChatPermissionError("CHAT_PERMISSION_IDENTITY_INVALID")
+        if permission.get("operation") != operation or permission.get("request_digest") != request_digest:
+            raise ChatPermissionError("CHAT_PERMISSION_EFFECT_SCOPE_MISMATCH")
+        if (self.state_dir / "stop.flag").exists():
+            raise ChatPermissionError("OWNER_STOPPED")
+        consequence = args.get("consequences")
+        if not isinstance(consequence, dict) or not consequence.get("purpose") or not consequence.get("targets") or not consequence.get("risk"):
+            raise ChatPermissionError("CHAT_PERMISSION_EFFECT_SCOPE_REQUIRED")
+        now = self.clock()
+        self._append("effect-permission.jsonl", {
+            "kind": "EFFECT_GRANT", "agent_id": args["agent_id"],
+            "task_id": args["task_id"], "operation": operation,
+            "request_digest": request_digest, "quote": quote.strip(),
+            "targets": consequence["targets"], "risk": consequence["risk"],
+            "expires": now + min(300, cfg["max_ttl_seconds"]),
+            "quote_verified_by_bridge": False,
+        }, required=True)
+        return now + min(300, cfg["max_ttl_seconds"])
+
     # -- evidence that programmatic routes were looked at first ----------------
     def note_route_search(self, agent, task, command) -> None:
         if command not in ROUTE_SEARCH_COMMANDS:
