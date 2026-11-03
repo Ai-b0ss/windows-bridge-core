@@ -467,7 +467,7 @@
     "tests/integration/excel_task_com_rpc_smoke.py": "b8096f6992a24e1ad3ec27bbfeb00b88af50f9cb4dd7f62cb8c88e11f6c0a98d",
     "tests/integration/hidden_native_smoke.py": "0ee7addb0bd4cb8c432165c369a297267ba8e0017a1f3940f9a756cd3af093bb",
     "tests/integration/installed_package_smoke.py": "d1b56885ed342a6caa8577af788fb068ebf8e338d39adaab82ad1264bf305491",
-    "tests/integration/isolated_rpc_smoke.py": "d9c121274dad6495352ee7be5da313c634213991989954df1ec9ea7c2d7a1b4d",
+    "tests/integration/isolated_rpc_smoke.py": "f8e52f2d9f2cbdf0a340f56c017effbfc43b28a1ea36581c66fe979021125534",
     "tests/integration/owned_job_cleanup_smoke.py": "e93d58dda50fa0b4b75713bcb900a4f5b3d254d2193748657e7220d24d74d5cc",
     "tests/integration/owner_signed_approval_real_rpc_smoke.py": "ef8c6ba1ff2005fbca1662fbe85058689ccb58feb837d609f649904e37642ab8",
     "tests/integration/two_agent_isolated_rpc_smoke.py": "04f961e3c50659a94becb910bb929e7b6ce43cf7534118e60ad9a8385f2bf315",

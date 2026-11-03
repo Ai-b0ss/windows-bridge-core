@@ -52,7 +52,7 @@ def rpc(port: int,secret: str,op: str,args: dict,task: str) -> dict:
         return json.loads(exc.read())
 
 
-def verify_rpc(port: int,secret: str,root: Path):
+def verify_rpc(port: int,secret: str,root: Path | None = None):
     checks=[]
     ping=rpc(port,secret,"ping",{},"ci-read-ping")
     verify(ping.get("ok") is True,"PING_FAILED")
@@ -414,37 +414,38 @@ def verify_rpc(port: int,secret: str,root: Path):
            conflict.get("error_code")=="REQUEST_KEY_CONFLICT",
            "DURABLE_CONFLICT_DID_NOT_FAIL_CLOSED")
     checks.append("durable_duplicate_dedupes_process_and_conflicting_key_fails_closed")
-    # Harmless code labelled destructive exercises real isolated RPC permission gating.
-    harmless={"agent_id":"ci-effect-agent","task_id":"ci-effect-task",
-              "language":"python","code":"print('CI_PROTECTED_EFFECT_OK')",
-              "consequences":{"kind":"destructive","purpose":"isolated smoke",
-                              "targets":["synthetic fixture"],"risk":"no actual change"}}
-    denied=rpc(port,secret,"run_code",harmless,"ci-effect-denied")
-    verify(denied.get("error_code")=="OWNER_APPROVAL_REQUIRED",
-           "UNAPPROVED_PROTECTED_RPC_WAS_NOT_REJECTED")
-    config=root/"state/chat-permission.json"
-    config.parent.mkdir(parents=True,exist_ok=True)
-    config.write_text(json.dumps({"schema":"ff-chat-permission-v1","enabled":True,
-                                  "max_ttl_seconds":7200}),encoding="utf-8")
-    exact=json.dumps({"op":"run_code","args":harmless},sort_keys=True,
-                     separators=(",",":"),ensure_ascii=False,allow_nan=False)
-    digest=hashlib.sha256(exact.encode()).hexdigest()
-    synthetic={"quote":"CI synthetic test fixture, not an owner confirmation",
-               "operation":"run_code","request_digest":digest}
-    changed=rpc(port,secret,"run_code",
-                {**harmless,"owner_chat_permission":{**synthetic,"request_digest":"0"*64}},
-                "ci-effect-tamper")
-    verify(changed.get("error_code")=="CHAT_PERMISSION_EFFECT_SCOPE_MISMATCH",
-           "TAMPERED_EFFECT_DIGEST_WAS_ACCEPTED")
-    accepted=rpc(port,secret,"run_code",
-                 {**harmless,"owner_chat_permission":synthetic},"ci-effect-test")
-    verify(accepted.get("ok") is True and
-           "CI_PROTECTED_EFFECT_OK" in ((accepted.get("result") or {}).get("stdout") or ""),
-           "EXACT_CHAT_APPROVED_EFFECT_NOT_EXECUTED")
-    audit=root/"state/chat-permission/effect-permission.jsonl"
-    verify(audit.is_file() and "ci-effect-agent" in audit.read_text(encoding="utf-8"),
-           "CHAT_EFFECT_JOURNAL_MISSING")
-    checks.append("protected_rpc_chat_approval_exact_scope_isolated_execution")
+    if root is not None:
+        # Harmless code labelled destructive exercises real isolated RPC permission gating.
+        harmless={"agent_id":"ci-effect-agent","task_id":"ci-effect-task",
+                  "language":"python","code":"print('CI_PROTECTED_EFFECT_OK')",
+                  "consequences":{"kind":"destructive","purpose":"isolated smoke",
+                                  "targets":["synthetic fixture"],"risk":"no actual change"}}
+        denied=rpc(port,secret,"run_code",harmless,"ci-effect-denied")
+        verify(denied.get("error_code")=="OWNER_APPROVAL_REQUIRED",
+               "UNAPPROVED_PROTECTED_RPC_WAS_NOT_REJECTED")
+        config=root/"state/chat-permission.json"
+        config.parent.mkdir(parents=True,exist_ok=True)
+        config.write_text(json.dumps({"schema":"ff-chat-permission-v1","enabled":True,
+                                      "max_ttl_seconds":7200}),encoding="utf-8")
+        exact=json.dumps({"op":"run_code","args":harmless},sort_keys=True,
+                         separators=(",",":"),ensure_ascii=False,allow_nan=False)
+        digest=hashlib.sha256(exact.encode()).hexdigest()
+        synthetic={"quote":"CI synthetic test fixture, not an owner confirmation",
+                   "operation":"run_code","request_digest":digest}
+        changed=rpc(port,secret,"run_code",
+                    {**harmless,"owner_chat_permission":{**synthetic,"request_digest":"0"*64}},
+                    "ci-effect-tamper")
+        verify(changed.get("error_code")=="CHAT_PERMISSION_EFFECT_SCOPE_MISMATCH",
+               "TAMPERED_EFFECT_DIGEST_WAS_ACCEPTED")
+        accepted=rpc(port,secret,"run_code",
+                     {**harmless,"owner_chat_permission":synthetic},"ci-effect-test")
+        verify(accepted.get("ok") is True and
+               "CI_PROTECTED_EFFECT_OK" in ((accepted.get("result") or {}).get("stdout") or ""),
+               "EXACT_CHAT_APPROVED_EFFECT_NOT_EXECUTED")
+        audit=root/"state/chat-permission/effect-permission.jsonl"
+        verify(audit.is_file() and "ci-effect-agent" in audit.read_text(encoding="utf-8"),
+               "CHAT_EFFECT_JOURNAL_MISSING")
+        checks.append("protected_rpc_chat_approval_exact_scope_isolated_execution")
     return checks
 
 
