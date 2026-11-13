@@ -8,6 +8,7 @@ on:
       - 'runtime/bridge-v3/cua_owner_activity.py'
       - 'runtime/bridge-v3/cua_browser_playwright.mjs'
       - 'runtime/bridge-v3/test_cua_owner_activity_guard.py'
+      - 'runtime/bridge-v3/test_cua_owner_chrome_attach.py'
       - 'runtime/bridge-v3/test_cua_browser_iframe_verify.mjs'
       - '.github/workflows/windows-bridge-local-safety.yml'
   workflow_dispatch:
@@ -37,3 +38,5 @@ jobs:
           node runtime/bridge-v3/test_cua_browser_iframe_verify.mjs
       - name: Test owner activity guard with fake clock
         run: python -m unittest discover -s runtime/bridge-v3 -p 'test_cua_owner_activity_guard.py' -v
+      - name: Test safe owner Chrome attach with fake sidecar
+        run: python -m unittest discover -s runtime/bridge-v3 -p 'test_cua_owner_chrome_attach.py' -v
