@@ -447,7 +447,49 @@ export class PlaywrightEngine {
     }
     if(spec?.kind==='download')return {verified:!spec.failure&&Boolean(spec.path)&&Boolean(spec.sha256),kind:'download',path:spec.path,filename:spec.filename,failure:spec.failure??null,sha256:spec.sha256??null};
     if(spec?.kind==='companion_download_click')return {verified:true,kind:'companion_download_click',operation_id:String(spec.operation_id||'')};
-    if(spec.url!==undefined)return {verified:h.page.url()===String(spec.url),actual_url:h.page.url()};
+    if(spec.url!==undefined){
+      // A click may navigate its own iframe while keeping the outer page URL.
+      // Only the originating frame (or the main frame if it navigated) can
+      // satisfy the caller-supplied exact-URL postcondition. Never search an
+      // unrelated sibling iframe for a matching address.
+      const expected=String(spec.url);
+      const mainFrame=h.page.mainFrame();
+      const targetFrame=resolved?.frame;
+      const childFrame=Boolean(targetFrame&&targetFrame!==mainFrame);
+      let pageUrl=h.page.url();
+      let detached=childFrame&&targetFrame.isDetached?.()===true;
+      let frameUrl=null;
+      if(childFrame&&!detached){
+        try{frameUrl=targetFrame.url();}catch{frameUrl=null;}
+      }
+      if(pageUrl!==expected&&frameUrl!==expected){
+        // Playwright locator.click() can return before iframe commit. Wait only
+        // for the originating frame or the parent page, never a sibling frame.
+        // A timeout is a failed verification, NOT permission to replay clicks.
+        const until={timeout:2000,waitUntil:'commit'};
+        const waits=[];
+        if(typeof h.page.waitForURL==='function')waits.push(h.page.waitForURL(expected,until));
+        if(childFrame&&!detached&&typeof targetFrame.waitForURL==='function')waits.push(targetFrame.waitForURL(expected,until));
+        if(waits.length){try{await Promise.any(waits);}catch{}}
+        pageUrl=h.page.url();
+        detached=childFrame&&targetFrame.isDetached?.()===true;
+        frameUrl=null;
+        if(childFrame&&!detached){
+          try{frameUrl=targetFrame.url();}catch{frameUrl=null;}
+        }
+      }
+      const matchedFrame=childFrame&&!detached&&frameUrl===expected;
+      const matchedPage=pageUrl===expected;
+      return {
+        verified:matchedFrame||matchedPage,
+        kind:'url',
+        verification_scope:matchedFrame?'target_frame':'main_page',
+        expected_url:expected,
+        actual_url:matchedFrame?frameUrl:pageUrl,
+        page_url:pageUrl,
+        ...(childFrame?{target_frame_url:frameUrl,target_frame_detached:Boolean(detached)}:{}),
+      };
+    }
     if(spec.text!==undefined){ const scope=resolved?.frame??h.page; return {verified:await scope.getByText(String(spec.text),{exact:false}).count()>0,kind:'target_frame_text',text:String(spec.text)}; }
     if(spec.focused!==undefined){ if(!resolved?.locator)throw new BrowserSidecarError('VERIFY_TARGET_REQUIRED'); const actual=await resolved.locator.evaluate(el=>el===document.activeElement); const expected=Boolean(spec.focused); return {verified:actual===expected,kind:'target_focus',expected_focused:expected,actual_focused:Boolean(actual)}; }
     if(spec.value!==undefined){ if(!resolved?.locator)throw new BrowserSidecarError('VERIFY_TARGET_REQUIRED'); const actual=await resolved.locator.inputValue().catch(async()=>String(await resolved.locator.textContent()??'')); return {verified:actual===String(spec.value),kind:'target_value',expected_value:String(spec.value),actual_value:actual}; }
