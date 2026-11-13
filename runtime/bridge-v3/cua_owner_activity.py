@@ -45,7 +45,10 @@ class OwnerActivityGuard:
                 raise OwnerActive(idle)
             return
         since_agent_ms = (self._clock() - self._agent_done_at) * 1000
-        if idle + self.margin_ms < since_agent_ms:
+        # An owner input after the last agent action only makes the owner
+        # active while that input is recent.  Comparing with _agent_done_at
+        # alone would leave OWNER_ACTIVE latched forever after any owner input.
+        if idle < self.quiet_ms and idle + self.margin_ms < since_agent_ms:
             raise OwnerActive(idle)
 
     def agent_input_done(self) -> None:
