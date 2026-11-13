@@ -174,7 +174,21 @@ function Start-FF3DirectRelay {
         return $false
     }
 
-    $cmdArgs = '/d /s /c ""' + $node.Source + '" "' + $relayRuntimePath + '" remote --debug 1>>"' + $relayStdoutPath + '" 2>>"' + $relayStderrPath + '""'
+    # Bound inherited relay diagnostics before creating a new output handle.
+    # Retain the last 200 diagnostic lines; do not touch logs held by another process.
+    foreach ($logFile in @($relayStdoutPath, $relayStderrPath)) {
+        try {
+            if ((Test-Path -LiteralPath $logFile -PathType Leaf) -and ((Get-Item -LiteralPath $logFile).Length -gt 8MB)) {
+                $recentLog = $logFile + '.recent-before-trim.log'
+                Get-Content -LiteralPath $logFile -Tail 200 -Encoding UTF8 | Set-Content -LiteralPath $recentLog -Encoding UTF8
+                Clear-Content -LiteralPath $logFile -ErrorAction Stop
+                Write-FF3RelayWatchdogLog ('relay_log_trimmed:' + (Split-Path -Path $logFile -Leaf))
+            }
+        } catch {
+            Write-FF3RelayWatchdogLog ('relay_log_trim_skipped:' + (Split-Path -Path $logFile -Leaf))
+        }
+    }
+    $cmdArgs = '/d /s /c ""' + $node.Source + '" "' + $relayRuntimePath + '" remote 1>>"' + $relayStdoutPath + '" 2>>"' + $relayStderrPath + '""'
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $env:ComSpec
     $psi.Arguments = $cmdArgs
