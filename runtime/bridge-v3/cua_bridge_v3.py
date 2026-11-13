@@ -4,6 +4,7 @@ import hashlib
 import threading
 import os
 import shutil
+import re
 import sys
 import time
 import uuid
@@ -356,14 +357,20 @@ class CuaBridgeControlPlane:
                 powershell = shutil.which("powershell.exe") or shutil.which("powershell")
                 if not powershell:
                     raise CuaBridgeError("POWERSHELL_NOT_FOUND")
+                # Preserve an explicitly configured Chrome Profile N.
+                # Never silently replace it with a different user profile.
+                owner_profile = (os.environ.get("FF_OWNER_CHROME_PROFILE_DIR_NAME")
+                                 or os.environ.get("PLAYWRIGHT_MCP_PROFILE_DIR_NAME")
+                                 or "Default")
+                if re.fullmatch(r"(?:Default|Profile [0-9]+)", owner_profile) is None:
+                    raise CuaBridgeError("OWNER_CHROME_PROFILE_INVALID")
                 supervisor = JsonLineSidecarSupervisor(
                     "browser-extension",
                     [powershell, "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
                      str(self.root / "cua_browser_extension_rpc.ps1")],
                     cwd=self.root,
-                    env={"PLAYWRIGHT_MCP_PROFILE_DIR_NAME":
-                         os.environ.get("FF_OWNER_CHROME_PROFILE_DIR_NAME", "Default")},
-                    timeout_seconds=6.0,
+                    env={"PLAYWRIGHT_MCP_PROFILE_DIR_NAME": owner_profile},
+                    timeout_seconds=15.0,
                     multiplex=True,
                 )
             elif transport == "isolated":
@@ -1309,7 +1316,20 @@ class CuaBridgeControlPlane:
                     if (caps.get("owner_browser") is not True
                             or caps.get("isolated_profile") is not False
                             or caps.get("owner_transport") != "extension"):
-                        raise CuaBridgeError("OWNER_CHROME_PROFILE_MISMATCH")
+                        # A successful attach may already have opened one tab.
+                        # Clean up only its newly issued surface identifier.
+                        cleanup = "not_attempted"
+                        unexpected_surface = result.get("surface_id")
+                        if isinstance(unexpected_surface, str) and unexpected_surface:
+                            try:
+                                close_result = _unwrap(supervisor.request(
+                                    "close", {"surface_id": unexpected_surface}), browser=True)
+                                cleanup = ("confirmed" if close_result.get("ok") is True
+                                           else "unconfirmed")
+                            except Exception:
+                                cleanup = "failed"
+                        raise CuaBridgeError("OWNER_CHROME_PROFILE_MISMATCH",
+                                             details={"cleanup": cleanup})
             surface_id = str(result["surface_id"])
             surface_key = f"browser-surface/tab:{surface_id}"
             self._surfaces[surface_id] = {
