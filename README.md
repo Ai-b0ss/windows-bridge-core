@@ -2,12 +2,22 @@
 
 **Portable Windows Bridge v3 core** for owner-authorized local Windows system administration and GUI automation.
 
-- Download the prebuilt ZIP from [Releases](../../releases/latest), extract and run `INSTALL-FRIEND.cmd`. Do **not** run `install.ps1` directly from a source checkout: the checked-in source intentionally omits vendor binary ZIP assets. The release ZIP includes all required core assets and hash manifest.
+- For the complete portable Core, download the pinned [Remote Beta 3 ZIP](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3), extract it and run `INSTALL-FRIEND.cmd`. The GitHub *latest release* may instead be a Skill-only package. Do **not** run `install.ps1` directly from a source checkout: the checked-in source intentionally omits vendor binary ZIP assets.
 - Runs as current Windows user, starts a **127.0.0.1-only** local agent; privileged operations require normal Windows authorization/UAC. Local bridge installation alone **does not grant remote access**.
 - Core includes PowerShell/CMD, Python, process and file operations, native Windows UIA/Win32 GUI routes. Runtime code still contains optional browser/vision paths, but Playwright Chromium and the large PyTorch/OmniParser bundle are excluded from the default package.
 - Browser-specific Playwright/OmniParser capabilities require separately installed dependencies. See `OPTIONAL-ADDONS.md`.
 - No machine/user credentials, preconfigured VPN profiles, private transport logs, Astra project state or old repository history are included.
 - The original private repository is separate. This repository starts from a **clean initial commit**.
+
+## Repository map and maintenance
+
+The canonical source is this public `windows-bridge-core` repository; the old private transport/history lives separately. **`main`, the published Core ZIP and the installed home Bridge are different artifacts until independently verified.** A merged PR does not automatically deploy to the PC.
+
+- [Repository map, branch cleanup and rollback (RU)](docs/REPOSITORY_MAINTENANCE_RU.md)
+- [Operator guide and runtime updates (RU)](docs/OPERATOR_GUIDE_RU.md)
+- [Architecture and decisions](docs/design/P0_AGENT_PLATFORM.md)
+- [Tests and CI policy](CI_POLICY.md)
+- [Optional prelogin network recovery](tools/prelogin-recovery/README.md) — not bundled into the portable Core ZIP
 
 ## Usage
 

@@ -1,0 +1,37 @@
+name: One-time verified merged branch cleanup
+on:
+  pull_request:
+    paths:
+      - 'tools/maintenance/**'
+      - '.github/workflows/merged-branch-housekeeping.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/merged-branch-housekeeping.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Unit-test branch deletion safety gates
+        run: node --test tools/maintenance/test_merged_branches.mjs
+      - name: Read-only compare of archived merged refs
+        run: node tools/maintenance/prune_merged_branches.mjs --dry-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+  prune-once:
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Delete only exact SHA and PR-verified merged heads
+        run: node tools/maintenance/prune_merged_branches.mjs --apply
+        env:
+          GH_TOKEN: ${{ github.token }}

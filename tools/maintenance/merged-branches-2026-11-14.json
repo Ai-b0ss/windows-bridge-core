@@ -1,0 +1,327 @@
+{
+  "schema": "ff-merged-branch-archive-v1",
+  "repository": "Ai-b0ss/windows-bridge-core",
+  "reviewedOn": "2026-11-14",
+  "candidates": [
+    {
+      "name": "docs/agent-instructions",
+      "sha": "e181e535bd5b904c89e3647faf4f87ab82ad6aa0",
+      "pr": 78
+    },
+    {
+      "name": "docs/agents-parity-line",
+      "sha": "050d3508d25458ea3dd7a1d6e5378cad81e174b5",
+      "pr": 80
+    },
+    {
+      "name": "docs/observe-hybrid",
+      "sha": "055295adc0a982294c6471cb8f4fc6a3448960b7",
+      "pr": 77
+    },
+    {
+      "name": "docs/operator-guide-ru",
+      "sha": "782d46d0032dec1bc3aea0ee966f04eb3b7ff6b3",
+      "pr": 73
+    },
+    {
+      "name": "docs/skill-press-upload-args",
+      "sha": "4aa5e54d0b6f514fa32cb373e488e8f8165fca77",
+      "pr": 84
+    },
+    {
+      "name": "docs/skill-references",
+      "sha": "1fe2d96482dbbc133d41396af011722f3047f273",
+      "pr": 74
+    },
+    {
+      "name": "feat/assistant-task-durable-step-ledger-20261027",
+      "sha": "0a8c4e0b89a01c2a6eca3bd5c7b9b0bd0c28b0e2",
+      "pr": 48
+    },
+    {
+      "name": "feat/bounded-excel-range-task-20261027",
+      "sha": "15f9c659cae6713e5a178b33f93a2c9f63598954",
+      "pr": 46
+    },
+    {
+      "name": "feat/browser-observed-change",
+      "sha": "742f9113572989f2fea944ef26e0ab74641867d4",
+      "pr": 70
+    },
+    {
+      "name": "feat/full-runtime-shadow-parity-20261027",
+      "sha": "6e0b65f79711f2c12d7936cf4f8b98632da07424",
+      "pr": 40
+    },
+    {
+      "name": "feat/git-discovery-to-rpc-acceptance-20261028",
+      "sha": "36bacc828590b96b0be31d59b93c1fcd8f0ef847",
+      "pr": 55
+    },
+    {
+      "name": "feat/input-guard-and-violations",
+      "sha": "7f5c37ecfe5d93b1f88fb811e59d928ebe49f38d",
+      "pr": 71
+    },
+    {
+      "name": "feat/opt-in-cursor-model-list-20261028",
+      "sha": "a5c56ebc46c06b8bd4da759a8193103a3049188c",
+      "pr": 58
+    },
+    {
+      "name": "feat/owner-programmatic-first-chat-consent-20261027",
+      "sha": "8291f70fb4d85c0e2c88d8cb78cbfd476273ee80",
+      "pr": 50
+    },
+    {
+      "name": "feat/p0-real-owner-signed-approval-rpc-20261028",
+      "sha": "9f2f3f9181011d4df99b5ee66a4c9462db5c7978",
+      "pr": 52
+    },
+    {
+      "name": "feat/per-window-grants",
+      "sha": "b94eb94011b4ff482c811734289143d3d2887548",
+      "pr": 87
+    },
+    {
+      "name": "feat/read-only-assistant-final-reconcile-20261027",
+      "sha": "5260da233ad4da1e9f1c897b15176931c8f07f2b",
+      "pr": 49
+    },
+    {
+      "name": "feat/real-antigravity-headless-task-20261027",
+      "sha": "501c793c63e1297912a694110f0c39e5c81be8b2",
+      "pr": 47
+    },
+    {
+      "name": "feat/runtime-parity-tool",
+      "sha": "c9b46090ad1ba2cd47047a9949dbba8cf4c385c7",
+      "pr": 79
+    },
+    {
+      "name": "feat/seamless-handover",
+      "sha": "253e8be1901d56961f7aa69a7824ed0cbf415c7a",
+      "pr": 86
+    },
+    {
+      "name": "feat/skill-first-chat-permission",
+      "sha": "a3bb1a597e095e123ecd1b93a7a93240710abf7e",
+      "pr": 69
+    },
+    {
+      "name": "feat/task-aware-orchestrator-gates-20261027",
+      "sha": "2b57f4afb95a3fc7cb74d1e261fa380aef195bb0",
+      "pr": 42
+    },
+    {
+      "name": "feat/verified-excel-cell-task-20261027",
+      "sha": "a7a639924a94450543b209d4d76b125f619c1114",
+      "pr": 45
+    },
+    {
+      "name": "feat/verified-git-task-execution-20261028",
+      "sha": "cc561059fe75c840aff25233983555ef81e3464e",
+      "pr": 54
+    },
+    {
+      "name": "feat/verified-readonly-git-diff-20261028",
+      "sha": "07947635320cafe60dcec8879ebbca53bb96664d",
+      "pr": 62
+    },
+    {
+      "name": "feat/windows-mcp-persistent",
+      "sha": "e189dc00dacdac8b53cfe93c60d395b94462e64f",
+      "pr": 72
+    },
+    {
+      "name": "fix/chat-consent-challenge-20261030",
+      "sha": "45acfcf5dde759393bd5b6fe02d401d442200659",
+      "pr": 67
+    },
+    {
+      "name": "fix/chat-permission-for-protected-rpc",
+      "sha": "59a5c55fd99b188f1824ce4744cfd345a55bb63b",
+      "pr": 88
+    },
+    {
+      "name": "fix/desktop-targets-resolve",
+      "sha": "a072b54130d7d4c4cbc706aee70692dc995f09bc",
+      "pr": 85
+    },
+    {
+      "name": "fix/exact-process-birth-decimal-20261101",
+      "sha": "deabcb8b33527a4db710e22f76adac96d9721ddf",
+      "pr": 81
+    },
+    {
+      "name": "fix/fingerprint-str-parity",
+      "sha": "0009cb7d286799d1f7e2af1cf4981a54cb462d26",
+      "pr": 83
+    },
+    {
+      "name": "fix/identity-error-hint",
+      "sha": "b80b6026f7b0ac0503b169d6fe6c3429e3f7c6e8",
+      "pr": 75
+    },
+    {
+      "name": "fix/journal-rotation",
+      "sha": "c41f31ecb98c2e9c636be28873821e1aca0891f6",
+      "pr": 76
+    },
+    {
+      "name": "fix/optional-addon-ambiguous-path-root-link-20261028",
+      "sha": "910e0f3227b33891f2981ffc87a8cf9a6f4b6540",
+      "pr": 63
+    },
+    {
+      "name": "fix/owned-completed-session-cleanup-20261027",
+      "sha": "814a3a4959db56d823ce2cc1459d6eb40de057f3",
+      "pr": 39
+    },
+    {
+      "name": "fix/p0-git-cli-untrusted-path-20261028",
+      "sha": "a0c4a2b2b0236291c668339eab0fcc66d87100d1",
+      "pr": 56
+    },
+    {
+      "name": "fix/p0-live-install-overwrite-guard-20261028",
+      "sha": "ae54a41811c04241a58b5f1c651c8884f4676c59",
+      "pr": 53
+    },
+    {
+      "name": "fix/p0-pin-public-ci-actions-20261028",
+      "sha": "7c9e29b7411e06c10879ae80958d137c715c4e61",
+      "pr": 51
+    },
+    {
+      "name": "fix/prelogin-network-auto-recovery-20261114",
+      "sha": "6bb070c79302469d7a65674681195b86dac8e356",
+      "pr": 90
+    },
+    {
+      "name": "fix/pure-task-compatibility-20261027",
+      "sha": "12bca659e9958a0012dc9909e36d2dc6289fc97c",
+      "pr": 37
+    },
+    {
+      "name": "fix/revert-fingerprint-mismatch-20261101",
+      "sha": "8829aa5fd4c7a2f2feb36a6129930295fe8d0778",
+      "pr": 82
+    },
+    {
+      "name": "fix/rollback-journal-preflight-20261028",
+      "sha": "76cdc857a634b8cc64180c5e24799f8f0eee6679",
+      "pr": 60
+    },
+    {
+      "name": "fix/route-experience-outside-source-20261028",
+      "sha": "8e2d59c8811e8b6e8307adf0109b742134798c7b",
+      "pr": 57
+    },
+    {
+      "name": "fix/skill-runtime-preflight-fallback-20261027",
+      "sha": "cc2aaa4c93a71cbf96431ae088802cd395295ac8",
+      "pr": 44
+    },
+    {
+      "name": "fix/sync-local-runtime-20261113",
+      "sha": "cea9c91935995d371ea70afaba26e27eb63c3059",
+      "pr": 89
+    },
+    {
+      "name": "fix/task-route-evidence-20261027",
+      "sha": "63ec67df3c638bafd3082a2206c60c91924093ef",
+      "pr": 36
+    },
+    {
+      "name": "fix/task-scoped-session-reaping-20261027",
+      "sha": "15815d4d23e02bc77c3f5db6e0fa9a92ff2a152c",
+      "pr": 41
+    },
+    {
+      "name": "fix/uia3-cache-outside-source-20261028",
+      "sha": "62ed3de806ab626ec31341b92fc870cf5516c012",
+      "pr": 59
+    },
+    {
+      "name": "p0/detached-session-pid-fingerprint-20261025",
+      "sha": "b92cd9e0d6e08860ec6576870a48b687a407e22d",
+      "pr": 25
+    },
+    {
+      "name": "p0/master-durable-session-scope-20261025",
+      "sha": "3a1fafc5bef6f7e1ba5af88e96e190b08add62b8",
+      "pr": 32
+    },
+    {
+      "name": "p0/master-existing-plugin-packaging-20261025",
+      "sha": "f29e14d54fb687602e1fbedcc981780dd730858c",
+      "pr": 30
+    },
+    {
+      "name": "p0/master-hidden-native-acceptance-20261025",
+      "sha": "281111c202b01b9d56ba4b9c1ad73be39361f90d",
+      "pr": 29
+    },
+    {
+      "name": "p0/master-owned-job-session-20261025",
+      "sha": "e18620022667f1d42a7ab5793fd7806f07dfc61f",
+      "pr": 35
+    },
+    {
+      "name": "p0/master-package-install-acceptance-20261025",
+      "sha": "49eea8a1f456b46fcda1b37954dc50010a5f4561",
+      "pr": 34
+    },
+    {
+      "name": "p0/master-process-handles-20261025",
+      "sha": "300cd963b290dacc26c98f1c25068910be4ac20f",
+      "pr": 28
+    },
+    {
+      "name": "p0/master-release-install-identity-20261025",
+      "sha": "2b6bc686ed32a57d611627524770901cae23c8b5",
+      "pr": 33
+    },
+    {
+      "name": "p0/master-release-source-proof-20261025",
+      "sha": "f0a297d601e6a1327b19a07de09f229df78dd103",
+      "pr": 31
+    },
+    {
+      "name": "p0/master-runtime-parity-20261025",
+      "sha": "fc32d6680e27732006b2394159e67ad0297cb9d6",
+      "pr": 27
+    },
+    {
+      "name": "security/bounded-cli-discovery-20261027",
+      "sha": "d0f2bf4c654c4c1224cac0c96e88871fb5ed06c4",
+      "pr": 38
+    },
+    {
+      "name": "test/ci-public-core-upgrade-rollback-20261028",
+      "sha": "6d2ef8af65da1920ac190669a073bcd613a896f0",
+      "pr": 61
+    },
+    {
+      "name": "test/inventory-critical-module-parity-20261028",
+      "sha": "bc8356669a49e38472a96e1333683caad677e27b",
+      "pr": 64
+    },
+    {
+      "name": "test/real-two-agent-session-isolation-20261027",
+      "sha": "736c66ede47e65013fced1201f713be958217bcd",
+      "pr": 43
+    }
+  ],
+  "preservedBranches": [
+    {
+      "name": "feat/trusted-skill-input-20261030",
+      "sha": "c86e8809ed5c79f91e2de41df233fcc5192cc3d5"
+    },
+    {
+      "name": "security/pin-public-ci-actions-20261027",
+      "sha": "0b9688a22e11bda57fb085d7d0d7e8493974ca7c"
+    }
+  ]
+}
