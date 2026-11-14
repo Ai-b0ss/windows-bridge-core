@@ -15,6 +15,8 @@ Read this before changing anything. The owner is a Russian-speaking individual w
 - One topic per branch and PR, squash-merged after the GitHub checks pass. Run `python -m unittest discover -s tests -p "test_*.py"` and `python tests/integration/isolated_rpc_smoke.py` first; the second starts a separate Bridge on a random port and never touches the owner's.
 - `release-manifest.json` lists a SHA-256 for every bundled source file and must contain the bytes **Git stores** (LF). On a Windows checkout the working tree is CRLF, so hashing disk bytes breaks the release builder. `tests/test_manifest_matches_git.py` enforces this: `git add` your files, then hash `git show :path`.
 - Prefer small verified changes. A claim of "works" needs a real run: a unit test is not proof for anything that touches Windows input, Chrome or the live runtime.
+- After a squash merge, do not rely on `git branch --merged` to identify deletable branches. Check the merged PR's exact `head.ref` and `head.sha` against the current remote branch SHA; preserve branches with new commits or open PRs. See `docs/REPOSITORY_MAINTENANCE_RU.md`.
+- The `main` source, portable release ZIP, and installed home runtime are distinct; do not present successful CI or a merged PR as proof of live deployment. Do not copy private transport state into this public repository.
 
 ## Deploying to the owner's PC
 
