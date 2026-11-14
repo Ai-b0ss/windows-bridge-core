@@ -1,4 +1,5 @@
 name: Verified Full Core 2026-11-14
+# Retry the one-time release gate only after fixing the expired-worker reuse bug.
 on:
   pull_request:
     paths: ['.github/workflows/publish-verified-full-core.yml', 'tests/test_windows_mcp_pool.py']
@@ -137,3 +138,15 @@ jobs:
           gh release edit v2026.11.14-full-core-verified -R Ai-b0ss/windows-bridge-core --prerelease=false
           if($LASTEXITCODE -ne 0){throw 'PROMOTION_FAILED'}
           Write-Host 'VERIFIED_FULL_CORE_PROMOTED'
+      - name: Retire only this exact merged release-fix branch
+        shell: pwsh
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          $ErrorActionPreference='Stop'
+          $p=gh api repos/Ai-b0ss/windows-bridge-core/pulls/95 | ConvertFrom-Json
+          if($LASTEXITCODE -ne 0 -or -not $p.merged_at -or $p.head.ref -ne 'fix/worker-idle-hard-expiry-release-20261114'){throw 'EXPECTED_MERGED_PR_MISSING'}
+          $r=gh api repos/Ai-b0ss/windows-bridge-core/git/ref/heads/fix/worker-idle-hard-expiry-release-20261114 | ConvertFrom-Json
+          if($LASTEXITCODE -ne 0 -or $r.object.sha -ne $p.head.sha){throw 'BRANCH_HEAD_MISMATCH'}
+          gh api -X DELETE repos/Ai-b0ss/windows-bridge-core/git/refs/heads/fix/worker-idle-hard-expiry-release-20261114
+          if($LASTEXITCODE -ne 0){throw 'SAFE_BRANCH_CLEANUP_FAILED'}
+          Write-Host 'MERGED_RELEASE_BRANCH_CLEANED'
