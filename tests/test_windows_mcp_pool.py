@@ -70,14 +70,36 @@ class PoolTests(unittest.TestCase):
         try:
             first=pool.call({"tool":"Snapshot","arguments":{}})
             self.assertFalse(first["worker_reused"])
-            time.sleep(6)  # allow even a slow CI runner to fire the idle timer
-            self.assertIsNotNone(spawned[0].poll(), "Idle worker was not terminated")
+            time.sleep(6)  # CI can delay Timer; call must enforce TTL anyway.
             second=pool.call({"tool":"Snapshot","arguments":{}})
-            # Windows may reuse the *same numerical PID* for a fresh process.
-            # Verify a new Popen object and the pool's own reuse signal instead.
+            self.assertIsNotNone(spawned[0].poll(), "Expired worker was not terminated")
+            # Windows may reuse the same numerical PID for a fresh process.
             self.assertFalse(second["worker_reused"])
             self.assertEqual(len(spawned),2)
             self.assertIsNot(spawned[0],spawned[1])
+        finally:
+            pool.stop()
+
+    def test_expired_worker_is_not_reused_when_idle_timer_never_fires(self):
+        spawned=[]
+        def spawn():
+            worker=subprocess.Popen([sys.executable,str(self.script)],
+                                    stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            spawned.append(worker)
+            return worker
+        pool=mod.WorkerPool(spawn,idle_seconds=60)
+        try:
+            first=pool.call({"tool":"Snapshot","arguments":{}})
+            with pool._lock:
+                pool._timer.cancel()  # deterministically simulate a delayed timer.
+                pool._last_used-=61
+            second=pool.call({"tool":"Snapshot","arguments":{}})
+            self.assertFalse(first["worker_reused"])
+            self.assertFalse(second["worker_reused"])
+            self.assertEqual(len(spawned),2)
+            self.assertIsNot(spawned[0],spawned[1])
+            self.assertIsNotNone(spawned[0].poll())
         finally:
             pool.stop()
 
