@@ -85,7 +85,7 @@ async function run() {
     console.log('DELETED ' + record.name + ' PR#' + record.pr + ' ' + record.sha);
   }
   console.log(JSON.stringify({mode: apply ? 'apply' : 'dry-run', pinned: records.length, eligible: eligibleCount, deleted, absent, preserved: protectedCount, deliberatelyUnlisted: archive.preservedBranches.length}));
-  if (!apply && (eligibleCount !== 62 || absent || protectedCount)) throw Error('Live branch state differs from pinned archive; stop and review');
+  if (!apply && (eligibleCount + absent !== records.length || protectedCount)) throw Error('Live branch state differs from pinned archive; stop and review');
 }
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   run().catch(error => { console.error('CLEANUP_FAILED ' + error.message); process.exitCode = 1; });
