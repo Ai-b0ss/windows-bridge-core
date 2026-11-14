@@ -1,0 +1,37 @@
+name: Final reviewed branch cleanup
+on:
+  pull_request:
+    paths:
+      - 'tools/maintenance/remove-final-service-branches.mjs'
+      - '.github/workflows/final-reviewed-branch-cleanup.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/final-reviewed-branch-cleanup.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Syntax and exact branch and PR preflight (no writes)
+        run: |
+          node --check tools/maintenance/remove-final-service-branches.mjs
+          node tools/maintenance/remove-final-service-branches.mjs --dry-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+  prune-after-merge:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Remove only 3 exact PR-verified refs (including this PR branch)
+        run: node tools/maintenance/remove-final-service-branches.mjs --apply
+        env:
+          GH_TOKEN: ${{ github.token }}
