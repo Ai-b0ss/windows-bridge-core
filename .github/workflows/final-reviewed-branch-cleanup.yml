@@ -1,4 +1,5 @@
 name: Final reviewed branch cleanup
+# Final post-release sweep: PR 94 and this maintenance PR only.
 on:
   pull_request:
     paths:
