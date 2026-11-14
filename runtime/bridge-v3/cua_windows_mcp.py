@@ -42,6 +42,12 @@ class WorkerPool:
 
     def call(self, request, first_timeout=FIRST_CALL_TIMEOUT, timeout=CALL_TIMEOUT):
         with self._lock:
+            # A Windows CI or busy host can delay Timer's callback. The idle
+            # deadline is authoritative: never reuse an expired worker even if
+            # its asynchronous cleanup has not run yet.
+            if self._proc is not None and self._last_used and (
+                    time.monotonic() - self._last_used >= self._idle):
+                self._stop()
             reused = self._alive()
             if not reused:
                 self._start()
