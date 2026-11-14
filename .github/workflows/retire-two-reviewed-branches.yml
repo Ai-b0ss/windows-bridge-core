@@ -1,0 +1,36 @@
+name: Retire two reviewed legacy branches
+on:
+  pull_request:
+    paths:
+      - 'tools/maintenance/retire-two-reviewed-branches.mjs'
+      - '.github/workflows/retire-two-reviewed-branches.yml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/retire-two-reviewed-branches.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify immutable archived branch refs, PRs and ancestor status
+        run: node tools/maintenance/retire-two-reviewed-branches.mjs --dry-run
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  delete-after-merge:
+    needs: verify
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Retire only the two preapproved exact-SHA branch refs
+        run: node tools/maintenance/retire-two-reviewed-branches.mjs --apply
+        env:
+          GH_TOKEN: ${{ github.token }}
