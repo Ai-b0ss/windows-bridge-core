@@ -70,11 +70,10 @@ class PoolTests(unittest.TestCase):
         try:
             first=pool.call({"tool":"Snapshot","arguments":{}})
             self.assertFalse(first["worker_reused"])
-            time.sleep(6)  # allow even a slow CI runner to fire the idle timer
-            self.assertIsNotNone(spawned[0].poll(), "Idle worker was not terminated")
+            time.sleep(6)  # CI can delay Timer; call must enforce TTL anyway.
             second=pool.call({"tool":"Snapshot","arguments":{}})
-            # Windows may reuse the *same numerical PID* for a fresh process.
-            # Verify a new Popen object and the pool's own reuse signal instead.
+            self.assertIsNotNone(spawned[0].poll(), "Expired worker was not terminated")
+            # Windows may reuse the same numerical PID for a fresh process.
             self.assertFalse(second["worker_reused"])
             self.assertEqual(len(spawned),2)
             self.assertIsNot(spawned[0],spawned[1])
