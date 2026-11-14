@@ -1,9 +1,8 @@
 // One-time owner-approved cleanup. Keep SHA and PR identity checks before any deletion.
 const REPO = 'Ai-b0ss/windows-bridge-core';
 const targets = [
-  { name: 'chore/repository-housekeeping-20261114', sha: 'cd8ce212786a6c0062979e044c681dbbaa74c5a1', pr: 91 },
-  { name: 'chore/retire-reviewed-legacy-refs-20261114', sha: '0e73ea64670d3a0396e7305235d8f4eec6877365', pr: 92 },
-  { name: 'chore/remove-final-service-branches-20261114', self: true },
+  { name: 'chore/bridge-five-stage-reliability-release-20261114', sha: 'fa4f46d8eeea0d86a9cda4492b99e22f753a1174', pr: 94 },
+  { name: 'chore/final-post-release-branch-prune-20261114', self: true },
 ];
 const apply = process.argv.includes('--apply');
 const token = process.env.GH_TOKEN;
