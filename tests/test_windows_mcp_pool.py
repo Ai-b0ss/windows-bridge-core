@@ -59,14 +59,25 @@ class PoolTests(unittest.TestCase):
         self.assertTrue(self.pool.call({"tool":"Snapshot","arguments":{}})["ok"])
 
     def test_idle_worker_is_stopped(self):
-        pool=mod.WorkerPool(lambda: subprocess.Popen([sys.executable,str(self.script)],
-                            stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL),
-                            idle_seconds=1)
+        spawned=[]
+        def spawn():
+            worker=subprocess.Popen([sys.executable,str(self.script)],
+                                    stdin=subprocess.PIPE,stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL)
+            spawned.append(worker)
+            return worker
+        pool=mod.WorkerPool(spawn,idle_seconds=1)
         try:
             first=pool.call({"tool":"Snapshot","arguments":{}})
-            time.sleep(6)  # idle timer is 1 s; CI runners can be slow to fire it
+            self.assertFalse(first["worker_reused"])
+            time.sleep(6)  # allow even a slow CI runner to fire the idle timer
+            self.assertIsNotNone(spawned[0].poll(), "Idle worker was not terminated")
             second=pool.call({"tool":"Snapshot","arguments":{}})
-            self.assertNotEqual(first["pid"],second["pid"])
+            # Windows may reuse the *same numerical PID* for a fresh process.
+            # Verify a new Popen object and the pool's own reuse signal instead.
+            self.assertFalse(second["worker_reused"])
+            self.assertEqual(len(spawned),2)
+            self.assertIsNot(spawned[0],spawned[1])
         finally:
             pool.stop()
 

@@ -1,0 +1,139 @@
+name: Verified Full Core 2026-11-14
+on:
+  pull_request:
+    paths: ['.github/workflows/publish-verified-full-core.yml', 'tests/test_windows_mcp_pool.py']
+  push:
+    branches: [main]
+    paths: ['.github/workflows/publish-verified-full-core.yml']
+permissions:
+  contents: read
+jobs:
+  preflight:
+    if: github.event_name == 'pull_request'
+    runs-on: windows-latest
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: '3.13'}
+      - shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p test_windows_mcp_pool.py -v
+          if ($LASTEXITCODE -ne 0) { throw 'POOL_REGRESSION_FAILED' }
+          node --test tools/prelogin-recovery/test-supervisor.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'SUPERVISOR_REGRESSION_FAILED' }
+  publish:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: windows-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+    outputs:
+      zip_sha: ${{ steps.build.outputs.zip_sha }}
+      source_commit: ${{ steps.build.outputs.source_commit }}
+    steps:
+      - shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: '3.13'}
+      - name: All unit tests and recovery regressions
+        shell: pwsh
+        run: |
+          python -m unittest discover -s tests -p 'test_*.py'
+          if ($LASTEXITCODE -ne 0) { throw 'UNIT_TESTS_FAILED' }
+          node --test tools/prelogin-recovery/test-supervisor.mjs
+          if ($LASTEXITCODE -ne 0) { throw 'SUPERVISOR_TEST_FAILED' }
+      - name: Two identical ZIPs, isolated install and installed real RPC
+        id: build
+        shell: pwsh
+        env: {SOURCE_COMMIT: '${{ github.sha }}'}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP 'ff-verified-core'
+          New-Item -ItemType Directory $d -Force | Out-Null
+          $prev=Join-Path $d 'previous.zip'
+          $name='Windows-Bridge-Full-Core-Remote-20261114-verified.zip'
+          $zip=Join-Path $d $name
+          Invoke-WebRequest -Uri 'https://github.com/Ai-b0ss/windows-bridge-core/releases/download/v2026.10.24-remote-beta2/Windows-Bridge-Full-Core-Remote-20261024-v2.zip' -OutFile $prev
+          python tools/build_portable_release.py --previous-release $prev --output $zip
+          if ($LASTEXITCODE -ne 0) { throw 'BUILD_FAILED' }
+          python tools/build_portable_release.py --previous-release $prev --output (Join-Path $d 'repeat.zip')
+          if ($LASTEXITCODE -ne 0) { throw 'REPEAT_FAILED' }
+          $sha=(Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($sha -ne (Get-FileHash (Join-Path $d 'repeat.zip') -Algorithm SHA256).Hash.ToLowerInvariant()) { throw 'REPRODUCIBILITY_FAILED' }
+          $package=Join-Path $d 'package'
+          $installed=Join-Path $d 'installed'
+          Expand-Archive -LiteralPath $zip -DestinationPath $package
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$package/install.ps1" -NoStartup -Transport Local -InstallRoot $installed
+          if ($LASTEXITCODE -ne 0) { throw 'INSTALL_FAILED' }
+          python tests/integration/installed_package_smoke.py --package-root $package --install-root $installed --source-commit $env:SOURCE_COMMIT --report "$d/acceptance.json"
+          if ($LASTEXITCODE -ne 0) { throw 'INSTALLED_RPC_FAILED' }
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT,"zip_sha=$sha" + [Environment]::NewLine)
+          [IO.File]::AppendAllText($env:GITHUB_OUTPUT,"source_commit=$env:SOURCE_COMMIT" + [Environment]::NewLine)
+          Write-Host "VERIFIED_ZIP_SHA256=$sha"
+      - name: Publish prerelease with immutable source and checksum
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ github.sha }}
+          DIGEST: ${{ steps.build.outputs.zip_sha }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $tag='v2026.11.14-full-core-verified'
+          $d=Join-Path $env:RUNNER_TEMP 'ff-verified-core'
+          $name='Windows-Bridge-Full-Core-Remote-20261114-verified.zip'
+          [IO.File]::WriteAllText((Join-Path $d 'SHA256SUMS.txt'),"$env:DIGEST  $name" + [Environment]::NewLine)
+          [IO.File]::WriteAllText((Join-Path $d 'release-notes.md'),"Verified public Full Core refresh. Source commit: $env:SOURCE_COMMIT. SHA256: $env:DIGEST. Offline reproducible; all unit tests; real installed RPC. Optional browser and ML packages are separate. Does not deploy to an active PC.")
+          gh release view $tag -R Ai-b0ss/windows-bridge-core *> $null
+          if ($LASTEXITCODE -eq 0) { throw 'RELEASE_ALREADY_EXISTS' }
+          gh release create $tag (Join-Path $d $name) (Join-Path $d 'SHA256SUMS.txt') -R Ai-b0ss/windows-bridge-core --target $env:SOURCE_COMMIT --title 'Windows Bridge Full Core 2026-11-14' --notes-file (Join-Path $d 'release-notes.md') --prerelease
+          if ($LASTEXITCODE -ne 0) { throw 'RELEASE_CREATE_FAILED' }
+  smoke-published:
+    needs: publish
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - shell: pwsh
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with: {python-version: '3.13'}
+      - name: Fresh Windows runner independently tests published bytes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ needs.publish.outputs.zip_sha }}
+          SOURCE_COMMIT: ${{ needs.publish.outputs.source_commit }}
+        run: |
+          $ErrorActionPreference='Stop'
+          $d=Join-Path $env:RUNNER_TEMP 'ff-release-accept'
+          $dl=Join-Path $d 'download'
+          New-Item -ItemType Directory $dl -Force | Out-Null
+          $name='Windows-Bridge-Full-Core-Remote-20261114-verified.zip'
+          $zip=Join-Path $dl $name
+          $ok=$false
+          for($i=0;$i -lt 5;$i++){
+            gh release download v2026.11.14-full-core-verified -R Ai-b0ss/windows-bridge-core --pattern $name --dir $dl --clobber
+            if($LASTEXITCODE -eq 0 -and (Test-Path $zip)){$ok=$true;break}
+            Start-Sleep -Seconds 3
+          }
+          if(-not $ok){throw 'DOWNLOAD_FAILED'}
+          if((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:DIGEST){throw 'SHA256_MISMATCH'}
+          $pkg=Join-Path $d 'package'
+          $inst=Join-Path $d 'installed'
+          Expand-Archive -LiteralPath $zip -DestinationPath $pkg
+          & powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "$pkg/install.ps1" -NoStartup -Transport Local -InstallRoot $inst
+          if($LASTEXITCODE -ne 0){throw 'CLEAN_INSTALL_FAILED'}
+          python tests/integration/installed_package_smoke.py --package-root $pkg --install-root $inst --source-commit $env:SOURCE_COMMIT --report "$d/acceptance.json"
+          if($LASTEXITCODE -ne 0){throw 'CLEAN_RPC_FAILED'}
+          Write-Host 'PUBLISHED_RELEASE_FRESH_WINDOWS_RPC_PASS'
+      - name: Promote only after published-asset smoke test
+        shell: pwsh
+        env: {GH_TOKEN: '${{ github.token }}'}
+        run: |
+          gh release edit v2026.11.14-full-core-verified -R Ai-b0ss/windows-bridge-core --prerelease=false
+          if($LASTEXITCODE -ne 0){throw 'PROMOTION_FAILED'}
+          Write-Host 'VERIFIED_FULL_CORE_PROMOTED'
