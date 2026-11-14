@@ -1,0 +1,25 @@
+name: Prelogin recovery regression
+on:
+  push:
+    paths:
+      - 'tools/prelogin-recovery/**'
+      - '.github/workflows/prelogin-recovery.yml'
+  pull_request:
+    paths:
+      - 'tools/prelogin-recovery/**'
+      - '.github/workflows/prelogin-recovery.yml'
+permissions:
+  contents: read
+jobs:
+  supervisor:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Validate JavaScript syntax
+        run: node --check tools/prelogin-recovery/supervisor.mjs
+      - name: Simulate core failure and automatic recovery
+        run: node --test tools/prelogin-recovery/test-supervisor.mjs
