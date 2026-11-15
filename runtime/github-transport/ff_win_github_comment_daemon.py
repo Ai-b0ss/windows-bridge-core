@@ -37,7 +37,7 @@ if CONFIG.get("rpc_url"):
 if CONFIG.get("background_rpc_url"):
     os.environ.setdefault("FF_V3_BACKGROUND_RPC_URL", CONFIG["background_rpc_url"])
 os.environ.setdefault("FF_TRANSPORT_MAX_RESULT_BYTES", str(2 * 1024 * 1024))
-from ff_win_transport_core import execute_task
+from ff_win_transport_core import execute_task, is_safe, recover_outbox_result
 from ff_win_transport_faults import barrier
 
 REPOSITORY = os.environ.get("FF_GH_REPOSITORY") or CONFIG.get("repository", "Ai-b0ss/windows-agent-bridge")
@@ -1018,18 +1018,70 @@ class CommentTransport:
             if cid in self.active:
                 return
             self.active.add(cid)
-        self.last_received_at = time.monotonic()
-        saved = self.outbox / (str(cid) + ".json")
-        if saved.exists():
-            item = json.loads(saved.read_text(encoding="utf-8"))
-            if item.get("published"):
-                (self.requests / (str(cid) + ".json")).unlink(missing_ok=True)
+        handed_off = False
+        try:
+            self.last_received_at = time.monotonic()
+            saved = self.outbox / (str(cid) + ".json")
+            # Read directly: exists() can hide access errors as absence. A .tmp
+            # left before atomic replacement also proves possible execution.
+            candidates = []
+            for path in (saved, saved.with_suffix(".tmp")):
+                try:
+                    candidates.append((path, path.read_bytes()))
+                except FileNotFoundError:
+                    continue
+            if candidates:
+                path, raw = candidates[0]
+                try:
+                    item = self.validate_outbox(raw, comment, task)
+                except (ValueError, TypeError, KeyError):
+                    item = None
+                # Copy, never move: interruption must leave a recovery marker
+                # at the original path until the replacement result is durable.
+                for evidence_path, evidence in candidates:
+                    if item is None or evidence_path.suffix == ".tmp":
+                        self.quarantine_outbox(evidence_path, evidence, cid)
+                if item is None or not item["published"]:
+                    self.retain_request(comment)
+                # A valid interrupted write is durable evidence regardless of
+                # whether it was interrupted before or after publication.
+                if item is not None and path.suffix == ".tmp":
+                    self.save_outbox(item)
+                if item is None:
+                    if is_safe(task["op"]):
+                        # Keep the damaged original until process saves a result.
+                        self.pool.submit(self.process, comment, task, now_ms())
+                    else:
+                        status, payload, route = recover_outbox_result(task)
+                        self.publish_result(comment, task["task_id"], {
+                            "schema": RESULT_SCHEMA, "transport_version": 5,
+                            "inbox_issue": self.inbox, "comment_id": cid,
+                            "device": DEVICE, "task": task, "outcome": "FAILED" if
+                            status >= 300 or payload.get("ok") is False else "PASS",
+                            "http_status": status, "route": route, "result": payload,
+                            "completed_at_ms": now_ms(),
+                        })
+                    handed_off = True
+                elif item["published"]:
+                    (self.requests / (str(cid) + ".json")).unlink(missing_ok=True)
+                else:
+                    self.publish_queue.put(item)
+                    handed_off = True
+                return
+            self.retain_request(comment)
+            self.pool.submit(self.process, comment, task, now_ms())
+            handed_off = True
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}:{exc}"[:500]
+            self.etag = None
+            raise
+        finally:
+            if not handed_off:
                 with self.active_lock:
                     self.active.discard(cid)
-            else:
-                self.publish_queue.put(item)
-            return
-        request = self.requests / (str(cid) + ".json")
+
+    def retain_request(self, comment):
+        request = self.requests / (str(int(comment["id"])) + ".json")
         if not request.exists():
             temp = request.with_suffix(".tmp")
             with temp.open("w", encoding="utf-8") as stream:
@@ -1037,7 +1089,77 @@ class CommentTransport:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp, request)
-        self.pool.submit(self.process, comment, task, now_ms())
+
+    @staticmethod
+    def validate_outbox(raw, comment, task):
+        def unique_object(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError("OUTBOX_DUPLICATE_KEY")
+                obj[key] = value
+            return obj
+
+        item = json.loads(raw, object_pairs_hook=unique_object)
+        if not isinstance(item, dict) or type(item.get("comment_id")) is not int or \
+                item["comment_id"] != int(comment["id"]) or \
+                item.get("node_id") != comment.get("node_id") or \
+                type(item.get("published")) is not bool or not isinstance(item.get("body"), str):
+            raise ValueError("OUTBOX_IDENTITY_INVALID")
+        result = json.loads(item["body"], object_pairs_hook=unique_object)
+        if not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA or \
+                type(result.get("transport_version")) is not int or result["transport_version"] != 5 or \
+                type(result.get("inbox_issue")) is not int or result["inbox_issue"] <= 0 or \
+                type(result.get("comment_id")) is not int or result["comment_id"] != item["comment_id"] or \
+                result.get("device") != DEVICE or result.get("outcome") not in {"PASS", "FAILED"} or \
+                type(result.get("http_status")) is not int or not 100 <= result["http_status"] <= 599 or \
+                not isinstance(result.get("route"), dict):
+            raise ValueError("OUTBOX_RESULT_INVALID")
+        expected = task
+        if "large_result" in result and isinstance(result.get("task"), dict) and \
+                "args" not in result["task"] and "args_sha256" in result["task"]:
+            expected = {k: v for k, v in task.items() if k != "args"}
+            expected["args_sha256"] = hashlib.sha256(json.dumps(task.get("args"), sort_keys=True).encode()).hexdigest()
+        if json.dumps(result.get("task"), sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ValueError("OUTBOX_TASK_CONFLICT")
+        large = result.get("large_result")
+        if "large_result" in result and (
+            not isinstance(large, dict) or large.get("encoding") != "gzip+json" or
+            not isinstance(large.get("branch"), str) or not large["branch"] or
+            not isinstance(large.get("path"), str) or not large["path"] or
+            not isinstance(large.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", large["sha256"]) or
+            any(type(large.get(key)) is not int or large[key] <= 0 for key in ("original_bytes", "stored_bytes"))
+        ):
+            raise ValueError("OUTBOX_LARGE_RESULT_INVALID")
+        if not isinstance(result.get("result"), dict) and large is None:
+            raise ValueError("OUTBOX_RESULT_MISSING")
+        if isinstance(result.get("result"), dict):
+            ok = 200 <= result["http_status"] < 300 and result["result"].get("ok") is not False
+            if result["outcome"] != ("PASS" if ok else "FAILED"):
+                raise ValueError("OUTBOX_OUTCOME_INVALID")
+        elif result["http_status"] >= 300 and result["outcome"] != "FAILED":
+            raise ValueError("OUTBOX_OUTCOME_INVALID")
+        return item
+
+    def quarantine_outbox(self, path, raw, cid):
+        digest = hashlib.sha256(raw).hexdigest()
+        root = self.outbox / "quarantine"
+        root.mkdir(exist_ok=True)
+        name = f"{cid}.{path.suffix[1:]}.{digest}"
+        for target, data in (
+            (root / (name + ".bin"), raw),
+            (root / (name + ".json"), json.dumps({
+                "comment_id": cid, "source": path.name, "sha256": digest,
+                "reason": "OUTBOX_INVALID_OR_INTERRUPTED", "at_ms": now_ms(),
+            }, separators=(",", ":")).encode("utf-8")),
+        ):
+            temp = target.with_suffix(target.suffix + ".tmp")
+            with temp.open("wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, target)
+        trace("outbox_quarantined", comment_id=cid, sha256=digest, source=path.name)
 
     def recover_requests(self):
         if time.monotonic() - self.last_recover_at < 15:
