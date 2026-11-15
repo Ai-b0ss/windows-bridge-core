@@ -117,6 +117,18 @@ class ConsentTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthorityError,"EXPIRED_OR_CONSUMED"):
             broker.authority.consume(answer["authorization_id"],agent=c["agent_id"],task=c["task_id"],request=payload["request"])
 
+        # A correctly signed action receipt is not an explicit Stop rearm.
+        stop = self.root / "chat-permission" / "stop.flag"
+        stop.parent.mkdir()
+        stop.write_text("owner stop")
+        fresh = broker.prepare("set_desktop_mode", action())
+        fresh_payload = {**payload, "nonce": fresh["challenge_id"],
+                         "approval_reference": "host-chat:" + fresh["challenge_id"]}
+        with self.assertRaisesRegex(AuthorityError, "OWNER_STOPPED"):
+            broker.commit(fresh["challenge_id"], sign(fresh_payload))
+        self.assertFalse(broker.status(fresh["challenge_id"])["approval_granted"])
+        self.assertEqual(stop.read_text(), "owner stop")
+
 
 if __name__ == "__main__":
     unittest.main()
