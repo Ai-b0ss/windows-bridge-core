@@ -1848,11 +1848,32 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.auth_ok():
             self.send_json(403, {"ok": False, "error_code": "AUTH_FAILED"})
             return
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0 or length > MAX_REQUEST_BYTES:
+        # Refuse ambiguous framing before reading or dispatching any RPC.
+        # Only one decimal Content-Length is supported; chunked is not.
+        lengths = self.headers.get_all("Content-Length", [])
+        if len(lengths) != 1 or self.headers.get("Transfer-Encoding") is not None:
+            self.close_connection = True
+            self.send_json(400, {"ok": False, "error_code": "REQUEST_LENGTH_INVALID"})
+            return
+        value = lengths[0].strip(" \t")
+        if not value or not value.isascii() or not value.isdigit():
+            self.close_connection = True
+            self.send_json(400, {"ok": False, "error_code": "REQUEST_LENGTH_INVALID"})
+            return
+        # Decimal-string bound avoids int()'s digit limit and huge allocations.
+        digits = value.lstrip("0") or "0"
+        max_digits = str(MAX_REQUEST_BYTES)
+        if (digits == "0" or len(digits) > len(max_digits)
+                or (len(digits) == len(max_digits) and digits > max_digits)):
+            self.close_connection = True
             self.send_json(413, {"ok": False, "error_code": "REQUEST_SIZE_INVALID"})
             return
+        length = int(digits)
         raw = self.rfile.read(length)
+        if len(raw) != length:
+            self.close_connection = True
+            self.send_json(400, {"ok": False, "error_code": "REQUEST_BODY_INCOMPLETE"})
+            return
         with STATE.lock:
             STATE.inflight += 1
         try:
