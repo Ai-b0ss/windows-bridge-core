@@ -326,6 +326,104 @@ def _previous_owned_files(repo: Path, candidate: dict[str, Any], previous: Any) 
         raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN") from exc
 
 
+
+def plan_manifest_reconciliation(
+    repo: Path, runtime_root: Path, *, trusted_head: str, ref: str = "HEAD"
+) -> dict[str, Any]:
+    """READ-ONLY proof for a stale installed manifest; never rewrite installation.
+
+    trusted_head is an independently selected, immutable Git commit. This proof
+    may be used in a separately authorized, backed-up migration, but is NOT
+    permission to replace the installed manifest or bypass apply_runtime().
+    """
+    if (not isinstance(trusted_head, str) or len(trusted_head) != 40
+            or any(c not in "0123456789abcdef" for c in trusted_head)):
+        raise RuntimeError("TRUSTED_HEAD_NOT_PINNED")
+    repo = repo.resolve()
+    root = extended_path(Path(os.path.abspath(runtime_root)), force=True)
+    with _DirectoryPins() as pins:
+        pins.pin(root)
+        manifest_path = root / MANIFEST_NAME
+        if (manifest_path.is_symlink()
+                or getattr(manifest_path, "is_junction", lambda: False)()
+                or not manifest_path.is_file()):
+            raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN")
+        if (root / LOCK_NAME).exists() or (root / TX_DIR_NAME).exists():
+            raise RuntimeError("RECONCILIATION_TRANSACTION_PRESENT")
+        if os.name == "nt":
+            with _windows_plain_handle(manifest_path):
+                previous_bytes = manifest_path.read_bytes()
+        else:
+            previous_bytes = manifest_path.read_bytes()
+        try:
+            previous = json.loads(previous_bytes.decode("utf-8-sig"))
+            previous_head = previous["source_head"]
+            if (not isinstance(previous_head, str) or len(previous_head) != 40
+                    or any(c not in "0123456789abcdef" for c in previous_head)):
+                raise ValueError("old head not pinned")
+            previous_plan = build_plan(repo, ref=previous_head)
+            if any(previous.get(key) != previous_plan[key]
+                   for key in ("schema", "source_head", "release_id", "files")):
+                raise ValueError("manifest differs from exact Git history")
+        except (KeyError, ValueError, TypeError, RuntimeError,
+                UnicodeError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN") from exc
+
+        trusted_plan = build_plan(repo, ref=trusted_head)
+        candidate_plan = build_plan(repo, ref=ref)
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor",
+             trusted_head, candidate_plan["source_head"]],
+            capture_output=True, timeout=30, check=False,
+        )
+        if ancestry.returncode != 0:
+            raise RuntimeError("TRUSTED_HEAD_NOT_ANCESTOR")
+        prior_targets = {item["target"] for item in previous_plan["files"]}
+        trusted_targets = {item["target"] for item in trusted_plan["files"]}
+        candidate_targets = {item["target"] for item in candidate_plan["files"]}
+        # No automatic retirement of unrelated owner files through reconciliation.
+        if not prior_targets <= trusted_targets or not trusted_targets <= candidate_targets:
+            raise RuntimeError("RECONCILIATION_RETIREMENT_UNSUPPORTED")
+
+        for item in trusted_plan["files"]:
+            target = _recovery_target(root, item["target"])
+            pins.pin(target.parent)
+            if not target.is_file():
+                raise RuntimeError("TRUSTED_FILE_MISSING:" + item["target"])
+            if os.name == "nt":
+                with _windows_plain_handle(target):
+                    actual = sha256_file(target)
+            else:
+                actual = sha256_file(target)
+            if actual != item["sha256"]:
+                raise RuntimeError("TRUSTED_FILE_MISMATCH:" + item["target"])
+        # A future candidate might introduce a filename currently occupied by
+        # an owner's unknown file. Never silently claim or overwrite that file.
+        for name in candidate_targets - trusted_targets:
+            target = _recovery_target(root, name)
+            # A new candidate subdirectory may not exist yet. Pin the nearest
+            # existing ancestor; never create directories during a dry run.
+            ancestor = target.parent
+            while not ancestor.exists() and ancestor != root:
+                ancestor = ancestor.parent
+            pins.pin(ancestor)
+            if target.exists() or target.is_symlink():
+                raise RuntimeError("CANDIDATE_TARGET_OCCUPIED:" + name)
+        if manifest_path.read_bytes() != previous_bytes:
+            raise RuntimeError("PREVIOUS_MANIFEST_CHANGED")
+        return {
+            "schema": "cua-runtime-provenance-reconciliation-plan/v1",
+            "eligible": True,
+            "old_head": previous_head,
+            "trusted_head": trusted_head,
+            "candidate_head": candidate_plan["source_head"],
+            "verified_files": len(trusted_plan["files"]),
+            "previous_manifest_sha256": sha256_bytes(previous_bytes),
+            "trusted_manifest": trusted_plan,
+            "production_modified": False,
+        }
+
+
 def stage_plan(repo: Path, plan: dict[str, Any], stage_root: Path) -> None:
     # Prefix the root before joining children: a short root can have a child
     # beyond MAX_PATH. This also covers mkdir/copy/rename and external parsers.
