@@ -63,6 +63,10 @@ class WindowsSocketHandoffGuards(unittest.TestCase):
             h.send_json.assert_called_once_with(
                 403, {"ok": False, "error_code": "HANDOVER_CHECK_PORT_REQUIRED"})
 
+    def test_raw_winsock_share_is_never_written_to_audit(self):
+        self.assertEqual(agent.redact({"listener_share": "sensitive-descriptor"}),
+                         {"listener_share": "<redacted>"})
+
     def test_concurrent_drain_fails_before_contacting_standby(self):
         with (patch.object(agent.STATE, "drain_lock") as lock,
               patch.object(agent, "client_request") as peer):

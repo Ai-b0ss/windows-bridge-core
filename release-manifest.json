@@ -438,7 +438,7 @@
     "runtime/bridge-v3/ff_win_process_identity.py": "875409d8fba363f7ff7c5afb4519fe15b2c6fd6fb7ee11b4080054c56b156e5c",
     "runtime/bridge-v3/ff_win_request_journal.py": "887fdbc2ffcbd846eb226ee019fa395e05efa9dbbc5100159064ff67dcff1c61",
     "runtime/bridge-v3/ff_win_stop_bridge.ps1": "2891c0d004ae2d02f8761820b3b9e6a34c33ccd8e18fc8f3583aa8b21e6d9fdb",
-    "runtime/bridge-v3/ff_win_v3_agent.py": "6ac15dc100ac48cd58b3698f9426a3ea7435442d3dc00e1319d6465a33140f0e",
+    "runtime/bridge-v3/ff_win_v3_agent.py": "2e7ce24e0d1e41452dc2ae0afc12d528a1c6d686411f301b89ae14894e42c54b",
     "runtime/bridge-v3/ff_win_v3_direct.py": "eec71c6207fd77b11875025d042010b3af17c6b0ad7ecbe3348a4192aaca91e6",
     "runtime/bridge-v3/ff_win_v3_documents.py": "95c7ec5fe6b35541e0d2e2235ad5d7ab668c8cece2a6587d85cd05c2a6afe00e",
     "runtime/bridge-v3/ff_win_v3_extras.py": "ecf92375e6eec6bffb23cd45f4f31827bbb920b45d672eda4496163436f6e3b0",
@@ -543,7 +543,7 @@
     "tests/test_visual_addon_cache.py": "9f375c01b5df6165b36ec73324360595da9966bb1a3741afb3bf62dede27c59a",
     "tests/test_windows_mcp_physical.py": "29fc91d17495fcbb58d12426a78159f1504da5fd656a13f59ed4a0cb68e532eb",
     "tests/test_windows_mcp_pool.py": "392ddc600ad99d419bbf8a1efb0e6310ced70964a86dedcc1ad865217959ebc2",
-    "tests/test_windows_socket_handoff.py": "192d4362af4098ca280349a64848943d01bc7f94817d0d6496213b6a0c8fdb40",
+    "tests/test_windows_socket_handoff.py": "b8f067a581dbfac486ebf6278bac6112a1e432791b98708f7782313780a759c5",
     "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
     "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0"
   }

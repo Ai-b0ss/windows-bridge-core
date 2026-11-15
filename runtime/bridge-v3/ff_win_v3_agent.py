@@ -63,7 +63,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 SENSITIVE_KEY_PARTS = (
     "token", "secret", "password", "passwd", "cookie", "authorization",
-    "api_key", "apikey", "private_key", "credential",
+    "api_key", "apikey", "private_key", "credential", "listener_share",
 )
 
 
