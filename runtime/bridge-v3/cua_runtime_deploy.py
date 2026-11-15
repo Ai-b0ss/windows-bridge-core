@@ -348,8 +348,19 @@ def plan_manifest_reconciliation(
                 or getattr(manifest_path, "is_junction", lambda: False)()
                 or not manifest_path.is_file()):
             raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN")
-        if (root / LOCK_NAME).exists() or (root / TX_DIR_NAME).exists():
+        if (root / LOCK_NAME).exists():
             raise RuntimeError("RECONCILIATION_TRANSACTION_PRESENT")
+        # Historical journal/backup trees can remain without an active lock.
+        # Report them as a rollout blocker, but still prove source bytes.
+        transaction_root = root / TX_DIR_NAME
+        if (transaction_root.is_symlink()
+                or getattr(transaction_root, "is_junction", lambda: False)()
+                or (transaction_root.exists() and not transaction_root.is_dir())):
+            raise RuntimeError("RECONCILIATION_TRANSACTION_INVALID")
+        pending_transactions = 0
+        if transaction_root.is_dir():
+            pins.pin(transaction_root)
+            pending_transactions = sum(1 for _ in transaction_root.iterdir())
         if os.name == "nt":
             with _windows_plain_handle(manifest_path):
                 previous_bytes = manifest_path.read_bytes()
@@ -413,7 +424,10 @@ def plan_manifest_reconciliation(
             raise RuntimeError("PREVIOUS_MANIFEST_CHANGED")
         return {
             "schema": "cua-runtime-provenance-reconciliation-plan/v1",
-            "eligible": True,
+            "eligible": pending_transactions == 0,
+            "provenance_verified": True,
+            "unresolved_deploy_transactions": pending_transactions,
+            "requires_transaction_review": pending_transactions > 0,
             "old_head": previous_head,
             "trusted_head": trusted_head,
             "candidate_head": candidate_plan["source_head"],

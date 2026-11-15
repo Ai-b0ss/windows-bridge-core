@@ -143,6 +143,18 @@ class ManifestReconciliationPreflight(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "RECONCILIATION_TRANSACTION_PRESENT"):
             self.plan()
 
+    def test_orphan_journal_blocks_rollout_but_not_readonly_proof(self):
+        tx = self.install / deploy.TX_DIR_NAME / "old-transaction"
+        tx.mkdir(parents=True)
+        (tx / "journal.json").write_text("{}", encoding="utf-8")
+        before = self.fingerprint()
+        proof = self.plan()
+        self.assertTrue(proof["provenance_verified"])
+        self.assertFalse(proof["eligible"])
+        self.assertTrue(proof["requires_transaction_review"])
+        self.assertEqual(proof["unresolved_deploy_transactions"], 1)
+        self.assertEqual(before, self.fingerprint())
+
     def test_missing_trusted_file_refused(self):
         (self.install / "cua_helper.py").unlink()
         with self.assertRaisesRegex(RuntimeError, "TRUSTED_FILE_MISSING"):
