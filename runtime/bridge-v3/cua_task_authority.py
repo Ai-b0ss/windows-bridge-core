@@ -234,7 +234,17 @@ def guard_effect(core, store, op, original, *, chat_permission=None):
     def guarded(args):
         def check_stop():
             # Both chat and signed approvals obey the same owner Stop.
-            state_dir = chat_permission.state_dir if chat_permission is not None else store.root.parent / "chat-permission"
+            if chat_permission is not None:
+                state_dir = chat_permission.state_dir
+            elif store is not None:
+                state_dir = store.root.parent / "chat-permission"
+            else:
+                # Legacy embedded tests can install this wrapper without an
+                # authority store. A real Bridge still supplies BRIDGE_ROOT.
+                bridge_root = getattr(core, "BRIDGE_ROOT", None)
+                if bridge_root is None:
+                    return
+                state_dir = Path(bridge_root) / "state" / "chat-permission"
             if stop_requested(state_dir):
                 raise core.RPCError("OWNER_STOPPED", details={"execution_started": False, "retry_safe": False})
 
