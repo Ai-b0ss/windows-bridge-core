@@ -219,9 +219,17 @@ def verify_bundle(snapshot: Path) -> dict:
 
 
 def _runtime_process_rows(runtime: Path, rows: list, *, target_port: int | None,
-                          peer_port: int | None) -> set[int]:
-    """Allow only a verified, non-standby 127.0.0.1:39076 from this runtime."""
+                          peer_port: int | None,
+                          requested_runtime: Path | None = None) -> set[int]:
+    """Allow only a verified, non-standby 127.0.0.1:39076 from this runtime.
+
+    Windows may canonicalize a temporary or junction-backed path differently
+    from its Win32_Process CommandLine. Compare both the requested spelling
+    and the resolved physical path: either must be considered, never ignored.
+    """
     aliases = [str(runtime).casefold().replace(chr(92), "/")]
+    if requested_runtime is not None:
+        aliases.append(str(requested_runtime).casefold().replace(chr(92), "/"))
     alias_root = Path(os.environ.get("LOCALAPPDATA") or "") / "FF-Windows-Bridge" / "bridge-v3"
     try:
         if alias_root.resolve() == runtime:
@@ -268,7 +276,8 @@ def assert_runtime_quiescent(runtime: Path, *, target_port: int | None = None,
 
     Without explicit target/peer port context all instances still block.
     """
-    runtime = Path(os.path.abspath(runtime)).resolve()
+    requested_runtime = Path(os.path.abspath(runtime))
+    runtime = requested_runtime.resolve()
     if (target_port is None) != (peer_port is None):
         raise RuntimeError("RESTORE_PORT_SCOPE_INCOMPLETE")
     if target_port is not None and (
@@ -296,7 +305,7 @@ def assert_runtime_quiescent(runtime: Path, *, target_port: int | None = None,
     if not isinstance(rows, list):
         raise RuntimeError("RESTORE_PROCESS_LIST_INVALID")
     peers = _runtime_process_rows(runtime, rows, target_port=target_port,
-                                 peer_port=peer_port)
+                                 peer_port=peer_port, requested_runtime=requested_runtime)
     # A shared agent.pid may be overwritten by the peer. Exempt a PID only
     # after matching its actual process command and Win32_Process identity.
     for name in ("agent.pid", "keeper.pid"):

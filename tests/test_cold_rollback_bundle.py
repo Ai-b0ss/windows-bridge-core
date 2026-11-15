@@ -203,6 +203,27 @@ class SnapshotSafety(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "RESTORE_RUNTIME_STILL_RUNNING"):
             bundle._runtime_process_rows(self.root, [peer], target_port=None, peer_port=None)
 
+    def test_requested_and_canonical_windows_aliases_both_count(self):
+        from unittest import mock
+        alias_path = self.root / "ff_win_v3_main.py"
+        row = {"ProcessId": 18096, "Name": "python.exe",
+               "CommandLine": (f'"python.exe" "{alias_path}" serve '
+                               "--host 127.0.0.1 --port 39076")}
+        proc = subprocess.CompletedProcess([], 0, json.dumps([row]), "")
+        with mock.patch.object(bundle.subprocess, "run", return_value=proc):
+            # A Windows CI runner may resolve its temp path via a different
+            # canonical spelling. The process still names the requested path.
+            original_resolve = Path.resolve
+            def alternate(self, *a, **kw):
+                if self == self_root:
+                    return Path("Z:/canonical-physical-fixture")
+                return original_resolve(self, *a, **kw)
+            self_root = self.root
+            with mock.patch.object(Path, "resolve", alternate):
+                result = bundle.assert_runtime_quiescent(
+                    self.root, target_port=39073, peer_port=39076)
+        self.assertEqual(result["peer_pids"], [18096])
+
     def test_live_peer_blocks_nonpython_restore_changes(self):
         self.captured()
         record_path = self.snapshot / "bundle.json"
