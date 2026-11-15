@@ -9,7 +9,7 @@ import json
 import time
 import uuid
 from pathlib import Path
-from ff_win_github_comment_daemon import GitHubREST, get_token, FAST_RESULT_MARKER, SCHEMA, RESULT_SCHEMA
+from ff_win_github_comment_daemon import GitHubREST, get_token, FAST_RESULT_MARKER, SCHEMA, RESULT_SCHEMA, valid_target_device
 
 def resolve(api, repository, issue):
     for _ in range(100):
@@ -84,6 +84,8 @@ def collect(api, repository, issue, rows, timeout=120):
     return rows
 
 def submit(api, repository, issue, task):
+    if not isinstance(task, dict) or not valid_target_device(task.get("target_device")):
+        raise ValueError("TARGET_DEVICE_REQUIRED: set the exact paired device; no fallback")
     issue, _ = resolve(api, repository, issue)
     started = time.time_ns() // 1_000_000
     status, _, raw = api.request("POST", f"/repos/{repository}/issues/{issue}/comments", {"body": json.dumps(task, separators=(",", ":"))}, retries=0)
@@ -92,7 +94,7 @@ def submit(api, repository, issue, task):
     comment = json.loads(raw)
     return {"comment_id": int(comment["id"]), "node_id": comment["node_id"], "sent_ms": started, "ack_ms": time.time_ns() // 1_000_000, "inbox_issue": issue}
 
-if __name__ == "__main__":
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=Path(__file__).with_name("github_transport_config.json"))
     parser.add_argument("--op", default="ping")
@@ -100,12 +102,20 @@ if __name__ == "__main__":
     parser.add_argument("--task-id", default=None)
     parser.add_argument("--client-id", default="github-client")
     parser.add_argument("--execution-context", choices=["auto", "interactive", "background"], default="auto")
-    opts = parser.parse_args()
+    opts = parser.parse_args(argv)
     config = json.loads(opts.config.read_text(encoding="utf-8-sig"))
-    api = GitHubREST(get_token())
-    task = {"schema": SCHEMA, "op": opts.op, "args": json.loads(opts.args), "task_id": opts.task_id or uuid.uuid4().hex, "client_id": opts.client_id, "target_device": config["device"]}
+    device = config.get("device")
+    if not valid_target_device(device):
+        raise ValueError("TARGET_DEVICE_REQUIRED: set config.device to the exact paired device; no fallback")
+    task = {"schema": SCHEMA, "op": opts.op, "args": json.loads(opts.args), "task_id": opts.task_id or uuid.uuid4().hex, "client_id": opts.client_id, "target_device": device}
     if opts.execution_context != "auto":
         task["execution_context"] = opts.execution_context
+    api = GitHubREST(get_token())
     row = submit(api, config["repository"], config["inbox_issue"], task)
     collect(api, config["repository"], row["inbox_issue"], [row])
     print(json.dumps(row, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
