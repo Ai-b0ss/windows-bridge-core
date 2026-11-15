@@ -50,6 +50,9 @@ def _state(path: Path) -> dict:
         old_expected = data["old_agent_sha256"]
     except (ValueError, TypeError, KeyError) as exc:
         raise RuntimeError("WATCH_STATE_INVALID") from exc
+    if (type(data.get("peer_port")) is not int
+            or (port, data["peer_port"]) != (39073, 39076)):
+        raise RuntimeError("WATCH_PEER_PORT_SCOPE_INVALID")
     if (type(port) is not int or not 1024 <= port <= 65535
             or not isinstance(expected, str) or len(expected) != 64
             or not isinstance(old_expected, str) or len(old_expected) != 64
@@ -204,8 +207,10 @@ def recover_failed_rollout(state: dict, *,
     terminate(state, "keeper")
     # Even a correctly terminated planned PID is not proof that no unrelated
     # agent uses the shared installed directory.
-    bundle.assert_runtime_quiescent(runtime)
-    restored = restore(snapshot, runtime, offline_confirmed=True)
+    bundle.assert_runtime_quiescent(runtime, target_port=state["port"],
+                                    peer_port=state["peer_port"])
+    restored = restore(snapshot, runtime, offline_confirmed=True,
+                       target_port=state["port"], peer_port=state["peer_port"])
     restart(state)
     return {"ok": True, "rollback": "restored", "files": restored["restored_files"],
             "pending_external_health_confirmation": True}

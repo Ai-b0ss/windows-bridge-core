@@ -177,6 +177,119 @@ class SnapshotSafety(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "RECOVERY_KIT_HASH_MISMATCH"):
             bundle.verify_recovery_kit(kit)
 
+    def test_win32_process_39076_peer_allowed_but_39073_or_keeper_blocked(self):
+        # Direct regression for the owner's live C:-junction prelogin process:
+        # WIN-2LK6007IEBP PID 18096 serves --port 39076 while 39073 is offline.
+        from unittest import mock
+        alias = str(self.root / "ff_win_v3_main.py")
+        peer = {"ProcessId": 18096, "Name": "python.exe",
+                "CommandLine": f'"C:/Python/python.exe" "{alias}" serve --host 127.0.0.1 --port 39076'}
+        target = {"ProcessId": 1896, "Name": "python.exe",
+                  "CommandLine": f'"C:/Python/python.exe" "{alias}" serve --host 127.0.0.1 --port 39073'}
+        keeper = {"ProcessId": 17088, "Name": "powershell.exe",
+                  "CommandLine": str(self.root / "ff_win_v3_keeper.ps1")}
+        def check(rows):
+            proc = subprocess.CompletedProcess([], 0, json.dumps(rows), "")
+            with mock.patch.object(bundle.subprocess, "run", return_value=proc):
+                return bundle.assert_runtime_quiescent(self.root, target_port=39073, peer_port=39076)
+        self.assertEqual(check([peer])["peer_pids"], [18096])
+        for rows in ([peer, target], [peer, keeper],
+                     [dict(peer, CommandLine=peer["CommandLine"] + " --also-listen 39073")],
+                     [dict(peer, CommandLine=peer["CommandLine"].replace("--port 39076", "--port 39075"))],
+                     [dict(peer, CommandLine=peer["CommandLine"].replace("--port 39076", ""))]):
+            with self.subTest(rows=rows):
+                with self.assertRaisesRegex(RuntimeError, "RESTORE_"):
+                    check(rows)
+        with self.assertRaisesRegex(RuntimeError, "RESTORE_RUNTIME_STILL_RUNNING"):
+            bundle._runtime_process_rows(self.root, [peer], target_port=None, peer_port=None)
+
+    def test_live_peer_blocks_nonpython_restore_changes(self):
+        self.captured()
+        record_path = self.snapshot / "bundle.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record["candidate_files"].append(
+            {"target": "ff_win_v3_keeper.ps1", "sha256": "a" * 64})
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+        manifest_before = (self.root / deploy.MANIFEST_NAME).read_bytes()
+        from unittest import mock
+        with mock.patch.object(bundle, "assert_runtime_quiescent",
+                               return_value={"peer_pids": [18096], "target_port": 39073}):
+            with self.assertRaisesRegex(RuntimeError, "RESTORE_PEER_NONPYTHON_CHANGE_FORBIDDEN"):
+                bundle.restore(self.snapshot, self.root, offline_confirmed=True,
+                               target_port=39073, peer_port=39076)
+        self.assertEqual((self.root / deploy.MANIFEST_NAME).read_bytes(), manifest_before)
+
+    def test_peer_pid_file_allowed_only_if_positively_identified(self):
+        from unittest import mock
+        alias = str(self.root / "ff_win_v3_main.py")
+        peer = {"ProcessId": 18096, "Name": "python.exe",
+                "CommandLine": f'"C:/Python/python.exe" "{alias}" serve --host 127.0.0.1 --port 39076'}
+        proc = subprocess.CompletedProcess([], 0, json.dumps([peer]), "")
+        (self.root / "agent.pid").write_text("18096", encoding="ascii")
+        with (mock.patch.object(bundle.subprocess, "run", return_value=proc),
+              mock.patch.object(bundle.deploy, "_process_alive", return_value=True)):
+            receipt = bundle.assert_runtime_quiescent(self.root, target_port=39073, peer_port=39076)
+            self.assertEqual(receipt["peer_pids"], [18096])
+            (self.root / "keeper.pid").write_text("18096", encoding="ascii")
+            with self.assertRaisesRegex(RuntimeError, "RESTORE_PID_STILL_ACTIVE:keeper.pid"):
+                bundle.assert_runtime_quiescent(self.root, target_port=39073, peer_port=39076)
+
+    def test_restore_with_39076_process_keeps_non_python_files_unmodified(self):
+        from unittest import mock
+        self.captured()
+        candidate = deploy.build_plan(self.repo, self.candidate)
+        for row in candidate["files"]:
+            b = subprocess.check_output(["git", "-C", str(self.repo), "show",
+                                          self.candidate + ":" + row["source"]])
+            dest = self.root / row["target"]
+            dest.write_bytes(b)
+        (self.root / deploy.MANIFEST_NAME).write_text(json.dumps(candidate), encoding="utf-8")
+        peer = {"ProcessId": 18096, "Name": "python.exe",
+                "CommandLine": (f'"python.exe" "{self.root / "ff_win_v3_main.py"}" '
+                                "serve --host 127.0.0.1 --port 39076")}
+        with mock.patch.object(bundle.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, json.dumps([peer]), "")):
+            result = bundle.restore(self.snapshot, self.root, offline_confirmed=True,
+                                    target_port=39073, peer_port=39076)
+        self.assertTrue(result["ok"])
+        self.assertEqual((self.root / "owner-sentinel.txt").read_text(), "leave untouched")
+        self.assertEqual((self.root / "ff_win_v3_agent.py").read_text(), "old='current'\n")
+
+    @unittest.skipUnless(os.name == "nt", "Win32_Process is only available on Windows")
+    def test_live_win32_process_peer_command_line_on_real_windows(self):
+        # Start a harmless child whose command line matches the backup 39076
+        # shape; do not open the port or touch the owner's actual prelogin agent.
+        import time
+        script = self.root / "ff_win_v3_main.py"
+        script.write_text("import time; time.sleep(12)\n", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(script), "serve", "--host", "127.0.0.1",
+             "--port", "39076"],
+            cwd=self.root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            ps = (
+                "$ErrorActionPreference='Stop'; "
+                "$p=Get-CimInstance Win32_Process -Filter 'ProcessId="
+                + str(proc.pid) + "'; "
+                "$p | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
+            )
+            out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=10)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            row = json.loads(out.stdout)
+            self.assertEqual(row["ProcessId"], proc.pid)
+            self.assertIsNone(proc.poll(), "fixture must be alive during classification")
+            classified = bundle._runtime_process_rows(
+                self.root, [row], target_port=39073, peer_port=39076)
+            self.assertEqual(classified, {proc.pid})
+            with self.assertRaisesRegex(RuntimeError, "RESTORE_RUNTIME_STILL_RUNNING"):
+                bundle._runtime_process_rows(self.root, [row], target_port=None, peer_port=None)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=6)
+
     def test_duplicate_snapshot_refused(self):
         self.captured()
         with self.assertRaisesRegex(RuntimeError, "SNAPSHOT_DESTINATION_UNSAFE"):

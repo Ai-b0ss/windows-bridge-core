@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -217,19 +218,69 @@ def verify_bundle(snapshot: Path) -> dict:
     return record
 
 
-def assert_runtime_quiescent(runtime: Path) -> None:
-    """Fail closed if any Bridge agent/keeper uses this physical runtime.
+def _runtime_process_rows(runtime: Path, rows: list, *, target_port: int | None,
+                          peer_port: int | None) -> set[int]:
+    """Allow only a verified, non-standby 127.0.0.1:39076 from this runtime."""
+    aliases = [str(runtime).casefold().replace(chr(92), "/")]
+    alias_root = Path(os.environ.get("LOCALAPPDATA") or "") / "FF-Windows-Bridge" / "bridge-v3"
+    try:
+        if alias_root.resolve() == runtime:
+            aliases.append(str(alias_root).casefold().replace(chr(92), "/"))
+    except (OSError, ValueError):
+        pass
+    allowed: set[int] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("RESTORE_PROCESS_LIST_INVALID")
+        cmd = str(row.get("CommandLine") or "").casefold().replace('"', "").replace(chr(92), "/")
+        exe = str(row.get("Name") or "").casefold()
+        if exe in {"powershell.exe", "pwsh.exe"} and "get-ciminstance" in cmd:
+            continue
+        if exe not in {"python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe"}:
+            continue
+        names = {name: any((base + "/" + name) in cmd for base in aliases)
+                 for name in ("ff_win_v3_main.py", "ff_win_v3_agent.py", "ff_win_v3_keeper.ps1")}
+        if not any(names.values()):
+            continue
+        if names["ff_win_v3_keeper.ps1"]:
+            raise RuntimeError("RESTORE_KEEPER_STILL_RUNNING")
+        if names["ff_win_v3_agent.py"]:
+            raise RuntimeError("RESTORE_RUNTIME_STILL_RUNNING")
+        if ((target_port, peer_port) != (39073, 39076)
+                or exe not in {"python.exe", "pythonw.exe"}
+                or not re.search(r"(?:^|\s)serve(?:\s|$)", cmd)
+                or re.search(r"(?:^|\s)--(?:standby|also-listen)(?:\s|=|$)", cmd)):
+            raise RuntimeError("RESTORE_RUNTIME_STILL_RUNNING")
+        ports = re.findall(r"(?:^|\s)--port(?:\s+|=)(\d+)(?=\s|$)", cmd)
+        hosts = re.findall(r"(?:^|\s)--host(?:\s+|=)([^\s]+)", cmd)
+        if ports != ["39076"] or hosts not in ([], ["127.0.0.1"]):
+            raise RuntimeError("RESTORE_RUNTIME_STILL_RUNNING")
+        pid = row.get("ProcessId")
+        if type(pid) is not int or pid <= 0:
+            raise RuntimeError("RESTORE_PEER_IDENTITY_UNKNOWN")
+        allowed.add(pid)
+    return allowed
 
-    The caller's offline flag is not proof. Process discovery is independent
-    and excludes the short-lived PowerShell query process itself.
+
+def assert_runtime_quiescent(runtime: Path, *, target_port: int | None = None,
+                             peer_port: int | None = None) -> dict:
+    """Block a live 39073 or keeper while tolerating the explicit 39076 peer.
+
+    Without explicit target/peer port context all instances still block.
     """
     runtime = Path(os.path.abspath(runtime)).resolve()
+    if (target_port is None) != (peer_port is None):
+        raise RuntimeError("RESTORE_PORT_SCOPE_INCOMPLETE")
+    if target_port is not None and (
+            type(target_port) is not int or type(peer_port) is not int
+            or (target_port, peer_port) != (39073, 39076)):
+        raise RuntimeError("RESTORE_PORT_SCOPE_INVALID")
     if os.name != "nt":
-        return
+        return {"peer_pids": [], "target_port": target_port}
     command = (
         "$ErrorActionPreference='Stop'; "
         "$items=Get-CimInstance Win32_Process | "
-        "Where-Object { $_.Name -in @('python.exe','powershell.exe','pwsh.exe') }; "
+        "Where-Object { $_.Name -in @('python.exe','pythonw.exe','powershell.exe','pwsh.exe') }; "
         "@($items | Select-Object ProcessId,Name,CommandLine) | ConvertTo-Json -Compress -Depth 3"
     )
     cp = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-Command", command],
@@ -244,41 +295,29 @@ def assert_runtime_quiescent(runtime: Path) -> None:
         rows = [rows]
     if not isinstance(rows, list):
         raise RuntimeError("RESTORE_PROCESS_LIST_INVALID")
-    names = ("ff_win_v3_main.py", "ff_win_v3_agent.py", "ff_win_v3_keeper.ps1")
-    aliases = [str(runtime)]
-    alias_root = Path(os.environ.get("LOCALAPPDATA") or "") / "FF-Windows-Bridge" / "bridge-v3"
-    try:
-        if alias_root.resolve() == runtime:
-            aliases.append(str(alias_root))
-    except (OSError, ValueError):
-        pass
-    for row in rows:
-        if not isinstance(row, dict):
-            raise RuntimeError("RESTORE_PROCESS_LIST_INVALID")
-        cmd = str(row.get("CommandLine") or "").casefold().replace('"', "")
-        exe = str(row.get("Name") or "").casefold()
-        if exe in {"powershell.exe", "pwsh.exe"} and "get-ciminstance" in cmd:
-            continue
-        if exe not in {"python.exe", "powershell.exe", "pwsh.exe"}:
-            continue
-        for base in aliases:
-            if any((str(Path(base) / name)).casefold() in cmd for name in names):
-                raise RuntimeError("RESTORE_RUNTIME_STILL_RUNNING")
-    # Also check PID files: an active PID without a discoverable command line
-    # must never be interpreted as proof of a stopped server.
+    peers = _runtime_process_rows(runtime, rows, target_port=target_port,
+                                 peer_port=peer_port)
+    # A shared agent.pid may be overwritten by the peer. Exempt a PID only
+    # after matching its actual process command and Win32_Process identity.
     for name in ("agent.pid", "keeper.pid"):
         file = runtime / name
-        if file.is_file():
-            try:
-                value = file.read_text(encoding="ascii").strip()
-                if value.isdigit() and deploy._process_alive(int(value)):
-                    raise RuntimeError("RESTORE_PID_STILL_ACTIVE:" + name)
-            except UnicodeError as exc:
-                raise RuntimeError("RESTORE_PID_FILE_INVALID") from exc
+        if not file.is_file():
+            continue
+        try:
+            value = file.read_text(encoding="ascii").strip()
+        except UnicodeError as exc:
+            raise RuntimeError("RESTORE_PID_FILE_INVALID") from exc
+        if not value.isdigit():
+            raise RuntimeError("RESTORE_PID_FILE_INVALID")
+        pid = int(value)
+        if deploy._process_alive(pid) and (name == "keeper.pid" or pid not in peers):
+            raise RuntimeError("RESTORE_PID_STILL_ACTIVE:" + name)
+    return {"peer_pids": sorted(peers), "target_port": target_port}
 
 
-def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False) -> dict:
-    """Restore only verified tracked files; caller must ensure all agents stopped."""
+def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False,
+            target_port: int | None = None, peer_port: int | None = None) -> dict:
+    """Restore verified tracked files; the explicit 39076 peer may stay alive."""
     if not offline_confirmed:
         raise RuntimeError("RESTORE_OFFLINE_CONFIRMATION_REQUIRED")
     record = verify_bundle(snapshot)
@@ -286,9 +325,15 @@ def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False) -
     _plain(runtime)
     if not runtime.is_dir():
         raise RuntimeError("RUNTIME_DESTINATION_MISSING")
-    assert_runtime_quiescent(runtime)
+    scope = assert_runtime_quiescent(runtime, target_port=target_port, peer_port=peer_port)
     previous = {row["target"]: row["sha256"] for row in record["source_files"]}
     candidate = {row["target"]: row["sha256"] for row in record["candidate_files"]}
+    # No non-Python tracked file may be changed while the peer still uses
+    # this directory; all .py writes are atomic replace operations.
+    changed = {n for n in previous.keys() | candidate.keys()
+               if previous.get(n) != candidate.get(n)}
+    if scope["peer_pids"] and any(not n.endswith(".py") for n in changed):
+        raise RuntimeError("RESTORE_PEER_NONPYTHON_CHANGE_FORBIDDEN")
     # Validate ALL affected target identities before the first change.
     for name in candidate:
         path = deploy._recovery_target(runtime, name)
@@ -308,6 +353,10 @@ def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False) -
             # allow it only when its entire byte hash still matches the backup.
             if digest(manifest) != record["previous_manifest_sha256"]:
                 raise RuntimeError("RESTORE_UNRELATED_MANIFEST")
+    second_scope = assert_runtime_quiescent(runtime, target_port=target_port,
+                                             peer_port=peer_port)
+    if second_scope["peer_pids"] and any(not n.endswith(".py") for n in changed):
+        raise RuntimeError("RESTORE_PEER_NONPYTHON_CHANGE_FORBIDDEN")
     for name in candidate.keys() - previous.keys():
         path = deploy._recovery_target(runtime, name)
         if path.is_file():
@@ -316,6 +365,8 @@ def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False) -
         src = deploy._recovery_target(snapshot / "files", name)
         dst = deploy._recovery_target(runtime, name)
         dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.is_file() and digest(dst) == previous[name]:
+            continue  # do not rewrite an unchanged file under the live peer
         _atomic_write(dst, src.read_bytes())
     _atomic_write(manifest, (snapshot / "previous-manifest.json").read_bytes())
     for name, hash_value in previous.items():
@@ -409,6 +460,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trusted-head")
     parser.add_argument("--candidate-ref", default="HEAD")
     parser.add_argument("--offline-confirmed", action="store_true")
+    parser.add_argument("--target-port", type=int)
+    parser.add_argument("--peer-port", type=int)
     parser.add_argument("--kit-root", type=Path)
     args = parser.parse_args(argv)
     try:
@@ -426,7 +479,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "verify-kit":
             result = verify_recovery_kit(args.kit_root)
         else:
-            result = restore(args.snapshot, args.runtime, offline_confirmed=args.offline_confirmed)
+            result = restore(args.snapshot, args.runtime,
+                             offline_confirmed=args.offline_confirmed,
+                             target_port=args.target_port, peer_port=args.peer_port)
         print(json.dumps(result, ensure_ascii=False))
         return 0
     except Exception as exc:

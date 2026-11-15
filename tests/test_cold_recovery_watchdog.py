@@ -24,6 +24,7 @@ class RecoveryWatchdogTests(unittest.TestCase):
             "authorized_cold_rollout": True,
             "deadline_epoch": time.time() + 20,
             "port": 39073,
+            "peer_port": 39076,
             "runtime": str(self.root / "runtime"),
             "snapshot": str(self.root / "backup"),
             "candidate_agent_sha256": "a" * 64,
@@ -70,6 +71,22 @@ class RecoveryWatchdogTests(unittest.TestCase):
                 watch.recover_failed_rollout(self.data)
             terminate.assert_not_called()
             restore.assert_not_called()
+
+    def test_recovery_passes_port_scope_to_both_independent_checks(self):
+        with (mock.patch.object(watch, "probe_agent", return_value=None),
+              mock.patch.object(watch.bundle, "assert_runtime_quiescent",
+                                return_value={"peer_pids": [18096], "target_port": 39073}) as guard):
+            restore = mock.Mock(return_value={"ok": True, "restored_files": 109})
+            restart = mock.Mock()
+            result = watch.recover_failed_rollout(self.data, terminate=mock.Mock(),
+                                                   restore=restore, restart=restart)
+            self.assertEqual(result["rollback"], "restored")
+            self.assertEqual(guard.call_args.kwargs,
+                             {"target_port": 39073, "peer_port": 39076})
+            self.assertEqual(restore.call_args.kwargs,
+                             {"offline_confirmed": True, "target_port": 39073,
+                              "peer_port": 39076})
+            restart.assert_called_once()
 
     def test_shared_runtime_blocks_restore_even_after_termination(self):
         with (mock.patch.object(watch, "probe_agent", return_value=None),
