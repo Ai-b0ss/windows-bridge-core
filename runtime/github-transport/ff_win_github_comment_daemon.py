@@ -227,6 +227,21 @@ def parse_json(body: bytes) -> Any:
     return json.loads(body.decode("utf-8-sig")) if body else None
 
 
+def valid_target_device(value: Any) -> bool:
+    """Require an explicit name; never coerce, trim or infer a destination."""
+    return (isinstance(value, str) and bool(value) and value == value.strip()
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
+
+
+def _unique_task_fields(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("TASK_DUPLICATE_JSON_KEY")
+        value[key] = item
+    return value
+
+
 def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
     if str((comment.get("user") or {}).get("login", "")).lower() not in ALLOWED_SENDERS:
         return None
@@ -234,7 +249,7 @@ def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(body, str):
         return None
     try:
-        task = json.loads(body.lstrip("\ufeff").strip())
+        task = json.loads(body.lstrip("\ufeff").strip(), object_pairs_hook=_unique_task_fields)
     except Exception:
         return None
     if not isinstance(task, dict) or task.get("schema") != SCHEMA:
@@ -251,7 +266,11 @@ def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(task.get("args", {}), dict):
         return None
     target = task.get("target_device")
-    if target and str(target).lower() != DEVICE.lower():
+    if not valid_target_device(target):
+        trace("task_rejected", comment_id=comment.get("id"), reason="TARGET_DEVICE_REQUIRED")
+        return None
+    if not valid_target_device(DEVICE) or target.lower() != DEVICE.lower():
+        trace("task_rejected", comment_id=comment.get("id"), reason="TARGET_DEVICE_MISMATCH")
         return None
     return task
 
@@ -943,9 +962,18 @@ class CommentTransport:
     def process(self, comment: dict[str, Any], task: dict[str, Any], received_ms: int) -> None:
         cid = int(comment["id"])
         started = time.perf_counter()
-        trace("execute_start", comment_id=cid, received_at_ms=received_ms)
         queued_for_publish = False
         try:
+            # Recheck at the execution boundary, including queued/recovered work.
+            # Execute the freshly parsed envelope, never an independently supplied task.
+            verified = parse_task(comment)
+            if verified is None:
+                return
+            if verified != task:
+                trace("task_rejected", comment_id=cid, reason="TASK_VALIDATION_MISMATCH")
+                return
+            task = verified
+            trace("execute_start", comment_id=cid, received_at_ms=received_ms)
             retry_delay = 1.0
             while True:
                 try:
