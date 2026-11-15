@@ -438,7 +438,7 @@
     "runtime/bridge-v3/ff_win_process_identity.py": "875409d8fba363f7ff7c5afb4519fe15b2c6fd6fb7ee11b4080054c56b156e5c",
     "runtime/bridge-v3/ff_win_request_journal.py": "887fdbc2ffcbd846eb226ee019fa395e05efa9dbbc5100159064ff67dcff1c61",
     "runtime/bridge-v3/ff_win_stop_bridge.ps1": "2891c0d004ae2d02f8761820b3b9e6a34c33ccd8e18fc8f3583aa8b21e6d9fdb",
-    "runtime/bridge-v3/ff_win_v3_agent.py": "e7f2217f315cbb2114823eaef08b6b7c48ace414b97f1167801fc4555fa9336f",
+    "runtime/bridge-v3/ff_win_v3_agent.py": "b3a18eecc0b20516d55150105ec393ad547fcb67b4a7720702436edfa4bab5b7",
     "runtime/bridge-v3/ff_win_v3_direct.py": "eec71c6207fd77b11875025d042010b3af17c6b0ad7ecbe3348a4192aaca91e6",
     "runtime/bridge-v3/ff_win_v3_documents.py": "95c7ec5fe6b35541e0d2e2235ad5d7ab668c8cece2a6587d85cd05c2a6afe00e",
     "runtime/bridge-v3/ff_win_v3_extras.py": "ecf92375e6eec6bffb23cd45f4f31827bbb920b45d672eda4496163436f6e3b0",
@@ -477,7 +477,7 @@
     "tests/integration/isolated_rpc_smoke.py": "7ab8691ed82577f8a2ad8518aebde99eb95205e9d0674d3bb64f85f78344bf1f",
     "tests/integration/owned_job_cleanup_smoke.py": "e93d58dda50fa0b4b75713bcb900a4f5b3d254d2193748657e7220d24d74d5cc",
     "tests/integration/owner_signed_approval_real_rpc_smoke.py": "ef8c6ba1ff2005fbca1662fbe85058689ccb58feb837d609f649904e37642ab8",
-    "tests/integration/seamless_handover.py": "f176a89d26f1e4c09fa666a88addcb8e9a1ae0d67acbe92246a47f5b7dc866bb",
+    "tests/integration/seamless_handover.py": "37be532d2bb6e65052c9d32e7ffed4a0653acd366164c31ce1aa641909c62cc9",
     "tests/integration/two_agent_isolated_rpc_smoke.py": "04f961e3c50659a94becb910bb929e7b6ce43cf7534118e60ad9a8385f2bf315",
     "tests/integration/two_agents_desktop.py": "6d7c1fbd7f7e48a077b12b66b3f0d1beed1077a61172f6e526cb42ca9ec8b53a",
     "tests/sidecar_observed_change.test.mjs": "c945208702e98fdd2b6eb9b7a0d21096118ce950dfe41d69d1575f7ee59d6a75",
@@ -543,6 +543,7 @@
     "tests/test_visual_addon_cache.py": "9f375c01b5df6165b36ec73324360595da9966bb1a3741afb3bf62dede27c59a",
     "tests/test_windows_mcp_physical.py": "29fc91d17495fcbb58d12426a78159f1504da5fd656a13f59ed4a0cb68e532eb",
     "tests/test_windows_mcp_pool.py": "392ddc600ad99d419bbf8a1efb0e6310ced70964a86dedcc1ad865217959ebc2",
+    "tests/test_windows_socket_handoff.py": "54843ca86e21cc311a3af0bb215e8b383afa4f70f03ab21900c1aa748edfa639",
     "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
     "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0"
   }

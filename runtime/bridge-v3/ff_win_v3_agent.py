@@ -842,6 +842,9 @@ class State:
         self.drain_requested = False
         self.drain_private_port: int | None = None
         self.private_server: http.server.ThreadingHTTPServer | None = None
+        self.standby_waiting = False
+        self.accept_ready = threading.Event()
+        self.check_servers: list[http.server.ThreadingHTTPServer] = []
         self.inflight = 0
 
 
@@ -865,6 +868,8 @@ def op_ping(args: dict[str, Any]) -> dict[str, Any]:
         "device": platform.node(),
         "uptime_seconds": max(0, (now_ms() - STATE.started_at) // 1000),
         "session_count": len(STATE.sessions),
+        "standby_waiting": STATE.standby_waiting and not STATE.accept_ready.is_set(),
+        "socket_handover_v1": os.name == "nt",
     }
 
 
@@ -1732,32 +1737,92 @@ def _forward_to_peer(request: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
-def op_drain(args: dict[str, Any]) -> dict[str, Any]:
-    """Stop taking new connections on the public port while this process keeps its sessions.
+def op_adopt_listener(args: dict[str, Any]) -> dict[str, Any]:
+    """Adopt a Windows duplicate of the OLD listening socket, not a fresh bind."""
+    if not STATE.standby_waiting or STATE.accept_ready.is_set() or STATE.server is None:
+        raise RPCError("HANDOVER_NOT_WAITING")
+    if os.name != "nt":
+        raise RPCError("HANDOVER_WINDOWS_REQUIRED")
+    source_pid, source_token = args.get("source_pid"), args.get("source_token")
+    if (type(source_pid) is not int or source_pid <= 0 or source_pid == os.getpid()
+            or not process_identity_matches(source_pid, source_token)):
+        raise RPCError("HANDOVER_SOURCE_INVALID")
+    packed = args.get("listener_share")
+    if not isinstance(packed, str) or not 0 < len(packed) <= 4096:
+        raise RPCError("HANDOVER_SOCKET_INVALID")
+    duplicate = None
+    try:
+        duplicate = socket.fromshare(base64.b64decode(packed, validate=True))
+        expected = STATE.server.server_address
+        actual = duplicate.getsockname()
+        if (actual != expected or actual[0] != "127.0.0.1"
+                or duplicate.family != socket.AF_INET
+                or duplicate.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1):
+            raise ValueError("socket is not the expected loopback listener")
+    except (OSError, ValueError, TypeError, OverflowError) as exc:
+        if duplicate is not None:
+            duplicate.close()
+        raise RPCError("HANDOVER_SOCKET_INVALID") from exc
+    with STATE.lock:
+        if not STATE.standby_waiting or STATE.accept_ready.is_set():
+            duplicate.close()
+            raise RPCError("HANDOVER_ALREADY_ACTIVE")
+        STATE.server.socket.close()  # Standby socket was never bound.
+        STATE.server.socket = duplicate
+        STATE.accept_ready.set()
+    return {"adopted": True, "pid": os.getpid(), "public_port": actual[1]}
 
-    A standby instance must already share the public port and answer on its own check port;
-    otherwise draining would be an outage and is refused.
-    """
+
+OPS["adopt_listener"] = op_adopt_listener
+
+
+def op_drain(args: dict[str, Any]) -> dict[str, Any]:
+    """Transfer the live WinSock accept queue to the verified standby."""
     standby = args.get("standby_port")
     if isinstance(standby, bool) or not isinstance(standby, int) or not 1024 <= standby <= 65535:
         raise RPCError("DRAIN_STANDBY_PORT_REQUIRED")
     if STATE.draining or STATE.drain_requested:
         raise RPCError("DRAIN_ALREADY_REQUESTED")
+    if os.name != "nt" or STATE.server is None or not hasattr(STATE.server.socket, "share"):
+        raise RPCError("DRAIN_SOCKET_SHARE_UNSUPPORTED")
     try:
         probe = client_request("127.0.0.1", standby, "ping", {})
     except Exception as exc:
-        raise RPCError("DRAIN_STANDBY_NOT_READY", details={"error": type(exc).__name__})
-    other = (probe.get("result") or {}).get("pid")
-    if probe.get("ok") is not True or not isinstance(other, int) or other == os.getpid():
+        raise RPCError("DRAIN_STANDBY_NOT_READY", details={"error": type(exc).__name__}) from exc
+    info = probe.get("result") or {}
+    other = info.get("pid")
+    if (probe.get("ok") is not True or type(other) is not int
+            or other == os.getpid() or info.get("standby_waiting") is not True
+            or info.get("socket_handover_v1") is not True):
         raise RPCError("DRAIN_STANDBY_NOT_READY", details={"standby_pid": other})
+    source_token = process_creation_token(os.getpid())
+    if source_token is None:
+        raise RPCError("DRAIN_SOURCE_UNATTESTED")
     private = BridgeHTTPServer(("127.0.0.1", 0), Handler)
     port = int(private.server_address[1])
     threading.Thread(target=_serve_direct, args=(private,), daemon=True).start()
     STATE.private_server = private
     STATE.drain_private_port = port
     _write_peer({"port": port, "started": now_ms()})
+    try:
+        shared = STATE.server.socket.share(other)
+        response = client_request("127.0.0.1", standby, "adopt_listener", {
+            "source_pid": os.getpid(), "source_token": source_token,
+            "listener_share": base64.b64encode(shared).decode("ascii"),
+        })
+        if response.get("ok") is not True or (response.get("result") or {}).get("adopted") is not True:
+            raise RuntimeError("standby refused listening socket")
+    except Exception as exc:
+        _write_peer(None)
+        STATE.private_server = None
+        STATE.drain_private_port = None
+        private.shutdown()
+        private.server_close()
+        raise RPCError("DRAIN_STANDBY_ADOPTION_FAILED",
+                       details={"error": type(exc).__name__}) from exc
     STATE.drain_requested = True
-    return {"draining": True, "private_port": port, "standby_pid": other, "pid": os.getpid()}
+    return {"draining": True, "private_port": port, "standby_pid": other,
+            "pid": os.getpid(), "socket_handover": "windows_duplicate_listener"}
 
 
 OPS["drain"] = op_drain
@@ -1892,6 +1957,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_json(400, {"ok": False, "error_code": "REQUEST_NOT_OBJECT"})
             return
         if self.path == "/rpc":
+            if (request.get("op") == "adopt_listener"
+                    and self.server not in STATE.check_servers):
+                self.send_json(403, {"ok": False, "error_code": "HANDOVER_CHECK_PORT_REQUIRED"})
+                return
             try:
                 self.send_json(200, dispatch(request))
             except RPCError as exc:
@@ -1913,10 +1982,9 @@ def _serve_direct(server: http.server.ThreadingHTTPServer) -> None:
     try:
         while not server._BaseServer__shutdown_request:
             if server is STATE.server and STATE.drain_requested:
-                # Leave only when nothing is queued, so closing cannot reset a waiting client.
-                if not select.select([server.socket], [], [], 0)[0]:
-                    STATE.draining = True
-                    break
+                # Standby shares this exact listener; queued accepts remain valid.
+                STATE.draining = True
+                break
             try:
                 request, client_address = server.get_request()
             except socket.timeout:
@@ -1961,19 +2029,29 @@ def _drain_wait() -> None:
             return
 
 
-def serve(host: str, port: int, also_listen: list[int] | None = None) -> int:
+def serve(host: str, port: int, also_listen: list[int] | None = None,
+          *, standby: bool = False) -> int:
     ensure_dirs()
     atomic_write_text(PID_PATH, str(os.getpid()) + "\n", "ascii")
+    if standby and (os.name != "nt" or host != "127.0.0.1" or not also_listen):
+        print("FF3_STANDBY_REQUIRES_WINDOWS_LOOPBACK_CHECK_PORT", file=sys.stderr)
+        return 4
     try:
-        server = BridgeHTTPServer((host, port), Handler)
+        # Standby never binds a second listener with SO_REUSEADDR.
+        server = BridgeHTTPServer((host, port), Handler, bind_and_activate=not standby)
         extras = [BridgeHTTPServer((host, extra), Handler) for extra in (also_listen or [])]
     except OSError as exc:
         print(f"FF3_BIND_FAILED:{exc}", file=sys.stderr)
         return 3
     STATE.server = server
+    STATE.standby_waiting = standby
+    STATE.check_servers = extras
     for extra in extras:
         threading.Thread(target=_serve_direct, args=(extra,), daemon=True).start()
     try:
+        if standby and not STATE.accept_ready.wait(120):
+            print("FF3_STANDBY_HANDOVER_TIMEOUT", file=sys.stderr)
+            return 4
         _serve_direct(server)
         if STATE.draining:
             server.server_close()
@@ -2011,12 +2089,14 @@ def main() -> int:
     serve_parser.add_argument("--port", type=int, default=PORT)
     serve_parser.add_argument("--also-listen", type=int, action="append", default=[],
                               help="extra loopback port to check a standby before it takes over")
+    serve_parser.add_argument("--standby", action="store_true",
+                              help="wait for Windows socket handoff without binding public port")
     ping_parser = subparsers.add_parser("ping")
     ping_parser.add_argument("--host", default=HOST)
     ping_parser.add_argument("--port", type=int, default=PORT)
     args = parser.parse_args()
     if args.cmd == "serve":
-        return serve(args.host, args.port, args.also_listen)
+        return serve(args.host, args.port, args.also_listen, standby=args.standby)
     if args.cmd == "ping":
         try:
             print(json.dumps(client_request(args.host, args.port, "ping"), ensure_ascii=False))
