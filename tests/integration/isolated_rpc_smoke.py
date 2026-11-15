@@ -449,6 +449,38 @@ def verify_rpc(port: int,secret: str,root: Path | None = None):
     return checks
 
 
+def verify_stopped(port: int, secret: str, root: Path):
+    """Real RPC refusal only: never dispatch input or launch a visible app."""
+    for index, (agent, task) in enumerate((("ci-stop-agent", "ci-stop-task"),
+                                          ("ci-other-agent", "ci-other-task"))):
+        grant = rpc(port, secret, "set_desktop_mode", {
+            "mode": "dedicated", "agent_id": agent, "task_id": task, "targets": [],
+            "owner_chat_permission": {"quote": "synthetic fixture cannot rearm Stop"},
+        }, "ci-stop-quote-" + str(index))
+        verify(grant.get("error_code") == "OWNER_STOPPED", "STOP_QUOTE_BYPASS")
+    for index, action in enumerate((
+        {"command": "windows_mcp", "tool": "Click", "arguments": {"loc": [1, 1]}},
+        {"command": "launch_app", "app": "fixture-never-launch",
+         "visible_launch_allowed": True},
+    )):
+        denied = rpc(port, secret, "computer_use", {
+            **action, "agent_id": "ci-stop-agent", "task_id": "ci-stop-task",
+            "mode_generation": 1,
+        }, "ci-stop-physical-" + str(index))
+        verify(denied.get("error_code") == "OWNER_STOPPED", "STOP_PHYSICAL_BYPASS")
+    marker = root / "effect-must-not-execute.txt"
+    denied = rpc(port, secret, "run_code", {
+        "agent_id": "ci-stop-agent", "task_id": "ci-stop-task", "language": "python",
+        "code": "from pathlib import Path; Path(" + repr(str(marker)) + ").write_text('unexpected')",
+    }, "ci-stop-effect")
+    verify(denied.get("error_code") == "OWNER_STOPPED" and not marker.exists(), "STOP_EFFECT_BYPASS")
+    status = rpc(port, secret, "desktop_mode_status", {}, "ci-stop-status")
+    verify((status.get("result") or {}).get("grants") == [], "STOP_OLD_GRANT_ACTIVE")
+    verify((root / "state/chat-permission/stop.flag").is_file(), "STOP_MARKER_REMOVED")
+    ping = rpc(port, secret, "ping", {}, "ci-stop-readonly")
+    verify(ping.get("ok") is True, "STOP_READONLY_PING_FAILED")
+
+
 def main() -> int:
     if os.name!="nt":
         print("Requires a Windows runner",file=sys.stderr)
@@ -482,6 +514,36 @@ def main() -> int:
                 raise RuntimeError("ISOLATED_AGENT_NOT_READY")
             secret=secret_file.read_text(encoding="ascii").strip()
             checks=verify_rpc(port,secret,root)
+            # Local tempfile fixture emulates the notice's Stop file, without UI.
+            before = rpc(port, secret, "set_desktop_mode", {
+                "mode": "dedicated", "agent_id": "ci-stop-agent", "task_id": "ci-stop-task",
+                "targets": [], "owner_chat_permission": {"quote": "synthetic pre-Stop fixture"},
+            }, "ci-stop-pre-grant")
+            verify(before.get("ok") is True, "PRE_STOP_CHAT_GRANT_FAILED")
+            (root / "state/chat-permission/stop.flag").write_text("synthetic local owner Stop")
+            verify_stopped(port, secret, root)
+            checks.append("durable_stop_denies_quotes_other_agents_old_grants_physical_launch_and_effect")
+            # Restart ONLY this disposable loopback Bridge; retain its fixture state.
+            process.terminate()
+            process.wait(timeout=6)
+            process = subprocess.Popen(
+                [sys.executable, str(SERVER), "serve", "--host", "127.0.0.1", "--port", str(port)],
+                cwd=str(REPO), env=env, stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                verify(process.poll() is None, "ISOLATED_RESTART_EXITED")
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=.2):
+                        break
+                except OSError:
+                    time.sleep(.1)
+            else:
+                raise RuntimeError("ISOLATED_RESTART_NOT_READY")
+            verify_stopped(port, secret, root)
+            checks.append("durable_stop_survives_isolated_process_restart")
             print(json.dumps({
                 "isolated_agent":True,"all_passed":True,
                 "checks":checks,"no_user_desktop":True,
