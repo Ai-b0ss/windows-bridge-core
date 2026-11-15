@@ -448,7 +448,7 @@
     "runtime/github-transport/ff_win_github_background_agent.py": "e1bfa9e749ff751c94975b5068ec389358a652e748bae1e03784a2ab092600c2",
     "runtime/github-transport/ff_win_github_background_keeper.ps1": "e2afe78ffb71812f7e5d913855f3e9afad8dece6de835d1d35e1009eafaebd10",
     "runtime/github-transport/ff_win_github_client.py": "edc98fc8cbeae2bb8a13585386aa1652b0bd4e8482af8e3510495d520e0c2a94",
-    "runtime/github-transport/ff_win_github_comment_daemon.py": "80e0ccb0fb2ee1d9f4c91cf8d8b7e39b3205997222577f2cfda64a2bcdf9c40b",
+    "runtime/github-transport/ff_win_github_comment_daemon.py": "e0fd498221cad4c71b6aeb9306a7c767c33304587c10d6e9052a30de3c7764b9",
     "runtime/github-transport/ff_win_github_prelogin_probe.ps1": "2d766ea2d1286fb02f55c94c6ef503071aa9fe52389a607b7c3096894cbb74b3",
     "runtime/github-transport/ff_win_github_smoke_test.ps1": "6cc4178d160b8347ff63d798b375fb479f1a4f6d68b2852b9af5a5ea2b2c94fb",
     "runtime/github-transport/ff_win_github_transport_health.ps1": "d21191249571d8d8f11f4715ae53bf753f25754232f10f202b9a9603e3b1ef81",
@@ -536,6 +536,8 @@
     "runtime/bridge-v3/cua_resource_leases.py": "3568233a9c783848cea45e7601eaed6efcf70535d20435eac315556028ecf8d2",
     "tests/integration/two_agents_desktop.py": "6d7c1fbd7f7e48a077b12b66b3f0d1beed1077a61172f6e526cb42ca9ec8b53a",
     "tests/test_per_window_grants.py": "27e34b732553054ca0bbbdf61fedac61c38d64c4ea7cfdc306bd32d0730d2301",
-    "tests/test_chat_effect_permission.py": "5803d1b23c35b81a3cd8490318fdfaf2dc950fb4ff078c0e950234e14cc83646"
+    "tests/test_chat_effect_permission.py": "5803d1b23c35b81a3cd8490318fdfaf2dc950fb4ff078c0e950234e14cc83646",
+    "tests/integration/github_retry_crash_smoke.py": "7f8d0117a5308eee0388e04f1bb5af3442aedf818e9c3582903e47184ffc5602",
+    "tests/test_github_bounded_retry.py": "29d6b443726f9780c286e872a524eb83325ded803805a13decd00f72fd64c412"
   }
 }
