@@ -492,6 +492,7 @@
     "tests/test_cli_contracts.py": "85554963e143767cef701deb30369958e906d57a2501c3fa1fa9ad9a1fdc011c",
     "tests/test_cli_discovery_safe_probe.py": "06d7cd0e8e42e859eb4cfb121d7a368fdbf4595001f4f3c2f607131c4d13a32a",
     "tests/test_cli_first_parity.py": "136cf55d9f227e71bcba9cda4c4d62af2ac3c6c6ef82e21bec333724e3dab8ed",
+    "tests/test_cold_rollback_bundle.py": "7963f489a38b8ab04d62867e3e23b00b40701db93683d5c4c067cc84c75353e0",
     "tests/test_cua_browser_iframe_verify.mjs": "6574d65b9695a368a8fba3c6f437f3c9190664dcf48943fd82bbc6d0a1c14940",
     "tests/test_cua_owner_activity_guard.py": "49da2a01dc5085b9176b0979136a749f035086239433e565f3dff6f3ce8e29bb",
     "tests/test_cua_owner_chrome_attach.py": "befc65b0576e205e60e283c23c199fff3075e2f3249ea67f33802dac63337b54",
@@ -545,6 +546,7 @@
     "tests/test_windows_mcp_pool.py": "392ddc600ad99d419bbf8a1efb0e6310ced70964a86dedcc1ad865217959ebc2",
     "tests/test_windows_socket_handoff.py": "b8f067a581dbfac486ebf6278bac6112a1e432791b98708f7782313780a759c5",
     "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
+    "tools/cua_cold_rollback_bundle.py": "a68ff8b33b220ac4da960fcb011540507351b92e1c028ef83b7f242d14d1c918",
     "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0"
   }
 }
