@@ -845,6 +845,7 @@ class State:
         self.standby_waiting = False
         self.accept_ready = threading.Event()
         self.check_servers: list[http.server.ThreadingHTTPServer] = []
+        self.drain_lock = threading.Lock()
         self.inflight = 0
 
 
@@ -1777,6 +1778,16 @@ OPS["adopt_listener"] = op_adopt_listener
 
 
 def op_drain(args: dict[str, Any]) -> dict[str, Any]:
+    """Serialize handover preparation to prevent two concurrent socket transfers."""
+    if not STATE.drain_lock.acquire(blocking=False):
+        raise RPCError("DRAIN_ALREADY_REQUESTED")
+    try:
+        return _op_drain_exclusive(args)
+    finally:
+        STATE.drain_lock.release()
+
+
+def _op_drain_exclusive(args: dict[str, Any]) -> dict[str, Any]:
     """Transfer the live WinSock accept queue to the verified standby."""
     standby = args.get("standby_port")
     if isinstance(standby, bool) or not isinstance(standby, int) or not 1024 <= standby <= 65535:

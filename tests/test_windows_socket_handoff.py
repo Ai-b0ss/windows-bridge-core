@@ -63,6 +63,16 @@ class WindowsSocketHandoffGuards(unittest.TestCase):
             h.send_json.assert_called_once_with(
                 403, {"ok": False, "error_code": "HANDOVER_CHECK_PORT_REQUIRED"})
 
+    def test_concurrent_drain_fails_before_contacting_standby(self):
+        with (patch.object(agent.STATE, "drain_lock") as lock,
+              patch.object(agent, "client_request") as peer):
+            lock.acquire.return_value = False
+            with self.assertRaises(agent.RPCError) as caught:
+                agent.op_drain({"standby_port": 39099})
+            self.assertEqual(caught.exception.code, "DRAIN_ALREADY_REQUESTED")
+            peer.assert_not_called()
+            lock.release.assert_not_called()
+
     def test_drain_refuses_unbound_or_unverified_standby(self):
         server = SimpleNamespace(socket=Mock())
         server.socket.share = Mock()
