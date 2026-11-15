@@ -166,6 +166,17 @@ class SnapshotSafety(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "SNAPSHOT_DESTINATION_UNSAFE"):
             bundle.capture(self.repo, self.root, self.root / "backup", trusted_head=self.trusted)
 
+    def test_independent_recovery_kit_dependency_closure(self):
+        kit = self.base / "independent-kit"
+        receipt = bundle.create_recovery_kit(ROOT, kit)
+        self.assertTrue(receipt["independent_import"])
+        self.assertEqual(receipt["file_count"], 7)
+        self.assertEqual(bundle.verify_recovery_kit(kit)["files_verified"], 7)
+        target = kit / "runtime/bridge-v3/cua_release_manifest.py"
+        target.write_text("tampered", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "RECOVERY_KIT_HASH_MISMATCH"):
+            bundle.verify_recovery_kit(kit)
+
     def test_duplicate_snapshot_refused(self):
         self.captured()
         with self.assertRaisesRegex(RuntimeError, "SNAPSHOT_DESTINATION_UNSAFE"):

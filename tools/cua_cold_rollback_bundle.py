@@ -326,15 +326,90 @@ def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False) -
     return {"ok": True, "restored_files": len(previous), "removed_candidate_only_files": len(candidate.keys() - previous.keys())}
 
 
+# Explicitly pinned dependency closure for an independent recovery process.
+# Do not import code from a runtime that is being overwritten during rollback.
+RECOVERY_KIT_FILES = (
+    "tools/cua_cold_rollback_bundle.py",
+    "tools/cua_cold_recovery_watchdog.py",
+    "runtime/bridge-v3/cua_runtime_deploy.py",
+    "runtime/bridge-v3/cua_release_manifest.py",
+    "runtime/bridge-v3/cua_windows_paths.py",
+    "runtime/bridge-v3/cua_lifecycle.py",
+    "runtime/bridge-v3/ff_win_process_identity.py",
+)
+
+
+def create_recovery_kit(repo: Path, destination: Path, ref: str = "HEAD") -> dict:
+    repo = repo.resolve()
+    dest = Path(os.path.abspath(destination))
+    if dest.exists():
+        raise RuntimeError("RECOVERY_KIT_DESTINATION_EXISTS")
+    _plain(dest.parent)
+    if not dest.parent.is_dir():
+        raise RuntimeError("RECOVERY_KIT_PARENT_INVALID")
+    commit = deploy.resolve_ref(repo, ref)
+    dest.mkdir(mode=0o700)
+    files = []
+    for name in RECOVERY_KIT_FILES:
+        raw = deploy.git_blob_bytes(repo, commit, name)
+        target = dest / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("xb") as stream:
+            stream.write(raw)
+            stream.flush()
+            os.fsync(stream.fileno())
+        check = hashlib.sha256(raw).hexdigest()
+        if digest(target) != check:
+            raise RuntimeError("RECOVERY_KIT_COPY_CORRUPT:" + name)
+        files.append({"path": name, "sha256": check, "bytes": len(raw)})
+    record = {"schema": "ff-independent-recovery-kit/v1",
+              "source_commit": commit, "files": files}
+    _atomic_write(dest / "kit-manifest.json",
+                  (json.dumps(record, ensure_ascii=True, sort_keys=True, indent=2) + "\n").encode("utf-8"))
+    verify_recovery_kit(dest)
+    # A clean import from the copied paths must work without the owner's repo
+    # and without importing modules from the installed runtime.
+    args = [
+        sys.executable, "-I", "-c",
+        "import sys; sys.path.insert(0, sys.argv[1]); sys.path.insert(0, sys.argv[2]); "
+        "import cua_cold_recovery_watchdog, cua_cold_rollback_bundle",
+        str(dest / "tools"), str(dest / "runtime/bridge-v3"),
+    ]
+    cp = subprocess.run(args, cwd=dest, capture_output=True, timeout=25, check=False)
+    if cp.returncode:
+        raise RuntimeError("RECOVERY_KIT_IMPORT_SMOKE_FAILED")
+    return {"ok": True, "kit": str(dest), "commit": commit,
+            "file_count": len(files), "independent_import": True}
+
+
+def verify_recovery_kit(path: Path) -> dict:
+    root = Path(os.path.abspath(path))
+    _plain(root)
+    mf = root / "kit-manifest.json"
+    _plain(mf, must_file=True)
+    data = json.loads(mf.read_text(encoding="utf-8"))
+    if (data.get("schema") != "ff-independent-recovery-kit/v1"
+            or len(data.get("files", [])) != len(RECOVERY_KIT_FILES)
+            or {row.get("path") for row in data["files"]} != set(RECOVERY_KIT_FILES)):
+        raise RuntimeError("RECOVERY_KIT_MANIFEST_UNPROVEN")
+    for row in data["files"]:
+        item = deploy._recovery_target(root, row["path"])
+        _plain(item, must_file=True)
+        if digest(item) != row.get("sha256"):
+            raise RuntimeError("RECOVERY_KIT_HASH_MISMATCH:" + row["path"])
+    return {"ok": True, "kit": str(root), "files_verified": len(RECOVERY_KIT_FILES)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("preflight", "capture", "verify", "restore"))
+    parser.add_argument("action", choices=("preflight", "capture", "verify", "restore", "kit", "verify-kit"))
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--runtime", type=Path)
     parser.add_argument("--snapshot", type=Path)
     parser.add_argument("--trusted-head")
     parser.add_argument("--candidate-ref", default="HEAD")
     parser.add_argument("--offline-confirmed", action="store_true")
+    parser.add_argument("--kit-root", type=Path)
     args = parser.parse_args(argv)
     try:
         if args.action == "preflight":
@@ -346,6 +421,10 @@ def main(argv: list[str] | None = None) -> int:
                              candidate_ref=args.candidate_ref)
         elif args.action == "verify":
             result = {"ok": True, "source_files": len(verify_bundle(args.snapshot)["source_files"])}
+        elif args.action == "kit":
+            result = create_recovery_kit(args.repo, args.kit_root, ref=args.candidate_ref)
+        elif args.action == "verify-kit":
+            result = verify_recovery_kit(args.kit_root)
         else:
             result = restore(args.snapshot, args.runtime, offline_confirmed=args.offline_confirmed)
         print(json.dumps(result, ensure_ascii=False))
