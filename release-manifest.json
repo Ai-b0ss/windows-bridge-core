@@ -326,7 +326,7 @@
   "core_profile": "full-win32-core-optional-visual-and-browser",
   "files": {
     "ADDONS.cmd": "dec370600dca6dd7761b376816b52111bd1488873104a4f8626e428bc4cc2e35",
-    "CHATGPT-REMOTE-CONTROL.md": "11fcbbc375999a4a14424ba6bc008092f220bb83dadcc14b50595b320b2e9981",
+    "CHATGPT-REMOTE-CONTROL.md": "02879856edfd060e840a615b1525c47de0c572b82db481e26938d4d0faf75a95",
     "CHECK-BRIDGE.cmd": "98c1761d39063c275026e782a2bcf2cf2372c99beb0b17db637ab783868a1604",
     "INSTALL-FRIEND.cmd": "cacd8aa4c8c2bacce3a7cbb1b8d669613afc528974e411463b6d52bf86024004",
     "OPTIONAL-ADDONS.md": "e95decacffd2b6be0f97c7607380e451ef81bd3e217c520196d6781e611f0cfb",
@@ -447,10 +447,10 @@
     "runtime/bridge-v3/package.json": "6796c28090bd32a75cd320b154987b30261d4fac4e8674ec2cfc5f49ee73409e",
     "runtime/github-transport/ff_win_github_background_agent.py": "e1bfa9e749ff751c94975b5068ec389358a652e748bae1e03784a2ab092600c2",
     "runtime/github-transport/ff_win_github_background_keeper.ps1": "e2afe78ffb71812f7e5d913855f3e9afad8dece6de835d1d35e1009eafaebd10",
-    "runtime/github-transport/ff_win_github_client.py": "edc98fc8cbeae2bb8a13585386aa1652b0bd4e8482af8e3510495d520e0c2a94",
-    "runtime/github-transport/ff_win_github_comment_daemon.py": "80e0ccb0fb2ee1d9f4c91cf8d8b7e39b3205997222577f2cfda64a2bcdf9c40b",
+    "runtime/github-transport/ff_win_github_client.py": "5c358cec94b88b7cf7ee6bdaff076321643863911408dc6f840750f6adc91162",
+    "runtime/github-transport/ff_win_github_comment_daemon.py": "ee0d432299232ae3f59d6dab8a766a334b6d42536d04735d64f26735251ec580",
     "runtime/github-transport/ff_win_github_prelogin_probe.ps1": "2d766ea2d1286fb02f55c94c6ef503071aa9fe52389a607b7c3096894cbb74b3",
-    "runtime/github-transport/ff_win_github_smoke_test.ps1": "6cc4178d160b8347ff63d798b375fb479f1a4f6d68b2852b9af5a5ea2b2c94fb",
+    "runtime/github-transport/ff_win_github_smoke_test.ps1": "8cfffda036cacda1ae97a3189eec7b540dfb17bcccf50cd6dee06e7f35fe90b0",
     "runtime/github-transport/ff_win_github_transport_health.ps1": "d21191249571d8d8f11f4715ae53bf753f25754232f10f202b9a9603e3b1ef81",
     "runtime/github-transport/ff_win_github_transport_keeper.ps1": "1828827c475d02af8740730e1060e13a500098a78727fa5e32fcfab3a3eef41b",
     "runtime/github-transport/ff_win_github_v3_keeper.ps1": "a9c0a96758590159a5d5d1b77faf3dd187a6078562307736c8e2d932c23d4664",
@@ -516,7 +516,7 @@
     "tests/test_transport_module_paths.py": "7c1a5c085e1de657e08ea8fba6dbd002bc271d57fd4505c2cbeb9659c7230e24",
     "tests/test_trusted_skill_input.py": "6c7c627d9931c587481c40465d950d1328d48785b91b0f583f017950fb8b1b9a",
     "tests/test_visual_addon_cache.py": "9f375c01b5df6165b36ec73324360595da9966bb1a3741afb3bf62dede27c59a",
-    "tools/bridge_remote_gh.py": "c1affff9b047154baf3bd8bc10a20d0ca91fc11693f54a2f0eee3904db9d582f",
+    "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
     "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0",
     "runtime/bridge-v3/cua_chat_permission.py": "acf390bed4819c08738f8d1cd4e5a3778523bbf23d2e54c5ffbac52e94bb66a6",
     "tests/test_chat_permission.py": "9c19d7c665191ade6d20002c50754fb216f0678f38af1791372257edc022d553",
@@ -536,6 +536,7 @@
     "runtime/bridge-v3/cua_resource_leases.py": "3568233a9c783848cea45e7601eaed6efcf70535d20435eac315556028ecf8d2",
     "tests/integration/two_agents_desktop.py": "6d7c1fbd7f7e48a077b12b66b3f0d1beed1077a61172f6e526cb42ca9ec8b53a",
     "tests/test_per_window_grants.py": "27e34b732553054ca0bbbdf61fedac61c38d64c4ea7cfdc306bd32d0730d2301",
-    "tests/test_chat_effect_permission.py": "5803d1b23c35b81a3cd8490318fdfaf2dc950fb4ff078c0e950234e14cc83646"
+    "tests/test_chat_effect_permission.py": "5803d1b23c35b81a3cd8490318fdfaf2dc950fb4ff078c0e950234e14cc83646",
+    "tests/test_github_explicit_device.py": "1924de751bd18c4eae1212b8586e02c207d49e67b43e47ca0a7c8c989a09c3fe"
   }
 }
