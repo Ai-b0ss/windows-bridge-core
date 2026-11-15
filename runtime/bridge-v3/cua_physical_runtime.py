@@ -256,10 +256,11 @@ class PhysicalInputRouteAdapter:
 
         def paced_sink(event: Mapping[str, Any]) -> None:
             nonlocal emitted
-            from cua_task_authority import DESKTOP_ACTION_EXPIRY
-            expires = DESKTOP_ACTION_EXPIRY.get()
-            if expires is not None and expires <= time.time():
-                raise PhysicalRuntimeError("DESKTOP_MODE_EXPIRED", {"retry_safe": False})
+            from cua_task_authority import AuthorityError, check_desktop_action
+            try:
+                check_desktop_action()
+            except AuthorityError as exc:
+                raise PhysicalRuntimeError(str(exc), {"retry_safe": False}) from exc
             if str(event.get("kind", "")).startswith("mouse"):
                 point = (event["x"], event["y"]) if event["kind"] in {"mouse_click_at", "mouse_move_at"} else self.runtime.target_api.cursor()
                 left, top, right, bottom = self.runtime.target_for(self.surface, request).rect
@@ -408,11 +409,12 @@ class WindowsPhysicalRuntime:
         request = {"generation": generation}
         target = self.target_for(surface, request)
         def activate(hwnd, guard):
-            from cua_task_authority import DESKTOP_ACTION_EXPIRY
+            from cua_task_authority import AuthorityError, check_desktop_action
             def input_guard():
-                expires = DESKTOP_ACTION_EXPIRY.get()
-                if expires is not None and expires <= time.time():
-                    raise PhysicalRuntimeError("DESKTOP_MODE_EXPIRED", {"retry_safe": False})
+                try:
+                    check_desktop_action()
+                except AuthorityError as exc:
+                    raise PhysicalRuntimeError(str(exc), {"retry_safe": False}) from exc
                 guard()
             point = self.target_api.caption_activation_point(hwnd, input_guard)
             input_guard()
