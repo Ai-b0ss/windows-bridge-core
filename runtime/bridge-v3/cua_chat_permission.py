@@ -20,6 +20,7 @@ import os
 import re
 import time
 from pathlib import Path
+from cua_owner_stop import stop_requested
 
 SCHEMA = "ff-chat-permission-v1"
 DEFAULT_TTL = 3600
@@ -80,11 +81,17 @@ class ChatPermissionPolicy:
         return {"schema": SCHEMA, "enabled": cfg["enabled"],
                 "max_ttl_seconds": cfg.get("max_ttl_seconds"),
                 "owner_opt_in_until": cfg.get("owner_opt_in_until"),
+                "owner_stopped": stop_requested(self.state_dir),
                 "quote_verified_by_bridge": False}
+
+    def check_stop(self) -> None:
+        if stop_requested(self.state_dir):
+            raise ChatPermissionError("OWNER_STOPPED")
 
     # -- grant ---------------------------------------------------------------
     def authorize(self, args: dict) -> float:
         """Validate a chat permission and return its expiry (Unix seconds)."""
+        self.check_stop()
         cfg = self._config()
         if not cfg["enabled"]:
             raise ChatPermissionError("CHAT_PERMISSION_DISABLED")
@@ -108,10 +115,6 @@ class ChatPermissionPolicy:
         duration = min(duration, cfg["max_ttl_seconds"])
         now = self.clock()
         expires = now + duration
-        try:  # a new grant starts clean: forget an old Stop press
-            (self.state_dir / "stop.flag").unlink()
-        except OSError:
-            pass
         self._append("chat-permission.jsonl", {
             "kind": "GRANT", "agent_id": args["agent_id"], "task_id": args["task_id"],
             "quote": quote.strip(), "apps": apps, "duration_seconds": duration,
@@ -121,6 +124,7 @@ class ChatPermissionPolicy:
             # Log only: the owner reviews this and decides whether to enforce it.
             self.log_violation("ROUTE_SEARCH_SKIPPED", agent_id=args["agent_id"],
                                task_id=args["task_id"])
+        self.check_stop()
         return expires
 
     def authorize_effect(self, args: dict, *, operation: str, request_digest: str) -> float:
@@ -129,6 +133,7 @@ class ChatPermissionPolicy:
         The chat quote is agent-reported, not host-attested, and the approval
         is not a reusable credential for other operations.
         """
+        self.check_stop()
         cfg = self._config()
         if not cfg["enabled"]:
             raise ChatPermissionError("CHAT_PERMISSION_DISABLED")
@@ -144,8 +149,6 @@ class ChatPermissionPolicy:
                 raise ChatPermissionError("CHAT_PERMISSION_IDENTITY_INVALID")
         if permission.get("operation") != operation or permission.get("request_digest") != request_digest:
             raise ChatPermissionError("CHAT_PERMISSION_EFFECT_SCOPE_MISMATCH")
-        if (self.state_dir / "stop.flag").exists():
-            raise ChatPermissionError("OWNER_STOPPED")
         consequence = args.get("consequences")
         if not isinstance(consequence, dict) or not consequence.get("purpose") or not consequence.get("targets") or not consequence.get("risk"):
             raise ChatPermissionError("CHAT_PERMISSION_EFFECT_SCOPE_REQUIRED")
@@ -158,6 +161,7 @@ class ChatPermissionPolicy:
             "expires": now + min(300, cfg["max_ttl_seconds"]),
             "quote_verified_by_bridge": False,
         }, required=True)
+        self.check_stop()
         return now + min(300, cfg["max_ttl_seconds"])
 
     # -- evidence that programmatic routes were looked at first ----------------

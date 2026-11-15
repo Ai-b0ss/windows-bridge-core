@@ -250,6 +250,34 @@ def _key(task: dict[str, Any]) -> str:
     return f"{task['client_id']}::{task['task_id']}"
 
 
+def recover_outbox_result(task: dict[str, Any]) -> tuple[int, dict[str, Any], dict[str, Any]]:
+    """Recover a mutation's recorded result without claiming or dispatching it.
+
+    An outbox (even a partial one) is evidence of a possible completed effect.
+    Missing/retryable journal entries cannot authorize fresh execution here.
+    Journal I/O/decoding errors propagate so the caller keeps that evidence.
+    """
+    con = _db()
+    try:
+        row = con.execute("SELECT digest,state,status,response FROM tasks WHERE k=?",
+                          (_key(task),)).fetchone()
+    finally:
+        con.close()
+    route = {"route": "journal-outbox-recovery", "automatic_retry_blocked": True}
+    if row and row[0] != _digest(task):
+        code = "TASK_ID_PAYLOAD_CONFLICT"
+    elif row and row[1] == "done":
+        result = json.loads(row[3])
+        if type(row[2]) is not int or not 100 <= row[2] <= 599 or not isinstance(result, dict):
+            raise TransportCoreError("JOURNAL_RESULT_INVALID")
+        return row[2], result, {**route, "deduplicated": True}
+    elif row and row[1] == "expired":
+        code = "TASK_OUTCOME_EXPIRED"
+    else:
+        code = "TASK_OUTCOME_UNKNOWN"
+    return 409, {"ok": False, "error_code": code, "retry_safe": False}, route
+
+
 def journal_begin(task: dict[str, Any]) -> tuple[str, Any]:
     if is_safe(task["op"]):
         return "execute", None

@@ -9,7 +9,7 @@ MODULES=ROOT/"runtime/bridge-v3"
 sys.path.insert(0,str(MODULES))
 from cua_owner_activity import OwnerActivityGuard, OwnerActive
 from cua_owner_notice import OwnerNotice
-from cua_chat_permission import ChatPermissionPolicy
+from cua_chat_permission import ChatPermissionError, ChatPermissionPolicy
 
 
 class FakeClock:
@@ -94,14 +94,15 @@ class NoticeTests(unittest.TestCase):
         notice=OwnerNotice(self.tmp.name,popen=boom)
         self.assertFalse(notice.action("a","t",1))
 
-    def test_stop_flag_roundtrip_and_new_grant_clears_it(self):
+    def test_stop_flag_survives_a_new_chat_quote(self):
         self.notice.stop_path.write_text("1")
         self.assertTrue(self.notice.stop_requested())
         cfg=Path(self.tmp.name)/"cfg.json"
         cfg.write_text(json.dumps({"schema":"ff-chat-permission-v1","enabled":True}))
         policy=ChatPermissionPolicy(cfg,self.tmp.name)
-        policy.authorize({"agent_id":"a","task_id":"t","owner_chat_permission":{"quote":"да"}})
-        self.assertFalse(self.notice.stop_requested())
+        with self.assertRaisesRegex(ChatPermissionError, "OWNER_STOPPED"):
+            policy.authorize({"agent_id":"a","task_id":"t","owner_chat_permission":{"quote":"да"}})
+        self.assertTrue(self.notice.stop_requested())
 
     def test_script_never_takes_focus_and_main_is_wired(self):
         ps=(MODULES/"cua_owner_notice.ps1").read_text(encoding="utf-8")
@@ -113,7 +114,7 @@ class NoticeTests(unittest.TestCase):
             self.assertIn(needle,guard)
         # every path that really sends input goes through the same guard
         self.assertEqual(main.count("with _visible_input_guard(args):"),3)
-        self.assertEqual(main.count("_owner_stop_check()"),5)  # definition + three call sites + lease cancellation
+        self.assertNotIn("clear_stop",main)
 
 
 if __name__=="__main__":

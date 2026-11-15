@@ -1,5 +1,9 @@
 # Skill-first permission and the browser gap (design, 2026-10-31)
 
+Обновление WB-REV-03: Stop сохраняется до доверенного локального обслуживания;
+цитаты и обычные подписанные разрешения его не снимают. Текущие ограничения,
+проверки и восстановление: [DURABLE_OWNER_STOP_RU.md](DURABLE_OWNER_STOP_RU.md).
+
 Status: skill text, design, and a first runtime slice (staged in this branch, **not deployed** to the live Bridge).
 
 Implemented in this branch (tests in `tests/test_chat_permission.py`, `tests/test_windows_mcp_physical.py`):

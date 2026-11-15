@@ -29,6 +29,12 @@ For operations that need arguments, pass valid JSON through `--args-json`. The r
 
 Use `--timeout` for long operations or `--no-wait` to get the ticket for manual checking. A timeout is an *unknown outcome*, not proof the operation failed: do not retry non-idempotent actions without checking the first result.
 
+## Обязательный адресат задач GitHub
+
+Каждая команда, включая `ping`, требует непустой строковый `target_device` верхнего уровня с точным именем выбранного устройства. Регистр букв по-прежнему не учитывается; пробелы по краям, управляющие символы, `null`, числа, массивы и псевдонимы не принимаются. Поле внутри `args` не заменяет адресат конверта. Поиск устройств через `--list` только читает GitHub и не отправляет команды.
+
+Клиенты используют явно выбранный `--device` либо `config.device`, без подстановки имени компьютера отправителя. Старые задачи без адресата сохраняются, но не исполняются. Перед исправлением и повторной отправкой проверьте исходный результат и журнал на всех устройствах, которые могли получить задачу. Порядок миграции и границы проверки: [обязательный адресат GitHub](docs/security/GITHUB_EXPLICIT_DEVICE_RU.md).
+
 ## ChatGPT agent instructions
 1. Check exact known target device; if user says "friend's laptop", do not silently default to home PC.
 2. Confirm the friend is explicitly paired and has not revoked access (private inbox must exist). Discover via `--list` and choose an exact device.

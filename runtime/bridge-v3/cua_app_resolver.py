@@ -137,10 +137,11 @@ class WindowsInstalledAppResolver:
                 raise AppResolverError("APP_LAUNCH_IDENTITY_CHANGED", {"retry_safe": False})
         if launch_arguments and (resolved["source"] != "explicit_executable" or expected_app is None):
             raise AppResolverError("APP_LAUNCH_ARGUMENTS_REQUIRE_EXACT_EXE")
-        from cua_task_authority import DESKTOP_ACTION_EXPIRY
-        expiry = DESKTOP_ACTION_EXPIRY.get()
-        if expiry is not None and expiry <= time.time():
-            raise AppResolverError("DESKTOP_MODE_EXPIRED", {"retry_safe": False})
+        from cua_task_authority import AuthorityError, check_desktop_action
+        try:
+            check_desktop_action()
+        except AuthorityError as exc:
+            raise AppResolverError(str(exc), {"retry_safe": False}) from exc
         try:
             if os.path.isabs(app_id) and app_id.casefold().endswith(".exe") and os.path.isfile(app_id):
                 proc = subprocess.Popen([app_id, *launch_arguments], close_fds=True)

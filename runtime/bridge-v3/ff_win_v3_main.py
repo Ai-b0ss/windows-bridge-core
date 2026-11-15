@@ -180,7 +180,6 @@ core.desktop_grant_active = _desktop_grant_active
 def _owner_stop_check() -> None:
     """The owner pressed Stop on the notice: revoke the grant for good."""
     if _OWNER_NOTICE.stop_requested():
-        _OWNER_NOTICE.clear_stop()
         _DESKTOP_MODES.revoke_all()  # Stop is the owner's override over every agent's grant
         raise core.RPCError("OWNER_STOPPED", details={"retry_safe": False})
 
@@ -211,6 +210,7 @@ def _physical_lease(args: dict[str, Any], resources: list[str]):
 
 def _focus_window(hwnd: int) -> None:
     """Bring one of the agent's own granted windows to the front (call only inside the input lease)."""
+    _owner_stop_check()
     import time as _time
     user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
     if not user32.IsWindow(hwnd):
@@ -239,6 +239,7 @@ def _focus_window(hwnd: int) -> None:
 def _visible_input_guard(args: dict[str, Any]):
     """Around every action that really sends input to the visible desktop:
     wait while the owner is typing, show the notice, remember when we finished."""
+    _owner_stop_check()
     try:
         _OWNER_ACTIVITY.check()
     except OwnerActive as exc:
@@ -251,6 +252,7 @@ def _visible_input_guard(args: dict[str, Any]):
     except OSError:
         pass  # the notice is a courtesy; it must not break an approved action
     try:
+        _owner_stop_check()
         yield
     finally:
         _OWNER_ACTIVITY.agent_input_done()
