@@ -1,86 +1,86 @@
-# Windows Bridge Full Core
+# Windows Bridge Full Core (`v3`)
 
-**Portable Windows Bridge v3 core** for owner-authorized local Windows system administration and GUI automation.
+**Portable, owner-authorized Windows Bridge v3** for local system administration, developer workflows, background browser automation, and bounded GUI control by AI agents.
 
-- For the complete portable Core, download the pinned [Remote Beta 3 ZIP](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3), extract it and run `INSTALL-FRIEND.cmd`. The GitHub *latest release* may instead be a Skill-only package. Do **not** run `install.ps1` directly from a source checkout: the checked-in source intentionally omits vendor binary ZIP assets.
-- Runs as current Windows user, starts a **127.0.0.1-only** local agent; privileged operations require normal Windows authorization/UAC. Local bridge installation alone **does not grant remote access**.
-- Core includes PowerShell/CMD, Python, process and file operations, native Windows UIA/Win32 GUI routes. Runtime code still contains optional browser/vision paths, but Playwright Chromium and the large PyTorch/OmniParser bundle are excluded from the default package.
-- Browser-specific Playwright/OmniParser capabilities require separately installed dependencies. See `OPTIONAL-ADDONS.md`.
-- No machine/user credentials, preconfigured VPN profiles, private transport logs, Astra project state or old repository history are included.
-- The original private repository is separate. This repository starts from a **clean initial commit**.
+[![Latest Verified Release](https://img.shields.io/badge/release-v2026.11.16--full--core-blue)](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core)
+[![Public Core CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/ci.yml/badge.svg)](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/ci.yml)
+[![Candidate Package & RPC Smoke](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/candidate-install.yml/badge.svg)](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/candidate-install.yml)
+[![Transport & Recovery CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/prelogin-recovery.yml/badge.svg)](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/prelogin-recovery.yml)
 
-## Repository map and maintenance
+---
 
-The canonical source is this public `windows-bridge-core` repository; the old private transport/history lives separately. **`main`, the published Core ZIP and the installed home Bridge are different artifacts until independently verified.** A merged PR does not automatically deploy to the PC.
+## Quick Start (Portable Release ZIP)
 
-- [Repository map, branch cleanup and rollback (RU)](docs/REPOSITORY_MAINTENANCE_RU.md)
-- [Operator guide and runtime updates (RU)](docs/OPERATOR_GUIDE_RU.md)
-- [Architecture and decisions](docs/design/P0_AGENT_PLATFORM.md)
-- [Tests and CI policy](CI_POLICY.md)
-- [Optional prelogin network recovery](tools/prelogin-recovery/README.md) — not bundled into the portable Core ZIP
+1. Download **`Windows-Bridge-Full-Core-Remote-20261116-verified.zip`** (and verify against `SHA256SUMS.txt`) from the [**Latest Release (`v2026.11.16-full-core`)**](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core).
+   - *Do not run `install.ps1` directly from a raw `git clone`: the repository intentionally excludes binary vendor archives (`Python 3.13.9`, `Node.js 22.14.0`, `GitHub CLI 2.101.0`), which are assembled deterministically by `tools/build_portable_release.py`.*
+2. Extract the archive and run **`INSTALL-FRIEND.cmd`** (or `powershell -ExecutionPolicy Bypass -File install.ps1`).
+3. Run **`CHECK-BRIDGE.cmd`** to verify local health (`127.0.0.1:39073`). To start/restart manually: `%LOCALAPPDATA%\FF-Windows-Bridge\START-FF.cmd`.
+4. Optional ChatGPT / Agent Skills: download `Windows-Bridge-ChatGPT-Skill.zip` or `Windows-Bridge-ChatGPT-Plugin.zip` from the same release and follow [`CHATGPT-SKILL-INSTALL.md`](CHATGPT-SKILL-INSTALL.md).
 
-## Usage
+Local installation binds **strictly to `127.0.0.1`** under the current Windows user and **never opens remote access by itself**. Remote transports (Cloudflare Worker tunnel or private GitHub inbox) must be paired explicitly by the device owner.
 
-Install: `INSTALL-FRIEND.cmd` from a **release ZIP**. Check: `CHECK-BRIDGE.cmd`. If installation is successful, run `%LOCALAPPDATA%\FF-Windows-Bridge\START-FF.cmd` to restart.
+---
 
-Remote support: the device owner must explicitly pair an approved secure remote-access client/transport separately; never embed existing Cloudflare or GitHub tokens into a portable release.
+## Key Capabilities & Architecture (`v2026.11.16-full-core`)
 
-## CI safety
+| Subsystem | What It Provides | Reference |
+| :--- | :--- | :--- |
+| **Core Loopback Runtime** (`runtime/bridge-v3/`) | PowerShell/CMD/Python execution, process & file ops, detached session ownership verification (`pid + create_time`), UIA/Win32 & hidden desktop automation, pooled `Windows-MCP` worker (`~1.4s` warm calls). | [`docs/OPERATOR_GUIDE_RU.md`](docs/OPERATOR_GUIDE_RU.md) |
+| **Owner's Chrome Without Mouse** (`cua_browser_*`) | Attaches to the owner's signed-in Chrome via the Playwright extension in an isolated agent tab (`attach -> new_tab -> find -> act -> close`) without stealing focus, mouse, or keyboard. | [`skills/windows-bridge/SKILL.md`](skills/windows-bridge/SKILL.md) |
+| **Skill-First Consent & Per-Window Grants** (`cua_chat_permission.py`, `cua_task_authority.py`) | Local opt-in (`state/chat-permission.json`), verbatim chat quote binding (`owner_chat_permission`), concurrent per-window grants (`hwnd + pid + create_time`), `OWNER_ACTIVE` physical-input pause, and rotating `scope_report` audit logs. | [`docs/design/SKILL_FIRST_PERMISSION.md`](docs/design/SKILL_FIRST_PERMISSION.md), [`docs/design/PER_WINDOW_GRANTS.md`](docs/design/PER_WINDOW_GRANTS.md) |
+| **Durable Owner Stop Latch** (`cua_owner_stop.py`) | Clicking **Stop** on the non-focus on-screen banner writes a persistent `stop.flag` latch across restarts that blocks desktop input and guarded effects until locally cleared by the owner. | [`docs/design/DURABLE_OWNER_STOP_RU.md`](docs/design/DURABLE_OWNER_STOP_RU.md) |
+| **Zero-Drop Hot Handover & Cold Rollback** (`cua_socket_transfer.py`, `cua_runtime_deploy.py`, `tools/cua_cold_*`) | WinSock listener socket transfer (`WSADuplicateSocket` / `adopt_listener`) eliminates `WinError 10054` during live updates; transactional `/journal/v2` deployer + offline SHA-verified cold rollback bundle & external Task Scheduler watchdog with `.cua-cold-maintenance.lock` keeper coordination. | [`docs/design/WINDOWS_SOCKET_HANDOVER_RU.md`](docs/design/WINDOWS_SOCKET_HANDOVER_RU.md), [`docs/OPERATOR_COLD_UPGRADE_RU.md`](docs/OPERATOR_COLD_UPGRADE_RU.md) |
+| **Cloudflare FlightController & ContextShield `v0.5.1`** (`tools/cf-flight-controller/`) | Protects calls exceeding the 20s edge timeout via `12.5s` soft async handover (`__flight_poll`), idempotent `__dedupe_key` replay suppression, automatic `39073 -> 39076` port failover, and `>20 KB` output spillover compaction. | [`docs/design/CF_FLIGHT_CONTROLLER_RU.md`](docs/design/CF_FLIGHT_CONTROLLER_RU.md) |
+| **Private GitHub Transport & Prelogin Supervisor** (`runtime/github-transport/`, `tools/prelogin-recovery/`) | Private-repo GitHub Issues/Actions transport with lease & outbox crash recovery, explicit multi-device targeting, and prelogin network recovery supervisor. | [`REMOTE-PAIRING.md`](REMOTE-PAIRING.md), [`docs/GITHUB_RETRY_RECOVERY_RU.md`](docs/GITHUB_RETRY_RECOVERY_RU.md), [`tools/prelogin-recovery/README.md`](tools/prelogin-recovery/README.md) |
+| **Optional Offline Addons** (`tools/optional_addons.py`) | Keeps the Full Core ZIP compact (~61.8 MB) while supporting SHA-256-pinned offline installation of Playwright Chromium and visual/OmniParser runtimes via `ADDONS.cmd`. | [`OPTIONAL-ADDONS.md`](OPTIONAL-ADDONS.md) |
 
-GitHub Actions must use GitHub-hosted standard runners only. Never run untrusted fork pull requests on private self-hosted Windows machines.
+---
 
-This core was derived from the archived, checked source snapshot `c034e527a77b737b266c3c7df8b8521032be6f8a` and repackaged for optional heavy dependencies. The original full archive is not part of the public history.
+## Three-Way Provenance Rule
 
-## Optional consented remote pairing
+`main` in this public repository, a published portable Release ZIP, and an installed runtime on a Windows PC are **three distinct artifacts** until verified:
+- Merging a PR into `main` does **not** mutate published release archives or auto-deploy to any PC.
+- `tools/build_portable_release.py` verifies every bundled file byte-for-byte against `git archive <HEAD>` (`core.autocrlf=false`), scans text files against credential regexes, and embeds `public_source_commit` into `release-manifest.json`.
+- `python tools/runtime_parity.py --installed <BRIDGE_ROOT>/bridge-v3 --ref origin/main --disk` verifies byte-exact SHA-256 parity between `origin/main` and an installed `bridge-v3` directory without exposing file contents or local paths.
 
-For a **separate private GitHub transport**, see [REMOTE-PAIRING.md](REMOTE-PAIRING.md). The friend must accept the repository collaboration invitation and explicitly run `PAIR-REMOTE-SUPPORT.cmd` from a release ZIP. **Do not use the public source repository as the remote execution inbox.**
+---
 
-## Operator guide (Russian)
+## Documentation Map
 
-[docs/OPERATOR_GUIDE_RU.md](docs/OPERATOR_GUIDE_RU.md): how the two layers fit together, how the owner's chat "yes" opens a bounded desktop grant, how to enable/disable it, the on-screen notice and Stop button, the journal and `scope_report`, the owner's-Chrome route, deploy/rollback steps and error codes.
+### Operator & Maintenance Guides
+- [**Operator Guide / Руководство владельца (RU)**](docs/OPERATOR_GUIDE_RU.md) — architecture, chat consent, durable `Stop`, Chrome without mouse, hot updates, and response codes.
+- [**Cold Upgrade & Watchdog / Холодное обновление (RU)**](docs/OPERATOR_COLD_UPGRADE_RU.md) — `cua_cold_rollback_bundle.py`, standalone recovery kit, `cua_cold_recovery_watchdog.py`, and `39073` / `39076` dual-port safety.
+- [**Repository Maintenance / Сопровождение репозитория (RU)**](docs/REPOSITORY_MAINTENANCE_RU.md) — directory layout, branch & squash-merge rules, and artifact parity.
+- [**Migration Provenance / Проверка происхождения установки (RU)**](docs/MIGRATION_PROVENANCE_RU.md) — strict `manifest.json` verification against Git objects.
+- [**Instructions for AI Agents (`AGENTS.md`)**](AGENTS.md) — binding trust model, routing order, testing, and privacy rules.
+- [**Continuous Integration Policy (`CI_POLICY.md`)**](CI_POLICY.md) — free GitHub-hosted runner rules, active workflows, and open acceptance queue.
 
-## Managing paired devices from ChatGPT
+### Pairing, Skills & Addons
+- [**ChatGPT Skill & Plugin Packaging**](CHATGPT-SKILL-INSTALL.md)
+- [**Managing Paired Devices from ChatGPT**](CHATGPT-REMOTE-CONTROL.md)
+- [**Consented Private GitHub Remote Pairing**](REMOTE-PAIRING.md)
+- [**Optional Browser & Vision Addons**](OPTIONAL-ADDONS.md)
 
-[CHATGPT-REMOTE-CONTROL.md](CHATGPT-REMOTE-CONTROL.md) documents exact device discovery, private GitHub transport command/results, owner authentication, required friend consent and safe shutdown. Optional no-token CLI: `python tools/bridge_remote_gh.py --list`.
+### Architecture & Security Specifications (`docs/design/` & `docs/security/`)
+- [`WINDOWS_SOCKET_HANDOVER_RU.md`](docs/design/WINDOWS_SOCKET_HANDOVER_RU.md) — zero-drop WinSock listener socket transfer.
+- [`CF_FLIGHT_CONTROLLER_RU.md`](docs/design/CF_FLIGHT_CONTROLLER_RU.md) — async `FlightController` and `ContextShield` log spillover.
+- [`DURABLE_OWNER_STOP_RU.md`](docs/design/DURABLE_OWNER_STOP_RU.md) — persistent `Stop` latch across restarts.
+- [`GITHUB_OUTBOX_RECOVERY_RU.md`](docs/design/GITHUB_OUTBOX_RECOVERY_RU.md) & [`GITHUB_EXPLICIT_DEVICE_RU.md`](docs/security/GITHUB_EXPLICIT_DEVICE_RU.md) — reliable delivery and explicit device targeting in GitHub transport.
+- [`SKILL_FIRST_PERMISSION.md`](docs/design/SKILL_FIRST_PERMISSION.md) & [`PER_WINDOW_GRANTS.md`](docs/design/PER_WINDOW_GRANTS.md) — trust model and per-window desktop grants.
+- [`P0_AGENT_PLATFORM.md`](docs/design/P0_AGENT_PLATFORM.md), [`P0_DURABLE_TASK_RECOVERY.md`](docs/design/P0_DURABLE_TASK_RECOVERY.md), [`P0_DETACHED_SESSION_IDENTITY.md`](docs/design/P0_DETACHED_SESSION_IDENTITY.md), [`P0_JOB_SESSION_CLEANUP.md`](docs/design/P0_JOB_SESSION_CLEANUP.md), [`P0_PERMISSION_BROKER.md`](docs/design/P0_PERMISSION_BROKER.md), [`P0_VENDOR_CLI_CONTRACTS.md`](docs/design/P0_VENDOR_CLI_CONTRACTS.md), [`P0_AGENT_WORKFLOW_DISCOVERY.md`](docs/design/P0_AGENT_WORKFLOW_DISCOVERY.md), [`P0_HIDDEN_NATIVE_ACCEPTANCE.md`](docs/design/P0_HIDDEN_NATIVE_ACCEPTANCE.md).
+- [**Historical Archive (`docs/archive/`)**](docs/archive/README.md) — superseded design drafts and branch cleanup manifests.
 
-## Public free CI and private-source separation
+---
 
-See [CI_POLICY.md](CI_POLICY.md) for free GitHub-hosted Windows/Linux checks, clean-release smoke runs, private repository safety and the rule against using personal Windows runners for untrusted public pull requests.
+## Verification Boundary & Open Hardware/Host Gates
 
-## Current lightweight release — Remote Beta 3
+Automated CI on GitHub-hosted Windows/Linux runners verifies source compilation, unit/contract suites (`546+` Python tests + Node transport/supervisor suites), clean portable ZIP assembly, isolated `install.ps1` bootstrap, and loopback RPC smoke tests. Real hardware/account acceptance gates that require physical multi-device or host-UI trials remain tracked openly:
+- [#4](https://github.com/Ai-b0ss/windows-bridge-core/issues/4) — Real second-device pairing, consent, and remote round-trip (`P0`).
+- [#6](https://github.com/Ai-b0ss/windows-bridge-core/issues/6) — Optional browser/vision offline addon validation across target workloads (`P1`).
+- [#7](https://github.com/Ai-b0ss/windows-bridge-core/issues/7) — CLI/API-first Windows automation routing with native hidden UI fallback (`P1`).
+- [#14](https://github.com/Ai-b0ss/windows-bridge-core/issues/14) — Automatic Windows Bridge Skill selection across independent prompts in a fresh ChatGPT chat (`P0`).
+- [#16](https://github.com/Ai-b0ss/windows-bridge-core/issues/16) — Three-way parity & end-to-end task-capable Cursor / Antigravity / Office acceptance (`P0`).
 
-Source `main` and the published Beta 3 ZIP have different bytes. A merged fix
-does not update that download or an already running installation.
+## Privacy & Clean Provenance
 
-For maintainer builds, `tools/build_portable_release.py` requires the pinned
-previous asset ZIP and verifies every bundled source file against the selected
-Git commit before writing `public_source_commit`. Modified, missing and
-untracked bundled source is refused, even when the index marks it unchanged.
-Use a clean checkout with `core.autocrlf=false`; line-ending conversion changes
-package bytes. The manifest records source-byte verification separately from
-installation or running-process acceptance, which must still be tested.
-
-[Download Windows Bridge Full Core Remote Beta 3](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3) (61.79 MB). It includes `ADDONS.cmd` for optional offline, pinned browser/vision installs; it does not bundle the heavy binaries. Follow [OPTIONAL-ADDONS.md](OPTIONAL-ADDONS.md). The pairing flow still requires explicit consent and a private GitHub transport.
-
-## P0: Verified agent orchestration and ChatGPT skill
-
-Read [P0_AGENT_PLATFORM.md](docs/design/P0_AGENT_PLATFORM.md) for verified three-way runtime audit, new no-effect route preflight (computer_use.command=plan_action), the [Windows Bridge Skill source](skills/windows-bridge/SKILL.md), missing host-side permission attestation and explicit acceptance gates. Skill source committed in GitHub is not proof it auto-activates in ChatGPT. The installed home Bridge is intentionally unchanged.
-
-### P0 — Device-bound owner consent
-
-[Permission Broker design and test status](docs/design/P0_PERMISSION_BROKER.md): signed approvals bind the exact device/agent/task/action/TTL, reject legacy unbound grants and provide local revocation. This is a local authorization foundation, **not** a claim that ChatGPT host-attested consent is integrated.
-
-### P0 — Inspect real Cursor/Antigravity CLI contracts
-
-[Bounded and redacted CLI capability audit](docs/design/P0_VENDOR_CLI_CONTRACTS.md) is implemented in `task_preflight` as an explicit opt-in. Status/Help/version checks are **not** proof of model entitlement or agent task success.
-
-### P0 — Durable task recovery
-
-[At-most-once request admission and unknown-outcome handling](docs/design/P0_DURABLE_TASK_RECOVERY.md): actual RPC duplicate suppression; isolated test-root journals; no automatic replay after lost responses. Full live-process restart still pending.
-
-
-### P0 — Detached session identity
-
-[Windows PID reuse and detached log ownership verification](docs/design/P0_DETACHED_SESSION_IDENTITY.md) prevents accidentally resuming or acting on a different process after restart.
-### P0 — Agent discovery without separate Skills
-[Read-only agent_workflows protocol](docs/design/P0_AGENT_WORKFLOW_DISCOVERY.md) through the existing MCP Bridge and capabilities; does not imply automatic activation or permissions.
+This repository starts from a clean audited initial commit (`200a50ec1592b3731d307838dd370a57cd1383c9`) and contains **no** machine hostnames, local user paths, VPN profiles, Cloudflare/GitHub tokens, or private operational logs. Never attach personal self-hosted Windows runners to public pull requests; see [`CI_POLICY.md`](CI_POLICY.md).

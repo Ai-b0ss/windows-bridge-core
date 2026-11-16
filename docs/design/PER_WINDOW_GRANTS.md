@@ -43,6 +43,6 @@ although the windows were different.
 
 ## Limits
 
-- Leases live in one Bridge process. During a blue-green overlap (SEAMLESS_UPDATE.md) the old and new
+- Leases live in one Bridge process. During a blue-green overlap (WINDOWS_SOCKET_HANDOVER_RU.md) the old and new
   process each have their own lease table; do not run physical input from both at once.
 - The physical mouse is still one mouse: actions of different agents alternate, they do not run together.

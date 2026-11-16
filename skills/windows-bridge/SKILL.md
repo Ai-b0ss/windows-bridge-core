@@ -84,7 +84,7 @@ Check `capabilities.features.owner_chat_permission`. If `enabled` is true, after
 
 ## Claude Desktop on the owner's PC (not Claude Code CLI)
 
-When the owner asks to control **Claude Desktop** (its windows, chat, Usage, settings, Cowork), the native app is the target. Never substitute the `claude` CLI or a new model session. Verify the real process and window (`gui_list_windows`, `computer_use(command="windows_mcp",tool="Snapshot")`) and do not mix `Claude.exe` (GUI) with `claude.exe` (CLI). Do not sign out, change credentials, auto-send or close arbitrary windows. The temporary trusted-input pilot (`trusted_skill_status`) may be used only when it reports `enabled=true` and `allowed_purpose` exactly matches the task; see `docs/design/TEMPORARY_SKILL_PILOT.md`.
+When the owner asks to control **Claude Desktop** (its windows, chat, Usage, settings, Cowork), the native app is the target. Never substitute the `claude` CLI or a new model session. Verify the real process and window (`gui_list_windows`, `computer_use(command="windows_mcp",tool="Snapshot")`) and do not mix `Claude.exe` (GUI) with `claude.exe` (CLI). Do not sign out, change credentials, auto-send or close arbitrary windows. The temporary trusted-input pilot (`trusted_skill_status`) may be used only when it reports `enabled=true` and `allowed_purpose` exactly matches the task; see `docs/archive/TEMPORARY_SKILL_PILOT.md`.
 
 ## References
 

@@ -179,7 +179,7 @@ class SnapshotSafety(unittest.TestCase):
 
     def test_win32_process_39076_peer_allowed_but_39073_or_keeper_blocked(self):
         # Direct regression for the owner's live C:-junction prelogin process:
-        # WIN-2LK6007IEBP PID 18096 serves --port 39076 while 39073 is offline.
+        # Prelogin fallback instance serves --port 39076 while 39073 is offline.
         from unittest import mock
         alias = str(self.root / "ff_win_v3_main.py")
         peer = {"ProcessId": 18096, "Name": "python.exe",
