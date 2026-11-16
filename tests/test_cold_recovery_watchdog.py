@@ -179,6 +179,17 @@ class RecoveryWatchdogTests(unittest.TestCase):
                                          restore=restore_mock, restart=restart_mock)
         self.assertEqual(calls, ["keeper_launcher", "candidate", "keeper"])
 
+    def test_isolated_drill_passes_strict_all_instance_quiescence_scope(self):
+        drill_state = dict(self.data, isolated_drill=True, port=49373, peer_port=49376, keeper_task=None)
+        with (mock.patch.object(watch, "probe_agent", return_value=None),
+              mock.patch.object(watch.bundle, "assert_runtime_quiescent",
+                                return_value={"peer_pids": [], "target_port": None}) as guard):
+            restore = mock.Mock(return_value={"ok": True, "restored_files": 113})
+            res = watch.recover_failed_rollout(drill_state, terminate=mock.Mock(), restore=restore)
+            self.assertTrue(res["rollback_executed"])
+            self.assertEqual(guard.call_args.kwargs, {"target_port": None, "peer_port": None})
+            self.assertEqual(restore.call_args.kwargs, {"offline_confirmed": True, "target_port": None, "peer_port": None})
+
 
 if __name__ == "__main__":
     unittest.main()

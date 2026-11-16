@@ -244,10 +244,12 @@ def recover_failed_rollout(state: dict, *,
         terminate(state, "keeper")
         # Even a correctly terminated planned PID is not proof that no unrelated
         # agent uses the shared installed directory.
-        bundle.assert_runtime_quiescent(runtime, target_port=state["port"],
-                                        peer_port=state["peer_port"])
+        tp = None if state.get("isolated_drill") is True else state["port"]
+        pp = None if state.get("isolated_drill") is True else state["peer_port"]
+        bundle.assert_runtime_quiescent(runtime, target_port=tp,
+                                        peer_port=pp)
         restored = restore(snapshot, runtime, offline_confirmed=True,
-                           target_port=state["port"], peer_port=state["peer_port"])
+                           target_port=tp, peer_port=pp)
     finally:
         _clear_maintenance_lock(runtime)
     restart(state)

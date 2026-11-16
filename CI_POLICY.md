@@ -21,7 +21,7 @@
 4. **`.github/workflows/windows-bridge-local-safety.yml` (`Windows Bridge local safety regressions`)** — path-scoped on owner-guard/browser files and manual `workflow_dispatch` (`ubuntu-latest`):
    - Verifies owner activity guard, iframe navigation rules, and safe owner Chrome attach logic.
 5. **`.github/workflows/portable-release-smoke.yml` (`Portable Release Windows Smoke`)** — manual `workflow_dispatch` (`tag` + `sha256`, `windows-latest`):
-   - Downloads an **already published GitHub Release ZIP**, enforces its exact SHA-256, runs a clean isolated install on `windows-latest`, verifies loopback-only listening (`127.0.0.1`) and `installed_package_smoke.py`, and cleans up all test processes.
+   - Downloads an **already published GitHub Release ZIP**, enforces its exact SHA-256, runs a clean isolated install on `windows-latest`, verifies `-StageOnly` and `-Transport Local` installation, `ADDONS.cmd` / `optional_addons.py status` defaults, and strict loopback-only listening (`127.0.0.1:47061`), then cleans up all test processes (full RPC `installed_package_smoke.py` runs in `candidate-install.yml` and operator release verification).
 
 *Note on disabled historical workflows:* Four one-time maintenance/release workflows (`final-reviewed-branch-cleanup.yml`, `merged-branch-housekeeping.yml`, `publish-verified-full-core.yml`, `retire-two-reviewed-branches.yml`) remain in `.github/workflows/` in `disabled_manually` state via GitHub API so they never trigger automatically when pushing with standard `repo`-scoped tokens (without `workflow` OAuth scope).
 
