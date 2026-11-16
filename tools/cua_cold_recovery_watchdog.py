@@ -26,6 +26,8 @@ import ff_win_process_identity as identity
 
 SCHEMA = "ff-bridge-rollback-watchdog/v1"
 MAX_WAIT_SECONDS = 300
+MAINTENANCE_LOCK_NAME = ".cua-cold-maintenance.lock"
+MAINTENANCE_LOCK_TTL_SECONDS = 300
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -50,7 +52,14 @@ def _state(path: Path) -> dict:
         old_expected = data["old_agent_sha256"]
     except (ValueError, TypeError, KeyError) as exc:
         raise RuntimeError("WATCH_STATE_INVALID") from exc
-    if (type(data.get("peer_port")) is not int
+    isolated_drill = data.get("isolated_drill") is True
+    if isolated_drill:
+        live_default = Path(os.environ.get("LOCALAPPDATA", "")) / "FF-Windows-Bridge" / "bridge-v3"
+        if port in (39073, 39076) or (live_default.exists() and target.resolve() == live_default.resolve()):
+            raise RuntimeError("WATCH_DRILL_MUST_BE_ISOLATED")
+        if type(data.get("peer_port")) is not int or data["peer_port"] == port:
+            raise RuntimeError("WATCH_PEER_PORT_SCOPE_INVALID")
+    elif (type(data.get("peer_port")) is not int
             or (port, data["peer_port"]) != (39073, 39076)):
         raise RuntimeError("WATCH_PEER_PORT_SCOPE_INVALID")
     if (type(port) is not int or not 1024 <= port <= 65535
@@ -179,7 +188,32 @@ def _check_candidate(state: dict) -> bool:
     return identity.process_identity_matches(*pair)
 
 
+def _write_maintenance_lock(runtime: Path, ttl_seconds: int = MAINTENANCE_LOCK_TTL_SECONDS) -> Path:
+    lock_path = runtime / MAINTENANCE_LOCK_NAME
+    now = int(time.time())
+    payload = {
+        "schema": "ff-cold-maintenance-lock/v1",
+        "created_epoch": now,
+        "expires_epoch": now + ttl_seconds,
+        "ttl_seconds": ttl_seconds,
+        "owner": "cua_cold_recovery_watchdog",
+    }
+    bundle._atomic_write(lock_path, (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+    return lock_path
+
+
+def _clear_maintenance_lock(runtime: Path) -> None:
+    lock_path = runtime / MAINTENANCE_LOCK_NAME
+    try:
+        if lock_path.is_file() and not lock_path.is_symlink():
+            lock_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _start_original_keeper(state: dict) -> None:
+    if state.get("isolated_drill") is True and state.get("keeper_task") is None:
+        return
     task = state.get("keeper_task")
     if task != "FF-Bridge-V3-Keeper":
         raise RuntimeError("WATCH_KEEPER_TASK_NOT_ALLOWED")
@@ -202,18 +236,23 @@ def recover_failed_rollout(state: dict, *,
     pair = _live_identity(state, "candidate")
     if current and (pair is None or current.get("pid") != pair[0]):
         raise RuntimeError("WATCH_UNKNOWN_AGENT_OWNS_PORT")
-    if state.get("keeper_launcher_pid") is not None or state.get("keeper_launcher_token") is not None:
-        terminate(state, "keeper_launcher")
-    terminate(state, "candidate")
-    terminate(state, "keeper")
-    # Even a correctly terminated planned PID is not proof that no unrelated
-    # agent uses the shared installed directory.
-    bundle.assert_runtime_quiescent(runtime, target_port=state["port"],
-                                    peer_port=state["peer_port"])
-    restored = restore(snapshot, runtime, offline_confirmed=True,
-                       target_port=state["port"], peer_port=state["peer_port"])
+    _write_maintenance_lock(runtime)
+    try:
+        if state.get("keeper_launcher_pid") is not None or state.get("keeper_launcher_token") is not None:
+            terminate(state, "keeper_launcher")
+        terminate(state, "candidate")
+        terminate(state, "keeper")
+        # Even a correctly terminated planned PID is not proof that no unrelated
+        # agent uses the shared installed directory.
+        bundle.assert_runtime_quiescent(runtime, target_port=state["port"],
+                                        peer_port=state["peer_port"])
+        restored = restore(snapshot, runtime, offline_confirmed=True,
+                           target_port=state["port"], peer_port=state["peer_port"])
+    finally:
+        _clear_maintenance_lock(runtime)
     restart(state)
-    return {"ok": True, "rollback": "restored", "files": restored["restored_files"],
+    return {"ok": True, "rollback": "restored", "rollback_executed": True,
+            "files": restored["restored_files"],
             "pending_external_health_confirmation": True}
 
 

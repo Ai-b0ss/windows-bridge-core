@@ -1,7 +1,6 @@
 """Deterministic guardrails for independent cold-rollout rollback watchdog."""
 from __future__ import annotations
 import json
-import os
 from pathlib import Path
 import sys
 import tempfile
@@ -52,13 +51,14 @@ class RecoveryWatchdogTests(unittest.TestCase):
     def test_deadline_triggers_verified_recovery(self):
         state = dict(self.data, deadline_epoch=2)
         counter = iter((0, 1, 2, 3))
-        recover = mock.Mock(return_value={"rollback": "restored", "files": 109})
+        recover = mock.Mock(return_value={"rollback": "restored", "rollback_executed": True, "files": 109})
         with (mock.patch.object(watch, "_state", return_value=state),
               mock.patch.object(watch, "_write_receipt") as receipt):
             result = watch.run(self.root / "arm.json", clock=lambda: next(counter),
                                sleep=lambda _: None, ready=lambda _: False, recover=recover)
             self.assertTrue(result["ok"])
             self.assertEqual(result["status"], "rollback_performed")
+            self.assertTrue(result["rollback_executed"])
             recover.assert_called_once_with(state)
             receipt.assert_called_once()
 
@@ -72,15 +72,31 @@ class RecoveryWatchdogTests(unittest.TestCase):
             terminate.assert_not_called()
             restore.assert_not_called()
 
-    def test_recovery_passes_port_scope_to_both_independent_checks(self):
+    def test_recovery_passes_port_scope_and_manages_maintenance_lock(self):
+        lock_file = self.root / "runtime" / watch.MAINTENANCE_LOCK_NAME
+        lock_states = {}
+
+        def fake_restore(*args, **kwargs):
+            lock_states["during_restore_exists"] = lock_file.is_file()
+            lock_states["during_restore_payload"] = json.loads(lock_file.read_text("utf-8"))
+            return {"ok": True, "restored_files": 113}
+
+        def fake_restart(st):
+            lock_states["during_restart_exists"] = lock_file.exists()
+
         with (mock.patch.object(watch, "probe_agent", return_value=None),
               mock.patch.object(watch.bundle, "assert_runtime_quiescent",
                                 return_value={"peer_pids": [18096], "target_port": 39073}) as guard):
-            restore = mock.Mock(return_value={"ok": True, "restored_files": 109})
-            restart = mock.Mock()
+            restore = mock.Mock(side_effect=fake_restore)
+            restart = mock.Mock(side_effect=fake_restart)
             result = watch.recover_failed_rollout(self.data, terminate=mock.Mock(),
                                                    restore=restore, restart=restart)
             self.assertEqual(result["rollback"], "restored")
+            self.assertTrue(result["rollback_executed"])
+            self.assertTrue(lock_states["during_restore_exists"])
+            self.assertEqual(lock_states["during_restore_payload"]["schema"], "ff-cold-maintenance-lock/v1")
+            self.assertFalse(lock_states["during_restart_exists"])
+            self.assertFalse(lock_file.exists())
             self.assertEqual(guard.call_args.kwargs,
                              {"target_port": 39073, "peer_port": 39076})
             self.assertEqual(restore.call_args.kwargs,
@@ -88,7 +104,8 @@ class RecoveryWatchdogTests(unittest.TestCase):
                               "peer_port": 39076})
             restart.assert_called_once()
 
-    def test_shared_runtime_blocks_restore_even_after_termination(self):
+    def test_shared_runtime_blocks_restore_and_clears_lock_on_error(self):
+        lock_file = self.root / "runtime" / watch.MAINTENANCE_LOCK_NAME
         with (mock.patch.object(watch, "probe_agent", return_value=None),
               mock.patch.object(watch.bundle, "assert_runtime_quiescent",
                                 side_effect=RuntimeError("RESTORE_RUNTIME_STILL_RUNNING")),
@@ -97,6 +114,7 @@ class RecoveryWatchdogTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "RESTORE_RUNTIME_STILL_RUNNING"):
                 watch.recover_failed_rollout(self.data, terminate=terminate)
             self.assertEqual(terminate.call_count, 2)
+            self.assertFalse(lock_file.exists())
             restore.assert_not_called()
 
     def test_unknown_pid_is_not_terminated(self):
@@ -113,7 +131,7 @@ class RecoveryWatchdogTests(unittest.TestCase):
                 watch._safe_terminate_known(self.data, "candidate")
             ref.assert_not_called()
 
-    def test_invalid_or_unarmed_state_rejected(self):
+    def test_invalid_or_unarmed_state_and_isolated_drill_guard(self):
         p = self.root / "watch.json"
         p.write_text(json.dumps(self.data), encoding="utf-8")
         with mock.patch.object(watch.bundle, "verify_bundle", return_value={
@@ -127,6 +145,13 @@ class RecoveryWatchdogTests(unittest.TestCase):
             p.write_text(json.dumps(d), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "WATCH_NOT_AUTHORIZED"):
                 watch._state(p)
+            drill_bad = dict(self.data, isolated_drill=True, port=39073, peer_port=49999)
+            p.write_text(json.dumps(drill_bad), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "WATCH_DRILL_MUST_BE_ISOLATED"):
+                watch._state(p)
+            drill_ok = dict(self.data, isolated_drill=True, port=49173, peer_port=49176, keeper_task=None)
+            p.write_text(json.dumps(drill_ok), encoding="utf-8")
+            self.assertEqual(watch._state(p)["port"], 49173)
 
     def test_watchdog_reports_rollback_blocker_not_success(self):
         state = dict(self.data, deadline_epoch=0)
@@ -138,7 +163,6 @@ class RecoveryWatchdogTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertEqual(result["status"], "rollback_blocked")
             receipt.assert_called_once()
-
 
     def test_optional_keeper_launcher_terminated_before_keeper_and_candidate(self):
         data = dict(self.data, keeper_launcher_pid=12128, keeper_launcher_token=776655)

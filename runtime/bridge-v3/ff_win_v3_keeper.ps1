@@ -1,4 +1,4 @@
-param([switch]$ProbeRelayCloud)
+param([switch]$ProbeRelayCloud, [switch]$LoadFunctionsOnly)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
@@ -8,7 +8,7 @@ $ErrorActionPreference = 'SilentlyContinue'
 # the atomic ownership boundary for all real keeper instances.
 $keeperMutex = $null
 $keeperMutexOwned = $false
-if (-not $ProbeRelayCloud) {
+if (-not $ProbeRelayCloud -and -not $LoadFunctionsOnly) {
     try {
         try {
             $keeperMutex = [System.Threading.Mutex]::new($false, 'Global\FF-Windows-Bridge-V3-Keeper')
@@ -47,9 +47,11 @@ $continuationDaemonPidPath = Join-Path $continuationsRoot 'continuation_daemon.p
 $continuationDaemon = Join-Path $root 'cua_session_continuation.py'
 $ownerChromeBootstrap = Join-Path $root 'cua_owner_chrome_logon.ps1'
 $runtimeDeployLock = Join-Path $root '.cua-runtime-deploy-lock.json'
+$coldMaintenanceLock = Join-Path $root '.cua-cold-maintenance.lock'
+$coldMaintenanceMaxTtlSeconds = 300
 $port = 39073
 
-if (-not $ProbeRelayCloud) {
+if (-not $ProbeRelayCloud -and -not $LoadFunctionsOnly) {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     Set-Content -LiteralPath $keeperPidPath -Value $PID -Encoding ASCII
 }
@@ -375,12 +377,56 @@ function Get-FF3AgentProcesses {
     } catch { throw }
 }
 
+function Test-FF3ColdMaintenanceLockActive {
+    param(
+        [string]$LockPath = $coldMaintenanceLock,
+        [int]$MaxTtlSeconds = $coldMaintenanceMaxTtlSeconds
+    )
+    if (-not (Test-Path -LiteralPath $LockPath -PathType Leaf)) { return $false }
+    try {
+        $item = Get-Item -LiteralPath $LockPath -ErrorAction Stop
+        $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $mtimeEpoch = ([DateTimeOffset]$item.LastWriteTimeUtc).ToUnixTimeSeconds()
+        if ($mtimeEpoch -gt ($nowEpoch + 60)) { $mtimeEpoch = $nowEpoch }
+        $effectiveExpiry = [double]($mtimeEpoch + $MaxTtlSeconds)
+        try {
+            $raw = Get-Content -LiteralPath $LockPath -Raw -ErrorAction Stop
+            if ($raw -and $raw.Trim().StartsWith('{')) {
+                $doc = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($null -ne $doc.expires_epoch) {
+                    $parsedExpiry = [double]$doc.expires_epoch
+                    if ($parsedExpiry -lt $effectiveExpiry) {
+                        $effectiveExpiry = $parsedExpiry
+                    }
+                } elseif ($null -ne $doc.created_epoch -and $null -ne $doc.ttl_seconds) {
+                    $ttl = [Math]::Min([Math]::Max([double]$doc.ttl_seconds, 1.0), [double]$MaxTtlSeconds)
+                    $parsedExpiry = [double]$doc.created_epoch + $ttl
+                    if ($parsedExpiry -lt $effectiveExpiry) {
+                        $effectiveExpiry = $parsedExpiry
+                    }
+                }
+            }
+        } catch {}
+        if ([double]$nowEpoch -lt $effectiveExpiry) {
+            return $true
+        }
+        Write-FF3RelayWatchdogLog ('cold_maintenance_lock_expired_ignored:age_s=' + ($nowEpoch - $mtimeEpoch))
+        return $false
+    } catch {
+        return $false
+    }
+}
+
 function Test-FF3AgentStartAllowed {
     # A failed HTTP health probe is not evidence that a live process or its
     # jobs are safe to terminate. Only respawn after verified absence. An
     # unresponsive live agent remains diagnosable; trusted runtime deployment
     # owns its separately verified stop/backup/recovery transaction.
     if (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf) { return $false }
+    if (Test-FF3ColdMaintenanceLockActive -LockPath $coldMaintenanceLock) {
+        Write-FF3RelayWatchdogLog 'agent_restart_suppressed:cold_maintenance_lock'
+        return $false
+    }
     try {
         $existing = @(Get-FF3AgentProcesses)
         if ($existing.Count -gt 0) {
@@ -425,6 +471,8 @@ if ($ProbeRelayCloud) {
     if ($probeOk) { exit 0 } else { exit 2 }
 }
 
+if ($LoadFunctionsOnly) { return }
+
 $lastRelayProbe = [datetime]::MinValue
 $relayEndpointFailures = 0
 $relayCloudFailures = 0
@@ -449,7 +497,7 @@ try {
 
 try {
     while ($true) {
-        if (-not (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf)) {
+        if ((-not (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf)) -and (-not (Test-FF3ColdMaintenanceLockActive -LockPath $coldMaintenanceLock))) {
             $agentHealthy = Test-FF3Agent
             if ($agentHealthy) {
                 $agentConsecutiveFailures = 0
