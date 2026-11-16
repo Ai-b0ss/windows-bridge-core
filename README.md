@@ -2,7 +2,7 @@
 
 **Portable, owner-authorized Windows Bridge v3** for local system administration, developer workflows, background browser automation, and bounded GUI control by AI agents.
 
-[![Latest Verified Release](https://img.shields.io/badge/release-v2026.11.16--full--core-blue)](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core)
+[![Latest Verified Release](https://img.shields.io/badge/release-v2026.11.16--full--core--r2-blue)](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core-r2)
 [![Public Core CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/ci.yml/badge.svg)](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/ci.yml)
 [![Candidate Package & RPC Smoke](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/candidate-install.yml/badge.svg)](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/candidate-install.yml)
 [![Transport & Recovery CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/prelogin-recovery.yml/badge.svg)](https://github.com/Ai-b0ss/windows-bridge-core/actions/workflows/prelogin-recovery.yml)
@@ -11,7 +11,7 @@
 
 ## Quick Start (Portable Release ZIP)
 
-1. Download **`Windows-Bridge-Full-Core-Remote-20261116-verified.zip`** (and verify against `SHA256SUMS.txt`) from the [**Latest Release (`v2026.11.16-full-core`)**](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core).
+1. Download **`Windows-Bridge-Full-Core-Remote-20261116-r2-verified.zip`** (and verify against `SHA256SUMS.txt`) from the [**Latest Release (`v2026.11.16-full-core-r2`)**](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core-r2).
    - *Do not run `install.ps1` directly from a raw `git clone`: the repository intentionally excludes binary vendor archives (`Python 3.13.9`, `Node.js 22.14.0`, `GitHub CLI 2.101.0`), which are assembled deterministically by `tools/build_portable_release.py`.*
 2. Extract the archive and run **`INSTALL-FRIEND.cmd`** (or `powershell -ExecutionPolicy Bypass -File install.ps1`).
 3. Run **`CHECK-BRIDGE.cmd`** to verify local health (`127.0.0.1:39073`). To start/restart manually: `%LOCALAPPDATA%\FF-Windows-Bridge\START-FF.cmd`.
@@ -21,18 +21,18 @@ Local installation binds **strictly to `127.0.0.1`** under the current Windows u
 
 ---
 
-## Key Capabilities & Architecture (`v2026.11.16-full-core`)
+## Key Capabilities & Architecture (`v2026.11.16-full-core-r2`)
 
 | Subsystem | What It Provides | Reference |
 | :--- | :--- | :--- |
-| **Core Loopback Runtime** (`runtime/bridge-v3/`) | PowerShell/CMD/Python execution, process & file ops, named-Job detached sessions with EOF-pipe stdin & `256 MiB` log-quota guard (`ff_win_detached_job.py`, `detached_log_guard.py`), detached ownership verification (`pid + create_time`), UIA/Win32 & hidden desktop automation, pooled `Windows-MCP` worker (`~1.4s` warm calls). | [`docs/OPERATOR_GUIDE_RU.md`](docs/OPERATOR_GUIDE_RU.md) |
+| **Core Loopback Runtime** (`runtime/bridge-v3/`) | PowerShell/CMD/Python execution, process & file ops, named-Job detached sessions with descendant-process lifecycle tracking, EOF-pipe stdin, bounded `64 KiB` newline-free tailing & `256 MiB` log-quota guard (`ff_win_detached_job.py`, `detached_log_guard.py`), UIA/Win32 & hidden desktop automation, pooled `Windows-MCP` worker (`~1.4s` warm calls). | [`docs/OPERATOR_GUIDE_RU.md`](docs/OPERATOR_GUIDE_RU.md) |
 | **Owner's Chrome Without Mouse** (`cua_browser_*`, `owner_chrome_session.py`) | Attaches to the owner's signed-in Chrome via the Playwright extension in an isolated agent tab (`attach -> new_tab -> find -> act -> close`) without stealing focus, mouse, or keyboard. | [`skills/windows-bridge/SKILL.md`](skills/windows-bridge/SKILL.md) |
 | **Skill-First Consent & Per-Window Grants** (`cua_chat_permission.py`, `cua_task_authority.py`) | Local opt-in (`state/chat-permission.json`), verbatim chat quote binding (`owner_chat_permission`), concurrent per-window grants (`hwnd + pid + create_time`), `OWNER_ACTIVE` physical-input pause, and rotating `scope_report` audit logs. | [`docs/design/SKILL_FIRST_PERMISSION.md`](docs/design/SKILL_FIRST_PERMISSION.md), [`docs/design/PER_WINDOW_GRANTS.md`](docs/design/PER_WINDOW_GRANTS.md) |
 | **Durable Owner Stop Latch** (`cua_owner_stop.py`) | Clicking **Stop** on the non-focus on-screen banner writes a persistent `stop.flag` latch across restarts that blocks desktop input and guarded effects until locally cleared by the owner. | [`docs/design/DURABLE_OWNER_STOP_RU.md`](docs/design/DURABLE_OWNER_STOP_RU.md) |
-| **Zero-Drop Hot Handover & Cold Rollback** (`cua_socket_transfer.py`, `cua_runtime_deploy.py`, `tools/cua_cold_*`) | WinSock listener socket transfer (`WSADuplicateSocket` / `adopt_listener`) eliminates `WinError 10054` during live updates; transactional `/journal/v2` deployer + offline SHA-verified cold rollback bundle & external Task Scheduler watchdog with `.cua-cold-maintenance.lock` keeper coordination. | [`docs/design/WINDOWS_SOCKET_HANDOVER_RU.md`](docs/design/WINDOWS_SOCKET_HANDOVER_RU.md), [`docs/OPERATOR_COLD_UPGRADE_RU.md`](docs/OPERATOR_COLD_UPGRADE_RU.md) |
-| **Cloudflare FlightController & ContextShield `v0.5.1`** (`tools/cf-flight-controller/`) | Protects calls exceeding the 20s edge timeout via `12.5s` soft async handover (`__flight_poll`), idempotent `__dedupe_key` replay suppression, automatic `39073 -> 39076` port failover, and `>20 KB` output spillover compaction. | [`docs/design/CF_FLIGHT_CONTROLLER_RU.md`](docs/design/CF_FLIGHT_CONTROLLER_RU.md) |
+| **Zero-Drop Hot Handover & Cold Rollback** (`cua_socket_transfer.py`, `cua_runtime_deploy.py`, `tools/cua_cold_*`, `tools/host-wrappers/`) | WinSock listener socket transfer (`WSADuplicateSocket` / `adopt_listener`) eliminates `WinError 10054` during live updates; transactional `/journal/v2` deployer + offline SHA-verified cold rollback bundle & external Task Scheduler watchdog with unified 300s-TTL `.cua-cold-maintenance.lock` enforcement across both inner and outer keepers. | [`docs/design/WINDOWS_SOCKET_HANDOVER_RU.md`](docs/design/WINDOWS_SOCKET_HANDOVER_RU.md), [`docs/OPERATOR_COLD_UPGRADE_RU.md`](docs/OPERATOR_COLD_UPGRADE_RU.md) |
+| **Cloudflare FlightController & ContextShield `v0.5.2`** (`tools/cf-flight-controller/`) | Protects calls exceeding the 20s edge timeout via `12.5s` soft async handover (`__flight_poll`), `OUTCOME_UNKNOWN` post-dispatch retention + SQLite `request_status` dedupe reconciliation across lost HTTP replies, automatic `39073 -> 39076` port failover, and `>20 KB` output spillover compaction. | [`docs/design/CF_FLIGHT_CONTROLLER_RU.md`](docs/design/CF_FLIGHT_CONTROLLER_RU.md) |
 | **Private GitHub Transport & Prelogin Supervisor** (`runtime/github-transport/`, `tools/prelogin-recovery/`) | Private-repo GitHub Issues/Actions transport with lease & outbox crash recovery, explicit multi-device targeting, and prelogin network recovery supervisor. | [`REMOTE-PAIRING.md`](REMOTE-PAIRING.md), [`docs/GITHUB_RETRY_RECOVERY_RU.md`](docs/GITHUB_RETRY_RECOVERY_RU.md), [`tools/prelogin-recovery/README.md`](tools/prelogin-recovery/README.md) |
-| **Optional Offline Addons** (`tools/optional_addons.py`) | Keeps the Full Core ZIP compact (~61.8 MB) while supporting SHA-256-pinned offline installation of Playwright Chromium and visual/OmniParser runtimes via `ADDONS.cmd`. | [`OPTIONAL-ADDONS.md`](OPTIONAL-ADDONS.md) |
+| **Optional Offline Addons & Hygiene Gates** (`tools/optional_addons.py`, `tools/workstation_hygiene_engine.py`, `tools/host-wrappers/storage-guard-v2.ps1`) | Keeps the Full Core ZIP compact (~62 MB) with SHA-256-pinned offline addons (`ADDONS.cmd`) plus parameterized storage-guard and SHA-256/Git-push hygiene verification gates. | [`OPTIONAL-ADDONS.md`](OPTIONAL-ADDONS.md) |
 
 ---
 
@@ -63,7 +63,7 @@ Local installation binds **strictly to `127.0.0.1`** under the current Windows u
 
 ### Architecture & Security Specifications (`docs/design/` & `docs/security/`)
 - [`WINDOWS_SOCKET_HANDOVER_RU.md`](docs/design/WINDOWS_SOCKET_HANDOVER_RU.md) — zero-drop WinSock listener socket transfer.
-- [`CF_FLIGHT_CONTROLLER_RU.md`](docs/design/CF_FLIGHT_CONTROLLER_RU.md) — async `FlightController` and `ContextShield` log spillover.
+- [`CF_FLIGHT_CONTROLLER_RU.md`](docs/design/CF_FLIGHT_CONTROLLER_RU.md) — async `FlightController v0.5.2`, `OUTCOME_UNKNOWN` dedupe reconciliation, and `ContextShield` log spillover.
 - [`DURABLE_OWNER_STOP_RU.md`](docs/design/DURABLE_OWNER_STOP_RU.md) — persistent `Stop` latch across restarts.
 - [`GITHUB_OUTBOX_RECOVERY_RU.md`](docs/design/GITHUB_OUTBOX_RECOVERY_RU.md) & [`GITHUB_EXPLICIT_DEVICE_RU.md`](docs/security/GITHUB_EXPLICIT_DEVICE_RU.md) — reliable delivery and explicit device targeting in GitHub transport.
 - [`SKILL_FIRST_PERMISSION.md`](docs/design/SKILL_FIRST_PERMISSION.md) & [`PER_WINDOW_GRANTS.md`](docs/design/PER_WINDOW_GRANTS.md) — trust model and per-window desktop grants.
@@ -74,7 +74,7 @@ Local installation binds **strictly to `127.0.0.1`** under the current Windows u
 
 ## Verification Boundary & Open Hardware/Host Gates
 
-Automated CI on GitHub-hosted Windows/Linux runners verifies source compilation, unit/contract suites (`546+` Python tests + Node transport/supervisor suites), clean portable ZIP assembly, isolated `install.ps1` bootstrap, and loopback RPC smoke tests. Real hardware/account acceptance gates that require physical multi-device or host-UI trials remain tracked openly:
+Automated CI on GitHub-hosted Windows/Linux runners verifies source compilation, unit/contract suites (`555+` Python tests + Node transport/supervisor suites), clean portable ZIP assembly, isolated `install.ps1` bootstrap, and loopback RPC smoke tests. Real hardware/account acceptance gates that require physical multi-device or host-UI trials remain tracked openly:
 - [#4](https://github.com/Ai-b0ss/windows-bridge-core/issues/4) — Real second-device pairing, consent, and remote round-trip (`P0`).
 - [#6](https://github.com/Ai-b0ss/windows-bridge-core/issues/6) — Optional browser/vision offline addon validation across target workloads (`P1`).
 - [#7](https://github.com/Ai-b0ss/windows-bridge-core/issues/7) — CLI/API-first Windows automation routing with native hidden UI fallback (`P1`).
@@ -83,4 +83,4 @@ Automated CI on GitHub-hosted Windows/Linux runners verifies source compilation,
 
 ## Privacy & Clean Provenance
 
-This repository starts from a clean audited initial commit (`200a50ec1592b3731d307838dd370a57cd1383c9`) and contains **no** machine hostnames, local user paths, VPN profiles, Cloudflare/GitHub tokens, or private operational logs. Never attach personal self-hosted Windows runners to public pull requests; see [`CI_POLICY.md`](CI_POLICY.md).
+This repository starts from a clean audited initial commit (`200a50ec1592b3731d307838dd370a57cd1383c9`) and contains **no** machine hostnames, local user paths, VPN profiles, Cloudflare/GitHub tokens, or private operational logs. Note: GitHub preserves historical comment revision metadata and unreferenced closed-PR commits (`1962f26a` from closed PR [#109](https://github.com/Ai-b0ss/windows-bridge-core/pull/109)) at the platform level even after active PR/Issue bodies and comments are scrubbed. Never attach personal self-hosted Windows runners to public pull requests; see [`CI_POLICY.md`](CI_POLICY.md).

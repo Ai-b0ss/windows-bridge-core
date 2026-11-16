@@ -48,6 +48,21 @@ const RAW_EXEMPT_OPS = new Set([
 const DIAG_LINE_RE =
   /\b(error|exception|traceback|fatal|failed|failure|assertionerror|syntaxerror|typeerror|warn|warning)\b/i;
 
+export class FlightOutcomeUnknownError extends Error {
+  constructor({ requestId, flightId, dedupeKey, op, causeMessage }) {
+    super(
+      `FLIGHT_OUTCOME_UNKNOWN:request_id=${requestId}:flight_id=${flightId}:dedupe_key=${dedupeKey ?? ""}:${causeMessage ?? "transport_interrupted"}`
+    );
+    this.name = "FlightOutcomeUnknownError";
+    this.code = "FLIGHT_OUTCOME_UNKNOWN";
+    this.request_id = requestId;
+    this.flight_id = flightId;
+    this.dedupe_key = dedupeKey;
+    this.op = op;
+    this.retry_safe = false;
+  }
+}
+
 function ensureDir(dirPath) {
   try {
     fs.mkdirSync(dirPath, { recursive: true });
@@ -278,8 +293,9 @@ export class ContextShield {
 }
 
 export class FlightController {
-  constructor({ executor, stateDir } = {}) {
+  constructor({ executor, reconciler = null, stateDir } = {}) {
     this.executor = executor;
+    this.reconciler = reconciler;
     this.stateDir =
       stateDir ?? process.env.FF_CF_STATE_DIR ?? path.join(__dirname, "state", "cf-flight-controller");
     this.journalPath = path.join(this.stateDir, "flights-journal.json");
@@ -293,6 +309,8 @@ export class FlightController {
       async_handovers: 0,
       poll_calls: 0,
       deduped_hits: 0,
+      reconciled_recoveries: 0,
+      outcome_unknown_blocks: 0,
       cancelled_flights: 0,
       spillovers_created: 0,
     };
@@ -313,7 +331,12 @@ export class FlightController {
           item.ended_at = now;
         }
         this.flights.set(item.flight_id, item);
-        if (item.dedupe_key && item.status === "COMPLETED") {
+        if (
+          item.dedupe_key &&
+          (item.status === "COMPLETED" ||
+            item.status === "OUTCOME_UNKNOWN" ||
+            item.status === "INTERRUPTED_BY_AGENT_RESTART")
+        ) {
           this.dedupeIndex.set(item.dedupe_key, item.flight_id);
         }
       }
@@ -330,6 +353,7 @@ export class FlightController {
           request_id: f.request_id,
           op: f.op,
           dedupe_key: f.dedupe_key,
+          backend_url: f.backend_url ?? null,
           status: f.status,
           created_at: f.created_at,
           ended_at: f.ended_at,
@@ -358,10 +382,18 @@ export class FlightController {
     }
     if (this.flights.size > MAX_STORED_FLIGHTS) {
       const finished = [...this.flights.values()]
-        .filter((f) => f.status !== "RUNNING")
+        .filter(
+          (f) =>
+            f.status !== "RUNNING" &&
+            f.status !== "OUTCOME_UNKNOWN" &&
+            f.status !== "INTERRUPTED_BY_AGENT_RESTART"
+        )
         .sort((a, b) => a.created_at - b.created_at);
-      for (const victim of finished.slice(0, this.flights.size - MAX_STORED_FLIGHTS)) {
+      for (const victim of finished.slice(0, Math.max(0, this.flights.size - MAX_STORED_FLIGHTS))) {
         this.flights.delete(victim.flight_id);
+        if (victim.dedupe_key && this.dedupeIndex.get(victim.dedupe_key) === victim.flight_id) {
+          this.dedupeIndex.delete(victim.dedupe_key);
+        }
       }
     }
   }
@@ -391,10 +423,16 @@ export class FlightController {
 
     this.stats.total_rpc++;
     const { cleanArgs, meta } = extractTransportMeta(rawArgs);
+    let reusedRequestId = null;
 
     if (meta.dedupeKey && this.dedupeIndex.has(meta.dedupeKey)) {
       const existing = this.flights.get(this.dedupeIndex.get(meta.dedupeKey));
-      if (existing && existing.op === op) {
+      if (existing) {
+        if (existing.op !== op) {
+          throw new Error(
+            `DEDUPE_KEY_CONFLICT: key "${meta.dedupeKey}" is bound to op "${existing.op}", cannot reuse for "${op}"`
+          );
+        }
         this.stats.deduped_hits++;
         if (existing.status === "COMPLETED") {
           return { ...existing.shieldedResult, deduped_replay: true, flight_id: existing.flight_id };
@@ -402,11 +440,59 @@ export class FlightController {
         if (existing.status === "RUNNING") {
           return this._awaitOrHandover(existing, meta);
         }
+        if (
+          existing.status === "OUTCOME_UNKNOWN" ||
+          existing.status === "INTERRUPTED_BY_AGENT_RESTART"
+        ) {
+          if (typeof this.reconciler === "function") {
+            let rec = null;
+            try {
+              rec = await this.reconciler({
+                op: existing.op,
+                cleanArgs,
+                requestId: existing.request_id,
+                dedupeKey: existing.dedupe_key,
+                flightId: existing.flight_id,
+                backendUrl: existing.backend_url ?? null,
+              });
+            } catch {
+              rec = null;
+            }
+            if (rec && rec.state === "completed" && rec.response && typeof rec.response === "object") {
+              existing.status = "COMPLETED";
+              existing.error = null;
+              existing.shieldedResult = this.shield.apply(op, rec.response, existing.flight_id, meta);
+              this.stats.reconciled_recoveries++;
+              this._persistJournal();
+              return {
+                ...existing.shieldedResult,
+                deduped_replay: true,
+                reconciled: true,
+                flight_id: existing.flight_id,
+              };
+            }
+            if (rec && rec.state === "not_found" && rec.dedupe_journal_v1 === true) {
+              reusedRequestId = existing.request_id;
+              this.flights.delete(existing.flight_id);
+              this.dedupeIndex.delete(meta.dedupeKey);
+            }
+          }
+          if (!reusedRequestId) {
+            this.stats.outcome_unknown_blocks++;
+            throw new FlightOutcomeUnknownError({
+              requestId: existing.request_id,
+              flightId: existing.flight_id,
+              dedupeKey: existing.dedupe_key,
+              op: existing.op,
+              causeMessage: existing.error,
+            });
+          }
+        }
       }
     }
 
     const flightId = "flt_" + Date.now().toString(36) + "_" + crypto.randomBytes(4).toString("hex");
-    const requestId = crypto.randomUUID();
+    const requestId = reusedRequestId ?? crypto.randomUUID();
     const controller = new AbortController();
     const hardTimer = setTimeout(() => controller.abort(new Error("FLIGHT_HARD_TIMEOUT")), meta.hardTimeoutMs);
     if (typeof hardTimer.unref === "function") hardTimer.unref();
@@ -416,6 +502,7 @@ export class FlightController {
       request_id: requestId,
       op,
       dedupe_key: meta.dedupeKey,
+      backend_url: null,
       status: "RUNNING",
       created_at: Date.now(),
       ended_at: null,
@@ -433,22 +520,35 @@ export class FlightController {
 
     flight.promise = (async () => {
       try {
-        const rawData = await this.executor(op, cleanArgs, { requestId, signal: controller.signal });
+        const rawData = await this.executor(op, cleanArgs, {
+          requestId,
+          dedupeKey: meta.dedupeKey,
+          signal: controller.signal,
+          setBackendUrl: (url) => {
+            if (typeof url === "string" && url.length > 0) flight.backend_url = url;
+          },
+        });
         flight.ended_at = Date.now();
         flight.duration_ms = flight.ended_at - flight.created_at;
         flight.status = "COMPLETED";
         flight.shieldedResult = this.shield.apply(op, rawData, flightId, meta);
-        if (flight.handover_triggered) this._persistJournal();
+        if (flight.handover_triggered || meta.dedupeKey) this._persistJournal();
         return { ok: true };
       } catch (err) {
         flight.ended_at = Date.now();
         flight.duration_ms = flight.ended_at - flight.created_at;
-        if (flight.status !== "CANCELLED") flight.status = "FAILED";
         flight.error = err instanceof Error ? err.message : String(err);
-        if (meta.dedupeKey && this.dedupeIndex.get(meta.dedupeKey) === flightId) {
-          this.dedupeIndex.delete(meta.dedupeKey);
+        const beforeDispatch = err && typeof err === "object" && err.beforeDispatch === true;
+        if (flight.status === "CANCELLED" || beforeDispatch || !meta.dedupeKey) {
+          if (flight.status !== "CANCELLED") flight.status = "FAILED";
+          if (meta.dedupeKey && this.dedupeIndex.get(meta.dedupeKey) === flightId) {
+            this.dedupeIndex.delete(meta.dedupeKey);
+          }
+          if (flight.handover_triggered) this._persistJournal();
+        } else {
+          flight.status = "OUTCOME_UNKNOWN";
+          this._persistJournal();
         }
-        if (flight.handover_triggered) this._persistJournal();
         return { ok: false };
       } finally {
         clearTimeout(hardTimer);
@@ -461,7 +561,18 @@ export class FlightController {
   async _awaitOrHandover(flight, meta) {
     if (meta.noAsyncHandover) {
       const outcome = await flight.promise;
-      if (!outcome.ok) throw new Error(flight.error || "FF3_CALL_FAILED");
+      if (!outcome.ok) {
+        if (flight.status === "OUTCOME_UNKNOWN") {
+          throw new FlightOutcomeUnknownError({
+            requestId: flight.request_id,
+            flightId: flight.flight_id,
+            dedupeKey: flight.dedupe_key,
+            op: flight.op,
+            causeMessage: flight.error,
+          });
+        }
+        throw new Error(flight.error || "FF3_CALL_FAILED");
+      }
       this.stats.fast_completed++;
       return flight.shieldedResult;
     }
@@ -477,6 +588,15 @@ export class FlightController {
     if (flight.status === "COMPLETED") {
       this.stats.fast_completed++;
       return flight.shieldedResult;
+    }
+    if (flight.status === "OUTCOME_UNKNOWN") {
+      throw new FlightOutcomeUnknownError({
+        requestId: flight.request_id,
+        flightId: flight.flight_id,
+        dedupeKey: flight.dedupe_key,
+        op: flight.op,
+        causeMessage: flight.error,
+      });
     }
     throw new Error(flight.error || `FLIGHT_${flight.status}`);
   }
@@ -518,6 +638,7 @@ export class FlightController {
       schema: "ff-win-v3-flight-poll-v1",
       ok: false,
       status: flight.status,
+      retry_safe: flight.status !== "OUTCOME_UNKNOWN",
       flight_id: flight.flight_id,
       request_id: flight.request_id,
       op: flight.op,
@@ -553,6 +674,7 @@ export class FlightController {
       .slice(0, limit)
       .map((f) => ({
         flight_id: f.flight_id,
+        request_id: f.request_id,
         op: f.op,
         status: f.status,
         elapsed_ms: (f.ended_at ?? Date.now()) - f.created_at,
@@ -570,7 +692,7 @@ export class FlightController {
     }
     return {
       ok: true,
-      module_version: "0.5.1-flight-controller-shield",
+      module_version: "0.5.2-flight-controller-shield",
       soft_window_ms: DEFAULT_SOFT_WINDOW_MS,
       cloudflare_do_ceiling_ms: 20000,
       default_max_inline_chars: DEFAULT_MAX_INLINE_CHARS,
@@ -581,15 +703,27 @@ export class FlightController {
   }
 }
 
-export function createFF3FlightCaller({ selectBackend, secretPath }) {
+export function createFF3FlightCaller({ selectBackend, secretPath, stateDir } = {}) {
   const fc = new FlightController({
-    executor: async (op, cleanArgs, { requestId, signal }) => {
-      const secret = fs.readFileSync(secretPath, "utf8").trim();
-      const targetUrl = await selectBackend(op, cleanArgs);
+    stateDir,
+    executor: async (op, cleanArgs, { requestId, dedupeKey, signal, setBackendUrl }) => {
+      let secret;
+      let targetUrl;
+      try {
+        secret = fs.readFileSync(secretPath, "utf8").trim();
+        targetUrl = await selectBackend(op, cleanArgs);
+        if (typeof setBackendUrl === "function") setBackendUrl(targetUrl);
+      } catch (prepErr) {
+        const wrapped = prepErr instanceof Error ? prepErr : new Error(String(prepErr));
+        wrapped.beforeDispatch = true;
+        throw wrapped;
+      }
+      const payload = { op, args: cleanArgs, request_id: requestId };
+      if (dedupeKey) payload.dedupe_key = dedupeKey;
       const response = await fetch(targetUrl, {
         method: "POST",
         headers: { "content-type": "application/json", "X-FF3-Key": secret },
-        body: JSON.stringify({ op, args: cleanArgs, request_id: requestId }),
+        body: JSON.stringify(payload),
         signal,
       });
       const text = await response.text();
@@ -603,6 +737,27 @@ export function createFF3FlightCaller({ selectBackend, secretPath }) {
         throw new Error("FF3_HTTP_" + response.status + ":" + JSON.stringify(data));
       }
       return data;
+    },
+    reconciler: async ({ op, cleanArgs, requestId, dedupeKey, backendUrl }) => {
+      if (!dedupeKey) return { state: "outcome_unknown" };
+      const secret = fs.readFileSync(secretPath, "utf8").trim();
+      // Always reconcile against the exact backend URL that received the original flight so
+      // port failover (39073 -> 39076) never misreads a peer's empty journal as not_found.
+      const targetUrl = backendUrl || (await selectBackend("request_status", cleanArgs));
+      const response = await fetch(targetUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-FF3-Key": secret },
+        body: JSON.stringify({
+          op: "request_status",
+          args: { op, dedupe_key: dedupeKey },
+          request_id: `reconcile:${requestId}`,
+        }),
+        signal: AbortSignal.timeout(4000),
+      });
+      if (!response.ok) return { state: "outcome_unknown" };
+      const data = await response.json();
+      if (!data?.ok || !data?.result) return { state: "outcome_unknown" };
+      return data.result;
     },
   });
   return (op, args = {}) => fc.dispatch(op, args);

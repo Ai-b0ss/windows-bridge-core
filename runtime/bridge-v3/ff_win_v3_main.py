@@ -786,9 +786,42 @@ def _install_durable_requests() -> None:
             return result
         except RequestJournalError as exc:
             raise core.RPCError(exc.code, details={"retry_safe": False}) from exc
+    def _derive_dedupe_journal_key(op_name: Any, dedupe_key: Any) -> str:
+        if not isinstance(op_name, str) or not op_name or not isinstance(dedupe_key, str):
+            raise RequestJournalError("REQUEST_KEY_INVALID")
+        cleaned = dedupe_key.strip()
+        if not cleaned or len(cleaned) > 160:
+            raise RequestJournalError("REQUEST_KEY_INVALID")
+        digest = __import__("hashlib").sha256(f"{op_name}:{cleaned}".encode("utf-8")).hexdigest()[:40]
+        return f"dk-{digest}"
+
+    _orig_dispatch = core.dispatch
+    def _journaled_dispatch(request: dict[str, Any]) -> dict[str, Any]:
+        if isinstance(request, dict) and request.get("dedupe_key") is not None and request.get("op") != "request_status":
+            op_name = request.get("op")
+            raw_dk = request.get("dedupe_key")
+            payload = {"op": op_name, "args": request.get("args"), "target_device": request.get("target_device")}
+            try:
+                rk = _derive_dedupe_journal_key(op_name, raw_dk)
+                outcome = journal.execute(rk, payload, lambda: _orig_dispatch(request))
+                if outcome.get("state") == "completed" and isinstance(outcome.get("response"), dict):
+                    return outcome["response"]
+                raise core.RPCError("REQUEST_OUTCOME_UNKNOWN", details={"request_key": rk, "retry_safe": False})
+            except RequestJournalError as exc:
+                raise core.RPCError(exc.code, details={"retry_safe": False}) from exc
+        return _orig_dispatch(request)
+    core.dispatch = _journaled_dispatch
+
     def request_status(args: dict[str, Any]) -> dict[str, Any]:
         try:
-            result = journal.status(args.get("request_key"))
+            rk = args.get("request_key")
+            from_dedupe = False
+            if rk is None and args.get("dedupe_key") is not None:
+                rk = _derive_dedupe_journal_key(args.get("op"), args.get("dedupe_key"))
+                from_dedupe = True
+            result = journal.status(rk)
+            if from_dedupe:
+                result["dedupe_journal_v1"] = True
             try:
                 evidence.append(args.get("agent_id", "unspecified"), args.get("task_id", args.get("request_key")),
                                 {"event": "recovery_status", "request_key": args.get("request_key"), "outcome": result["state"],

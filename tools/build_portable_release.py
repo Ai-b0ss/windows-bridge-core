@@ -129,12 +129,13 @@ def assemble(repo: Path, previous: Path, output: Path) -> dict:
                 raise ValueError("Pinned vendor asset changed: " + asset)
             contents[asset] = raw
         previous_readme = z.read("README-FIRST.md").decode("utf-8")
-    readme = previous_readme + (
-        "\n\n## Remote Core Beta 3 — Optional addons\n"
-        "This version includes ADDONS.cmd and tools/optional_addons.py.\n"
-        "Run ADDONS.cmd status, or install a separately obtained,\n"
-        "SHA-256 pinned browser-runtime.zip / visual-runtime.zip.\n"
-        "Nothing downloads without you supplying a file. Read OPTIONAL-ADDONS.md.\n"
+    normalized_readme = re.sub(r"Remote Core Beta\s*\d*", "Windows Bridge v3 Full Core", previous_readme)
+    readme = normalized_readme + (
+        "\n\n## Windows Bridge v3 Full Core — Optional addons & verified provenance\n"
+        f"- Verified public source commit: `{head}` (`release-manifest.json`).\n"
+        "- Includes `ADDONS.cmd` and `tools/optional_addons.py` for offline SHA-256-pinned\n"
+        "  `browser-runtime.zip` / `visual-runtime.zip` installation (`OPTIONAL-ADDONS.md`).\n"
+        "- Local setup binds strictly to `127.0.0.1` until you explicitly pair a remote transport.\n"
     )
     contents["README-FIRST.md"] = readme.encode("utf-8")
     matches = []

@@ -33,6 +33,41 @@ class TestDetachedLogGuard(unittest.TestCase):
             self.assertEqual(carry, b"")
             self.assertTrue(lines[-1].endswith(b"line-01999\n"))
 
+    def test_sol_p2_3_newline_less_8mib_stream_bounds_carry_memory(self) -> None:
+        """Sol P2 #3 regression: 8 MiB text without '\\n' must never accumulate >= chunk_size in carry."""
+        with tempfile.TemporaryDirectory() as td:
+            lp = Path(td) / "9999999999999999.log"
+            total_bytes = 8 * 1024 * 1024  # 8 MiB with ZERO newline bytes
+            pattern = b"0123456789ABCDEF" * (total_bytes // 16)
+            lp.write_bytes(pattern)
+
+            pos = 0
+            carry = b""
+            reconstructed = bytearray()
+            ticks = 0
+            while pos < total_bytes:
+                ticks += 1
+                lines, pos, carry = dlg.read_bounded_lines(
+                    lp, pos, carry, chunk_size=dlg.TAILER_READ_CHUNK_BYTES, max_chunks_per_tick=8
+                )
+                self.assertLess(
+                    len(carry),
+                    dlg.TAILER_READ_CHUNK_BYTES,
+                    msg=f"carry grew to {len(carry)} bytes on tick {ticks}",
+                )
+                self.assertGreater(
+                    len(lines),
+                    0,
+                    msg="8 MiB stream without newlines must emit bounded chunks rather than buffering silently",
+                )
+                for chunk in lines:
+                    self.assertLessEqual(len(chunk), dlg.TAILER_READ_CHUNK_BYTES)
+                    reconstructed.extend(chunk)
+
+            reconstructed.extend(carry)
+            self.assertEqual(len(reconstructed), total_bytes)
+            self.assertEqual(bytes(reconstructed), pattern)
+
     def test_compact_runaway_log_and_orphan_sweep(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
