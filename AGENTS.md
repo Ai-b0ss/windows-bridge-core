@@ -29,7 +29,7 @@ See `docs/OPERATOR_GUIDE_RU.md` and `docs/OPERATOR_COLD_UPGRADE_RU.md`:
 
 ## Where things are
 
-- `runtime/bridge-v3/`: core RPC server (`ff_win_v3_main.py`, `ff_win_v3_agent.py`), consent & Stop latch (`cua_chat_permission.py`, `cua_owner_stop.py`, `cua_task_authority.py`), activity/notice (`cua_owner_activity.py`, `cua_owner_notice.py/.ps1`), pooled worker (`cua_windows_mcp.py`), owner Chrome (`cua_browser_*`), hot socket transfer (`cua_socket_transfer.py`), transactional deployer (`cua_runtime_deploy.py`), and workflow discovery (`cua_agent_workflows.py`).
+- `runtime/bridge-v3/`: core RPC server (`ff_win_v3_main.py`, `ff_win_v3_agent.py`), consent & Stop latch (`cua_chat_permission.py`, `cua_owner_stop.py`, `cua_task_authority.py`), activity/notice (`cua_owner_activity.py`, `cua_owner_notice.py/.ps1`), pooled worker (`cua_windows_mcp.py`), owner Chrome (`cua_browser_*`, `owner_chrome_session.py`), detached named-Job & log-quota guard (`ff_win_detached_job.py`, `detached_log_guard.py`), hot socket transfer (`cua_socket_transfer.py`), transactional deployer (`cua_runtime_deploy.py`), and workflow discovery (`cua_agent_workflows.py`).
 - `runtime/github-transport/`: private GitHub Issues/Actions transport with lease & outbox recovery.
 - `tools/cf-flight-controller/`: `FlightController` + `ContextShield v0.5.1` (`12.5s` async handover, `__flight_poll`, `>20 KB` output spillover compaction, `39073 -> 39076` failover).
 - `tools/cua_cold_rollback_bundle.py` & `tools/cua_cold_recovery_watchdog.py`: offline provenance-checked snapshot/kit builder and independent cold-upgrade watchdog.

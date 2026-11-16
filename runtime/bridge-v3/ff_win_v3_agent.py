@@ -39,6 +39,7 @@ MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_INLINE_BYTES = 2 * 1024 * 1024
 SESSION_BUFFER_CHARS = 2 * 1024 * 1024
 DEFAULT_AUDIT_MAX_BYTES = 10 * 1024 * 1024
+DEFAULT_DETACHED_LOG_MAX_BYTES = 256 * 1024 * 1024
 
 BRIDGE_ROOT = Path(os.environ.get("FF_BRIDGE_ROOT") or (Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "FF-Windows-Bridge"))
 V3_ROOT = BRIDGE_ROOT / "bridge-v3"
@@ -58,6 +59,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "fileWriteLineLimit": 5000,
     "auditEnabled": True,
     "auditMaxBytes": DEFAULT_AUDIT_MAX_BYTES,
+    "maxDetachedLogBytes": DEFAULT_DETACHED_LOG_MAX_BYTES,
     "urlReadEnabled": True,
 }
 
@@ -530,9 +532,10 @@ def is_pid_alive(pid: int) -> bool:
 
 
 class DetachedProcessStub:
-    def __init__(self, pid: int, creation_token: int):
+    def __init__(self, pid: int, creation_token: int, session_id: str | None = None):
         self.pid = pid
         self.creation_token = creation_token
+        self.session_id = session_id
         self._reference = ProcessReference(pid, creation_token)
         self.exit_code_known = True
         self.stdin = None
@@ -548,6 +551,15 @@ class DetachedProcessStub:
 
     def terminate(self):
         self._reference.terminate()
+
+    def terminate_tree(self, timeout: float = 10.0) -> dict[str, Any]:
+        if os.name == "nt" and self.session_id:
+            from ff_win_detached_job import terminate_detached_job_by_name
+            receipt = terminate_detached_job_by_name(self.session_id, timeout=timeout)
+            if receipt is not None:
+                return receipt
+        self._reference.terminate()
+        return {"termination_scope": "owned_root_process", "descendant_cleanup_verified": False}
 
     def wait(self, timeout: float | None = None) -> int:
         start = time.time()
@@ -579,6 +591,7 @@ class Session:
         log_path: Path | None = None,
         created_at: int | None = None,
         owner_scope: tuple[str, str] | None = None,
+        max_log_bytes: int | None = None,
     ):
         self.id = session_id or uuid.uuid4().hex[:16]
         self.process = process
@@ -590,6 +603,8 @@ class Session:
         self.log_path = log_path
         self.created_at = created_at or now_ms()
         self.owner_scope = owner_scope
+        self.max_log_bytes = max_log_bytes or DEFAULT_DETACHED_LOG_MAX_BYTES
+        self.quota_exceeded = False
         self.closed_at: int | None = None
         self.events: deque[dict[str, Any]] = deque()
         self.next_seq = 1
@@ -617,25 +632,54 @@ class Session:
         return self.closed_at and 0
 
     def _log_tailer(self) -> None:
+        from detached_log_guard import (
+            compact_runaway_log_file,
+            compute_initial_tail_offset,
+            read_bounded_lines,
+        )
         pos = 0
+        carry = b""
+        if self.log_path and self.log_path.is_file():
+            pos, skipped = compute_initial_tail_offset(self.log_path)
+            if skipped > 0:
+                self.append_event("meta", f"<detached log resumed from tail; skipped_bytes={skipped}>\n")
         while True:
             try:
                 if self.log_path and self.log_path.is_file():
-                    with open(self.log_path, "rb") as f:
-                        f.seek(pos)
-                        lines = f.readlines()
-                        pos = f.tell()
+                    st_size = self.log_path.stat().st_size
+                    if self.max_log_bytes > 0 and st_size > self.max_log_bytes and self.is_running():
+                        self.quota_exceeded = True
+                        try:
+                            terminate_owned_session(self)
+                        except Exception:
+                            pass
+                        try:
+                            comp = compact_runaway_log_file(self.log_path)
+                            pos = self.log_path.stat().st_size
+                            carry = b""
+                            self.append_event(
+                                "meta",
+                                f"<detached process terminated: log_quota_exceeded limit={self.max_log_bytes} "
+                                f"observed={st_size} compacted={comp.get('compacted')}>\n",
+                            )
+                        except Exception:
+                            self.append_event("meta", f"<detached process terminated: log_quota_exceeded limit={self.max_log_bytes}>\n")
+                    else:
+                        lines, pos, carry = read_bounded_lines(self.log_path, pos, carry)
                         for line in lines:
                             self.append_event("stdout", safe_decode(line))
             except Exception:
                 pass
             if not self.is_running():
                 try:
-                    if self.log_path and self.log_path.is_file():
-                        with open(self.log_path, "rb") as f:
-                            f.seek(pos)
-                            for line in f.readlines():
-                                self.append_event("stdout", safe_decode(line))
+                    if self.log_path and self.log_path.is_file() and not self.quota_exceeded:
+                        lines, pos, carry = read_bounded_lines(
+                            self.log_path, pos, carry, max_chunks_per_tick=32
+                        )
+                        for line in lines:
+                            self.append_event("stdout", safe_decode(line))
+                        if carry:
+                            self.append_event("stdout", safe_decode(carry))
                 except Exception:
                     pass
                 self.closed_at = now_ms()
@@ -802,7 +846,7 @@ def recover_detached_sessions() -> dict[str, Session]:
         except (OSError, ValueError, TypeError):
             continue
         try:
-            stub = DetachedProcessStub(pid, token)
+            stub = DetachedProcessStub(pid, token, session_id=sid)
         except OSError:
             continue
         owner = info.get("owner_scope")
@@ -924,7 +968,7 @@ def op_set_config_value(args: dict[str, Any]) -> dict[str, Any]:
     if key in {"allowedDirectories", "blockedCommands", "allowedShells"}:
         if not isinstance(value, list) or not all(isinstance(x, str) for x in value):
             raise RPCError("CONFIG_VALUE_INVALID")
-    elif key in {"fileReadLineLimit", "fileWriteLineLimit", "auditMaxBytes"}:
+    elif key in {"fileReadLineLimit", "fileWriteLineLimit", "auditMaxBytes", "maxDetachedLogBytes"}:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise RPCError("CONFIG_VALUE_INVALID")
     elif key in {"auditEnabled", "urlReadEnabled"}:
@@ -967,30 +1011,38 @@ def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
     flags = 0
     session_id = uuid.uuid4().hex[:16]
     log_file: Path | None = None
+    max_log_bytes = int(STATE.config.get("maxDetachedLogBytes", DEFAULT_DETACHED_LOG_MAX_BYTES))
+    if "max_log_bytes" in args:
+        req_max = args.get("max_log_bytes")
+        if isinstance(req_max, bool) or not isinstance(req_max, int) or not (65536 <= req_max <= 4 * 1024 * 1024 * 1024):
+            raise RPCError("MAX_LOG_BYTES_INVALID")
+        max_log_bytes = req_max
     if detached:
         log_dir = V3_ROOT / "state" / "detached_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"{session_id}.log"
-        log_handle = open(log_file, "ab")
+        env.setdefault("PYTHON_BASIC_REPL", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
         if os.name == "nt":
-            # DETACHED_PROCESS leaves legacy Windows PowerShell without a
-            # console host: it can exit 0 without executing -Command. A hidden
-            # console process still survives this Bridge's exit because this
-            # branch is deliberately NOT assigned to the kill-on-close job.
-            flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
-        process = subprocess.Popen(
-            argv,
-            cwd=str(cwd),
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            creationflags=flags,
-        )
-        try:
-            log_handle.close()
-        except Exception:
-            pass
+            from ff_win_detached_job import DetachedJobProcess
+            try:
+                process = DetachedJobProcess(
+                    argv, cwd=str(cwd), env=env, session_id=session_id, log_file=log_file
+                )
+            except OSError as exc:
+                raise RPCError("DETACHED_JOB_PROCESS_START_FAILED", details={"execution_started": False}) from exc
+        else:
+            r_fd, w_fd = os.pipe()
+            os.close(w_fd)
+            log_handle = open(log_file, "ab")
+            try:
+                process = subprocess.Popen(
+                    argv, cwd=str(cwd), env=env,
+                    stdin=r_fd, stdout=log_handle, stderr=subprocess.STDOUT,
+                )
+            finally:
+                os.close(r_fd)
+                log_handle.close()
     else:
         if os.name == "nt":
             from ff_win_owned_job import OwnedJobProcess
@@ -1010,6 +1062,7 @@ def op_start_process(args: dict[str, Any]) -> dict[str, Any]:
         detached=detached,
         log_path=log_file,
         owner_scope=owner_scope,
+        max_log_bytes=max_log_bytes if detached else None,
     )
     with STATE.lock:
         STATE.sessions[session.id] = session
@@ -1627,7 +1680,7 @@ def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
             # A completed root may still own live descendants that inherited
             # its Job Object and stdio. Dropping the Session without draining
             # that job leaves task-owned children active indefinitely.
-            if not session.detached and hasattr(process, "terminate_tree"):
+            if hasattr(process, "terminate_tree"):
                 try:
                     if not getattr(session, "_owned_job_cleanup_verified", False):
                         receipt = process.terminate_tree()
@@ -1643,15 +1696,42 @@ def op_cleanup_sessions(args: dict[str, Any]) -> dict[str, Any]:
                 if STATE.sessions.get(session_id) is session:
                     STATE.sessions.pop(session_id, None)
                     removed.append(session_id)
-    if removed and DETACHED_STATE_PATH.is_file():
+    persisted_ids: set[str] = set()
+    if DETACHED_STATE_PATH.is_file():
         try:
             current = json.loads(DETACHED_STATE_PATH.read_text("utf-8"))
-            for sid in removed:
-                current.pop(sid, None)
-            atomic_write_text(DETACHED_STATE_PATH, json.dumps(current, indent=2))
+            if isinstance(current, dict):
+                if removed:
+                    for sid in removed:
+                        current.pop(sid, None)
+                    atomic_write_text(DETACHED_STATE_PATH, json.dumps(current, indent=2))
+                persisted_ids = set(current.keys())
         except Exception:
             pass
+    unlinked_logs: list[str] = []
+    for sid in removed:
+        safe_lp = detached_log_path(sid, V3_ROOT / "state" / "detached_logs" / f"{sid}.log")
+        if safe_lp is not None:
+            try:
+                safe_lp.unlink(missing_ok=True)
+                unlinked_logs.append(sid)
+            except OSError:
+                pass
+    orphan_logs_removed: list[str] = []
+    if scope is None:
+        from detached_log_guard import sweep_orphan_detached_logs
+        with STATE.lock:
+            active_ids = set(STATE.sessions.keys())
+        orphan_logs_removed = sweep_orphan_detached_logs(
+            V3_ROOT / "state" / "detached_logs",
+            active_session_ids=active_ids,
+            persisted_session_ids=persisted_ids,
+            older_than_seconds=age,
+            validator=detached_log_path,
+        )
     return {"removed": removed, "owned_job_descendants_verified": verified_jobs,
+            "detached_logs_unlinked": unlinked_logs,
+            "orphan_logs_removed": orphan_logs_removed,
             "cleanup_failed": cleanup_failed,
             "scope_enforced": scope is not None,
             "other_task_sessions_skipped": skipped_foreign}
