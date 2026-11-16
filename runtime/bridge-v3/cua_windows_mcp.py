@@ -42,6 +42,9 @@ class WorkerPool:
 
     def call(self, request, first_timeout=FIRST_CALL_TIMEOUT, timeout=CALL_TIMEOUT):
         with self._lock:
+            if request.get("physical"):
+                from cua_task_authority import check_desktop_action
+                check_desktop_action()
             # A Windows CI or busy host can delay Timer's callback. The idle
             # deadline is authoritative: never reuse an expired worker even if
             # its asynchronous cleanup has not run yet.
@@ -53,6 +56,11 @@ class WorkerPool:
                 self._start()
             request = {"id": uuid.uuid4().hex, **request}
             try:
+                # Startup/queueing can be slow. Recheck immediately before
+                # dispatch; a post-dispatch Stop cannot undo an external call.
+                if request.get("physical"):
+                    from cua_task_authority import check_desktop_action
+                    check_desktop_action()
                 self._proc.stdin.write((json.dumps(request, ensure_ascii=False) + "\n").encode("utf-8"))
                 self._proc.stdin.flush()
                 line = self._lines.get(timeout=timeout if reused else first_timeout)

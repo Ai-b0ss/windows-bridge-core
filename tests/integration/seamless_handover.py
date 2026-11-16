@@ -2,8 +2,8 @@
 
 Run with: python tests/integration/seamless_handover.py
 
-Old instance A owns the public port and a running session. Standby B shares the public port
-(SO_REUSEADDR: the first listener keeps receiving) and answers on its own check port.
+Old instance A owns the public port and a running session. Standby B waits without binding the public port
+and answers on its own check port, then adopts a duplicate of A's listener.
 While 24 clients hammer the public port, A is told to `drain`: the public listener closes,
 B takes every new connection, and A keeps serving its session through B's forwarding.
 Fails if one request is lost, if the session output is not reachable, or if A leaves early.
@@ -52,11 +52,14 @@ def rpc(port: int, secret: str, op: str, args: dict, timeout: float = 15) -> dic
         return json.loads(exc.read())
 
 
-def launch(root: Path, public: int, also: list[int], linger: str) -> subprocess.Popen:
+def launch(root: Path, public: int, also: list[int], linger: str,
+           *, standby: bool = False) -> subprocess.Popen:
     env = {**os.environ, "FF_BRIDGE_ROOT": str(root), "FF_DRAIN_LINGER_SECONDS": linger}
     cmd = [sys.executable, str(SERVER), "serve", "--host", "127.0.0.1", "--port", str(public)]
     for port in also:
         cmd += ["--also-listen", str(port)]
+    if standby:
+        cmd.append("--standby")
     return subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
@@ -99,8 +102,8 @@ def main() -> int:
             session_id = started["result"]["session_id"]
             checks.append("old_instance_runs_session")
 
-            # Standby shares the public port; the first listener (A) must keep every connection.
-            b = launch(root, public, [b_check], "3")
+            # Standby has no public listener before its authenticated WinSock handoff.
+            b = launch(root, public, [b_check], "3", standby=True)
             wait_ready(b, b_check, secret_file, "B")
             pid_b = rpc(b_check, secret, "ping", {})["result"]["pid"]
             verify(pid_b != pid_a, "STANDBY_NOT_SEPARATE_PROCESS")

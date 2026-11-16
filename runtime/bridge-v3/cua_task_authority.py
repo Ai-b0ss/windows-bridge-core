@@ -19,12 +19,24 @@ import re
 import secrets
 import sqlite3
 import time
+from cua_owner_stop import stop_requested
 
 APPROVED_EFFECT = ContextVar("approved_effect", default=False)
 DESKTOP_ACTION_EXPIRY = ContextVar("desktop_action_expiry", default=None)
+DESKTOP_ACTION_CHECK = ContextVar("desktop_action_check", default=None)
 
 class AuthorityError(RuntimeError):
     pass
+
+
+def check_desktop_action():
+    """Recheck Stop at dispatch/event boundaries inside a physical action."""
+    check = DESKTOP_ACTION_CHECK.get()
+    if check is not None:
+        check()
+    expiry = DESKTOP_ACTION_EXPIRY.get()
+    if expiry is not None and expiry <= time.time():
+        raise AuthorityError("DESKTOP_MODE_EXPIRED")
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
@@ -51,6 +63,10 @@ class AuthorityStore:
         # never be present in the bridge, scripts, ZIP or logs.
         key_path = self.root / "owner-approval-public.json"
         self.public_key = public_key if public_key is not None else json.loads(key_path.read_bytes()) if key_path.is_file() else None
+
+    def _require_running(self):
+        if stop_requested(self.root.parent / "chat-permission"):
+            raise AuthorityError("OWNER_STOPPED")
 
     def _verify_signature(self, approval):
         if not self.public_key:
@@ -89,6 +105,7 @@ class AuthorityStore:
         This may be transported by an agent; transport does not confer consent.
         An unsigned local/RPC assertion cannot provision an approval.
         """
+        self._require_running()
         return self._record_approval(self._verify_signature(signed_approval))
 
     def provision_local_desktop(self, delegation):
@@ -132,6 +149,7 @@ class AuthorityStore:
         return self._record_approval(delegation)
 
     def _record_approval(self, payload):
+        self._require_running()
         agent, task, request = payload.get("agent"), payload.get("task"), payload.get("request")
         if not isinstance(request, dict): raise AuthorityError("OWNER_APPROVAL_SCOPE_INVALID")
         # Device is covered by the exact signed payload (or trusted local
@@ -169,9 +187,11 @@ class AuthorityStore:
                 (grant, agent, task, digest, device, expires, uses, approval_reference),
             )
             con.commit()
+        self._require_running()
         return grant
 
     def consume(self, grant, *, agent, task, request):
+        self._require_running()
         identity(agent); identity(task)
         digest = hashlib.sha256(canonical(request).encode()).hexdigest()
         with closing(self._connect()) as con:
@@ -192,6 +212,7 @@ class AuthorityStore:
                 raise AuthorityError("OWNER_APPROVAL_EXPIRED_OR_CONSUMED")
             con.execute("UPDATE approvals_v2 SET uses=uses-1 WHERE id=?", (grant,))
             con.commit()
+        self._require_running()
         return row[4]
 
     def revoke(self, grant):
@@ -211,6 +232,23 @@ class AuthorityStore:
 
 def guard_effect(core, store, op, original, *, chat_permission=None):
     def guarded(args):
+        def check_stop():
+            # Both chat and signed approvals obey the same owner Stop.
+            if chat_permission is not None:
+                state_dir = chat_permission.state_dir
+            elif store is not None:
+                state_dir = store.root.parent / "chat-permission"
+            else:
+                # Legacy embedded tests can install this wrapper without an
+                # authority store. A real Bridge still supplies BRIDGE_ROOT.
+                bridge_root = getattr(core, "BRIDGE_ROOT", None)
+                if bridge_root is None:
+                    return
+                state_dir = Path(bridge_root) / "state" / "chat-permission"
+            if stop_requested(state_dir):
+                raise core.RPCError("OWNER_STOPPED", details={"execution_started": False, "retry_safe": False})
+
+        check_stop()
         consequence = args.get("consequences")
         if consequence is not None and (not isinstance(consequence, dict) or consequence.get("kind") not in {"ordinary", "destructive", "irreversible"}):
             raise core.RPCError("CONSEQUENCES_INVALID")
@@ -246,9 +284,11 @@ def guard_effect(core, store, op, original, *, chat_permission=None):
                     raise core.RPCError(str(exc) if isinstance(exc, AuthorityError) else "APPROVAL_STORAGE_UNAVAILABLE", details={"execution_started": False}) from exc
             token = APPROVED_EFFECT.set(True)
             try:
+                check_stop()
                 return original(args)
             finally:
                 APPROVED_EFFECT.reset(token)
+        check_stop()
         return original(args)
     return guarded
 
@@ -273,8 +313,14 @@ class DesktopModes:
         self.path = self.root / "desktop-mode.json"
         self.lock_path = self.root / "desktop-mode.lock"
 
+    def _require_running(self):
+        state_dir = self.chat_permission.state_dir if self.chat_permission is not None else self.root.parent / "chat-permission"
+        if stop_requested(state_dir):
+            raise AuthorityError("OWNER_STOPPED")
+
     def _grant_expiry(self, args, op):
         """Expiry from a signed grant, or from the owner's chat permission."""
+        self._require_running()
         if "signed_approval" not in args and "authorization_id" not in args and "owner_chat_permission" in args:
             if self.chat_permission is None:
                 raise AuthorityError("CHAT_PERMISSION_DISABLED")
@@ -294,6 +340,15 @@ class DesktopModes:
             if raw.get("mode") == "dedicated":
                 grants = [{key: raw[key] for key in ("agent_id", "task_id", "targets", "expires", "generation")}]
             raw = {"generation": raw.get("generation", 0), "grants": grants}
+        try:
+            self._require_running()
+        except AuthorityError:
+            if raw["grants"]:
+                # Persist revocation, including grants issued before a restart.
+                self.stop_input()
+                raw = {"generation": raw["generation"] + 1, "grants": []}
+                self._write(raw)
+            return raw
         now = time.time()
         live = [g for g in raw["grants"] if g["expires"] > now]
         if len(live) != len(raw["grants"]):
@@ -347,6 +402,7 @@ class DesktopModes:
         with _StateLock(self.lock_path):
             state = self._read()
             if mode == "dedicated":
+                self._require_running()
                 if not isinstance(agent, str) or not isinstance(task, str) or not agent or not task:
                     raise AuthorityError("AUTHORITY_IDENTITY_INVALID")
                 targets = args.get("targets")
@@ -364,6 +420,7 @@ class DesktopModes:
                 state = {"generation": generation,
                          "grants": [g for g in state["grants"] if g is not mine] + [grant]}
                 self._write(state)
+                self._require_running()
                 return self._view(state, grant)
             # Returning is always allowed, but only for one's own grant: another agent's work is protected.
             if not isinstance(agent, str) or not isinstance(task, str) or not agent or not task:
@@ -398,6 +455,7 @@ class DesktopModes:
         return self.grant_for(agent, task, generation) is not None
 
     def _check_grant(self, state, args):
+        self._require_running()
         grant = self._find(state, args.get("agent_id"), args.get("task_id"))
         if grant is None:
             raise AuthorityError("INTERACTIVE_FOREGROUND_DISABLED")
@@ -406,6 +464,7 @@ class DesktopModes:
         return grant
 
     def _still_granted(self, args, grant, error):
+        self._require_running()
         from cua_global_resources import _StateLock
         with _StateLock(self.lock_path):
             now = self._find(self._read(), args.get("agent_id"), args.get("task_id"))
@@ -423,6 +482,7 @@ class DesktopModes:
                 fingerprint = None
             if fingerprint is None or fingerprint not in grant["targets"]:
                 raise AuthorityError("DESKTOP_TARGET_OUTSIDE_SCOPE")
+            self._require_running()
             return grant
 
     @contextmanager
@@ -431,10 +491,13 @@ class DesktopModes:
         so other agents' grants and actions are never blocked for the length of the action."""
         grant = self.check_scope(args, hwnd)
         token = DESKTOP_ACTION_EXPIRY.set(grant["expires"])
+        stop_token = DESKTOP_ACTION_CHECK.set(self._require_running)
         try:
+            check_desktop_action()
             yield grant
             self._still_granted(args, grant, "DESKTOP_MODE_EXPIRED")  # revoked or expired while it ran
         finally:
+            DESKTOP_ACTION_CHECK.reset(stop_token)
             DESKTOP_ACTION_EXPIRY.reset(token)
 
     @contextmanager
@@ -448,12 +511,15 @@ class DesktopModes:
             expires = self._grant_expiry(args, "computer_use")
         expiry = min(expires, grant["expires"])
         token = DESKTOP_ACTION_EXPIRY.set(expiry)
+        stop_token = DESKTOP_ACTION_CHECK.set(self._require_running)
         try:
+            check_desktop_action()
             yield grant
             if expiry <= time.time():
                 raise AuthorityError("DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH")
             self._still_granted(args, grant, "DESKTOP_LAUNCH_EXPIRED_AFTER_DISPATCH")
         finally:
+            DESKTOP_ACTION_CHECK.reset(stop_token)
             DESKTOP_ACTION_EXPIRY.reset(token)
 
     def status(self, agent=None, task=None):

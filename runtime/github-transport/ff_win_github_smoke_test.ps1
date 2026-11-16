@@ -12,6 +12,11 @@ if (-not (Test-Path -LiteralPath $configPath -PathType Leaf)) {
     throw 'GITHUB_TRANSPORT_NOT_INSTALLED'
 }
 $config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json
+$device = if ($config.PSObject.Properties['device']) { $config.device } else { $null }
+if ($device -isnot [string] -or [string]::IsNullOrWhiteSpace($device) -or
+    $device -cne $device.Trim() -or $device -match '[\x00-\x1f\x7f]') {
+    throw 'TARGET_DEVICE_REQUIRED: set config.device to the exact paired device; no fallback'
+}
 
 $gh = (Get-Command gh.exe -ErrorAction SilentlyContinue | Select-Object -First 1)
 if (-not $gh) {
@@ -52,7 +57,6 @@ function Invoke-GitHub([string]$Method, [string]$Url, $Body = $null) {
 
 $repository = [string]$config.repository
 $issue = [int]$config.inbox_issue
-$device = [string]$config.device
 $taskId = 'manual-smoke-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
 $task = [ordered]@{
     schema = 'ff-win-github-comment-v5'

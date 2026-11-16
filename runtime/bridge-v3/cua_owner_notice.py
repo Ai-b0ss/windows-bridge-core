@@ -12,6 +12,7 @@ import os
 import subprocess
 import time
 from pathlib import Path
+from cua_owner_stop import stop_requested
 
 SCRIPT = Path(__file__).with_name("cua_owner_notice.ps1")
 CREATE_NO_WINDOW = 0x08000000
@@ -35,13 +36,7 @@ class OwnerNotice:
         return self.dir / "notice-heartbeat"
 
     def stop_requested(self) -> bool:
-        return self.stop_path.exists()
-
-    def clear_stop(self) -> None:
-        try:
-            self.stop_path.unlink()
-        except FileNotFoundError:
-            pass
+        return stop_requested(self.dir)
 
     def action(self, agent: str, task: str, generation, apps_text: str = "") -> bool:
         """Refresh the heartbeat and show the notice if none is running. Returns True if visible."""

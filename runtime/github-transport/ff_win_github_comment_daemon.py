@@ -7,15 +7,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ff_win_transport_paths
 import base64
 import concurrent.futures
+import errno
 import gzip
 import hashlib
 import http.client
 import json
+import math
 import msvcrt
 import os
 import platform
 import queue
+import random
 import re
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -37,7 +41,7 @@ if CONFIG.get("rpc_url"):
 if CONFIG.get("background_rpc_url"):
     os.environ.setdefault("FF_V3_BACKGROUND_RPC_URL", CONFIG["background_rpc_url"])
 os.environ.setdefault("FF_TRANSPORT_MAX_RESULT_BYTES", str(2 * 1024 * 1024))
-from ff_win_transport_core import execute_task
+from ff_win_transport_core import execute_task, is_safe, recover_outbox_result, RpcFailure, TransportCoreError
 from ff_win_transport_faults import barrier
 
 REPOSITORY = os.environ.get("FF_GH_REPOSITORY") or CONFIG.get("repository", "Ai-b0ss/windows-agent-bridge")
@@ -128,6 +132,12 @@ def get_token() -> str:
     return token
 
 
+class GitHubHTTPError(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(message)
+        self.status = status
+
+
 class GitHubREST:
     def __init__(self, token: str):
         self.token = token
@@ -190,7 +200,7 @@ class GitHubREST:
                     if method != "GET" or status != 304:
                         trace("api_response", method=method, path=path, status=status, resource=resource, rate=self.rate[resource])
                 if status in (502, 503, 504):
-                    raise RuntimeError(f"GH_HTTP_{status}")
+                    raise GitHubHTTPError(status, f"GH_HTTP_{status}")
                 if status in (403, 429):
                     message = body.decode("utf-8", "replace").lower()
                     retry_after = meta.get("retry-after")
@@ -227,6 +237,21 @@ def parse_json(body: bytes) -> Any:
     return json.loads(body.decode("utf-8-sig")) if body else None
 
 
+def valid_target_device(value: Any) -> bool:
+    """Require an explicit name; never coerce, trim or infer a destination."""
+    return (isinstance(value, str) and bool(value) and value == value.strip()
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
+
+
+def _unique_task_fields(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("TASK_DUPLICATE_JSON_KEY")
+        value[key] = item
+    return value
+
+
 def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
     if str((comment.get("user") or {}).get("login", "")).lower() not in ALLOWED_SENDERS:
         return None
@@ -234,7 +259,7 @@ def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(body, str):
         return None
     try:
-        task = json.loads(body.lstrip("\ufeff").strip())
+        task = json.loads(body.lstrip("\ufeff").strip(), object_pairs_hook=_unique_task_fields)
     except Exception:
         return None
     if not isinstance(task, dict) or task.get("schema") != SCHEMA:
@@ -251,7 +276,11 @@ def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
     if not isinstance(task.get("args", {}), dict):
         return None
     target = task.get("target_device")
-    if target and str(target).lower() != DEVICE.lower():
+    if not valid_target_device(target):
+        trace("task_rejected", comment_id=comment.get("id"), reason="TARGET_DEVICE_REQUIRED")
+        return None
+    if not valid_target_device(DEVICE) or target.lower() != DEVICE.lower():
+        trace("task_rejected", comment_id=comment.get("id"), reason="TARGET_DEVICE_MISMATCH")
         return None
     return task
 
@@ -298,6 +327,19 @@ class CommentTransport:
         self.outbox.mkdir(parents=True, exist_ok=True)
         self.requests = GH_HOME / "pending-requests"
         self.requests.mkdir(parents=True, exist_ok=True)
+        self.retries = GH_HOME / "request-retries"
+        self.retries.mkdir(parents=True, exist_ok=True)
+        self.retry_deadlines: dict[int, float] = {}
+        # Only the trusted local config controls this budget, never a task body.
+        def limit(name, default, low, high):
+            value = float(CONFIG.get(name, default))
+            if not math.isfinite(value):
+                raise ValueError("INVALID_LOCAL_RETRY_CONFIG:" + name)
+            return max(low, min(high, value))
+        self.retry_attempts = int(limit("task_retry_attempts", 6, 1, 32))
+        self.retry_seconds = limit("task_retry_seconds", 300, 1, 3600)
+        self.retry_base = limit("task_retry_base_seconds", 1, .1, 30)
+        self.retry_cap = limit("task_retry_cap_seconds", 30, self.retry_base, 300)
         self.last_recover_at = 0.0
         self.counters = {
             "poll_200": 0,
@@ -530,6 +572,96 @@ class CommentTransport:
             return True
         if status == 409 and isinstance(result, dict) and result.get("error_code") == "TASK_IN_PROGRESS":
             return True
+        return False
+
+    def retry_identity(self, comment, task):
+        raw = json.dumps(task, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return {"repository": REPOSITORY, "comment_id": int(comment["id"]),
+                "task_sha256": hashlib.sha256(raw).hexdigest()}
+
+    def load_retry(self, comment, task):
+        cid = int(comment["id"])
+        path = self.retries / (str(cid) + ".json")
+        identity = self.retry_identity(comment, task)
+        if path.exists():
+            state = json.loads(path.read_text(encoding="utf-8"))
+            if state.get("schema") != "ff-gh-request-retry-v1" or state.get("identity") != identity:
+                raise ValueError("RETRY_IDENTITY_CONFLICT")
+        else:
+            issue = re.fullmatch(r"https://api\.github\.com/repos/" + re.escape(REPOSITORY) + r"/issues/(\d+)",
+                                 str(comment.get("issue_url", "")))
+            state = {"schema": "ff-gh-request-retry-v1", "identity": identity,
+                     "inbox_issue": int(issue[1]) if issue else self.inbox,
+                     "attempts": 0, "status": "waiting",
+                     "remaining_seconds": self.retry_seconds, "saved_at": time.time(),
+                     "next_retry_at": 0, "received_at_ms": now_ms()}
+        if cid not in self.retry_deadlines:
+            # Wall time is used only to bridge a reboot. Clock rollback cannot
+            # enlarge the saved budget; a running daemon uses monotonic time.
+            elapsed = max(0, time.time() - state["saved_at"])
+            remaining = max(0, min(self.retry_seconds, state["remaining_seconds"]) - elapsed)
+            self.retry_deadlines[cid] = time.monotonic() + remaining
+            delay = min(self.retry_cap, max(0, state["next_retry_at"] - time.time()))
+            self.retry_after[cid] = time.monotonic() + delay
+        return state
+
+    def save_retry(self, cid, state):
+        state["remaining_seconds"] = max(0, self.retry_deadlines[cid] - time.monotonic())
+        state["saved_at"] = time.time()
+        path = self.retries / (str(cid) + ".json")
+        temp = path.with_suffix(".tmp")
+        with temp.open("w", encoding="utf-8") as stream:
+            json.dump(state, stream, ensure_ascii=False, separators=(",", ":"))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+
+    def clear_retry(self, cid):
+        (self.retries / (str(cid) + ".json")).unlink(missing_ok=True)
+        self.retry_after.pop(cid, None)
+        self.retry_deadlines.pop(cid, None)
+
+    def retry_failure(self, cid, state, code, retryable):
+        remaining = self.retry_deadlines[cid] - time.monotonic()
+        exhausted = state["attempts"] >= self.retry_attempts or remaining <= 0
+        state.update(status="quarantined" if exhausted or not retryable else "waiting",
+                     error_code=code, retryable=retryable,
+                     quarantine_reason="RETRY_BUDGET_EXHAUSTED" if exhausted else code)
+        if state["status"] == "waiting":
+            ceiling = min(self.retry_cap, self.retry_base * 2 ** min(state["attempts"] - 1, 31))
+            delay = min(remaining, random.uniform(ceiling / 2, ceiling))
+            self.retry_after[cid] = time.monotonic() + delay
+            state["next_retry_at"] = time.time() + delay
+            self.counters["transient_retries"] += 1
+        else:
+            self.counters["tasks_failed"] += 1
+        self.last_error = state["quarantine_reason"]
+        self.save_retry(cid, state)
+        trace("request_retry_state", comment_id=cid, attempts=state["attempts"],
+              status=state["status"], error_code=code)
+
+    @staticmethod
+    def retryable_exception(exc, task):
+        # Unexpected/configuration errors are quarantined, not presumed transient.
+        if isinstance(exc, (FileNotFoundError, PermissionError)):
+            return False
+        if isinstance(exc, GitHubHTTPError):
+            return exc.status in {408, 429, 500, 502, 503, 504} or (
+                exc.status == 403 and _rate_gate_until > time.monotonic())
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+        if isinstance(exc, OSError):
+            return exc.errno in {errno.EAGAIN, errno.EINTR, errno.EBUSY, errno.ECONNREFUSED,
+                                 errno.ETIMEDOUT, errno.ECONNRESET, errno.ECONNABORTED,
+                                 errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN, errno.EPIPE}
+        if isinstance(exc, http.client.HTTPException):
+            return not isinstance(exc, http.client.InvalidURL)
+        if isinstance(exc, sqlite3.OperationalError):
+            return (getattr(exc, "sqlite_errorcode", -1) & 0xff) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+        if is_safe(task["op"]) and isinstance(exc, TransportCoreError):
+            cause = exc.cause if isinstance(exc, RpcFailure) else exc.__cause__
+            if cause is not None:
+                return CommentTransport.retryable_exception(cause, task)
         return False
 
     def paced_mutation(
@@ -850,6 +982,9 @@ class CommentTransport:
     def mark_published(self, item):
         item["published"] = True
         self.save_outbox(item)
+        # Clear the new checkpoint before deleting its recovery trigger. If
+        # power is lost here, cached-outbox recovery completes the cleanup.
+        self.clear_retry(int(item["comment_id"]))
         (self.requests / (str(item["comment_id"]) + ".json")).unlink(missing_ok=True)
         trace("durable_published", comment_id=item["comment_id"])
 
@@ -859,11 +994,11 @@ class CommentTransport:
         if status == 200:
             return
         if status != 404:
-            raise RuntimeError(f"GH_RESULTS_REF_HTTP_{status}:{raw[:300]!r}")
+            raise GitHubHTTPError(status, f"GH_RESULTS_REF_HTTP_{status}:{raw[:300]!r}")
 
         status, _, raw = self.api.request("GET", f"/repos/{OWNER}/{REPO}/git/ref/heads/{quote(SOURCE_BRANCH, safe='')}")
         if status != 200:
-            raise RuntimeError(f"GH_MAIN_REF_HTTP_{status}:{raw[:300]!r}")
+            raise GitHubHTTPError(status, f"GH_MAIN_REF_HTTP_{status}:{raw[:300]!r}")
         main_sha = parse_json(raw)["object"]["sha"]
         status, _, raw = self.paced_mutation(
             "POST",
@@ -871,7 +1006,7 @@ class CommentTransport:
             {"ref": f"refs/heads/{RESULTS_BRANCH}", "sha": main_sha},
         )
         if status not in (201, 422):
-            raise RuntimeError(f"GH_RESULTS_REF_CREATE_HTTP_{status}:{raw[:300]!r}")
+            raise GitHubHTTPError(status, f"GH_RESULTS_REF_CREATE_HTTP_{status}:{raw[:300]!r}")
 
     def store_large_result(self, comment_id: int, task_id: str, raw: bytes) -> dict[str, Any]:
         compressed = gzip.compress(raw, compresslevel=6)
@@ -898,8 +1033,8 @@ class CommentTransport:
                         f"/repos/{OWNER}/{REPO}/contents/{api_path}?ref={quote(RESULTS_BRANCH, safe='')}",
                     )
                     if check != 200:
-                        raise RuntimeError(
-                            f"GH_LARGE_RESULT_HTTP_{status}:{response[:300]!r}"
+                        raise GitHubHTTPError(
+                            check, f"GH_LARGE_RESULT_HTTP_{check}:{existing[:300]!r}"
                         )
                     check, _, stored = self.api.request(
                         "GET", f"/repos/{OWNER}/{REPO}/contents/{api_path}?ref={quote(RESULTS_BRANCH, safe='')}",
@@ -907,8 +1042,8 @@ class CommentTransport:
                     if check != 200 or hashlib.sha256(gzip.decompress(stored)).hexdigest() != digest:
                         raise RuntimeError("GH_LARGE_RESULT_EXISTING_CONTENT_CONFLICT")
                 else:
-                    raise RuntimeError(
-                        f"GH_LARGE_RESULT_HTTP_{status}:{response[:300]!r}"
+                    raise GitHubHTTPError(
+                        status, f"GH_LARGE_RESULT_HTTP_{status}:{response[:300]!r}"
                     )
 
         return {
@@ -943,65 +1078,91 @@ class CommentTransport:
     def process(self, comment: dict[str, Any], task: dict[str, Any], received_ms: int) -> None:
         cid = int(comment["id"])
         started = time.perf_counter()
-        trace("execute_start", comment_id=cid, received_at_ms=received_ms)
         queued_for_publish = False
+        state = None
         try:
-            retry_delay = 1.0
-            while True:
+            # Recheck at the execution boundary, including queued/recovered work.
+            # Execute the freshly parsed envelope, never an independently supplied task.
+            verified = parse_task(comment)
+            if verified is None:
+                return
+            if verified != task:
+                trace("task_rejected", comment_id=cid, reason="TASK_VALIDATION_MISMATCH")
+                return
+            task = verified
+            trace("execute_start", comment_id=cid, received_at_ms=received_ms)
+            state = self.load_retry(comment, task)
+            if state["status"] == "quarantined":
+                return
+            if state["attempts"] >= self.retry_attempts or time.monotonic() >= self.retry_deadlines[cid]:
+                self.retry_failure(cid, state, "RETRY_BUDGET_EXHAUSTED", True)
+                return
+            # Charge before dispatch so process death cannot reset the budget.
+            state["attempts"] += 1
+            state["status"] = "running"
+            self.save_retry(cid, state)
+            if "completed_result" not in state:
+
                 try:
                     status, payload, route = execute_task(task)
                 except Exception as exc:
-                    self.counters["transient_retries"] += 1
-                    self.last_error = f"{type(exc).__name__}:{exc}"[:500]
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2.0, 30.0)
-                    continue
-
-                if self.transient(status, payload):
-                    self.counters["transient_retries"] += 1
-                    self.last_error = (
-                        f"TRANSIENT_HTTP_{status}:"
-                        f"{payload.get('error_code') if isinstance(payload, dict) else 'UNKNOWN'}"
-                    )[:500]
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2.0, 30.0)
-                    continue
-                if status == 503 and payload.get("error_code") == "INTERACTIVE_SESSION_REQUIRED":
-                    self.retry_after[cid] = time.monotonic() + 5
+                    self.retry_failure(cid, state, type(exc).__name__, self.retryable_exception(exc, task))
                     return
-                break
-
-            ok = 200 <= status < 300 and not (
-                isinstance(payload, dict) and payload.get("ok") is False
-            )
-            result = {
-                "schema": RESULT_SCHEMA,
-                "transport_version": 5,
-                "inbox_issue": self.inbox,
-                "comment_id": cid,
-                "device": DEVICE,
-                "task": task,
-                "outcome": "PASS" if ok else "FAILED",
-                "http_status": status,
-                "route": route,
-                "result": payload,
-                "received_at_ms": received_ms,
-                "completed_at_ms": now_ms(),
-                "worker_elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
-            }
+                code = payload.get("error_code") if isinstance(payload, dict) else None
+                if not isinstance(code, str):
+                    code = "HTTP_" + str(status)
+                # Cached responses and unknown outcomes are terminal. Only the
+                # core's known nondelivery/in-progress states or read-only RPCs
+                # may be scheduled again; never reinterpret a mutation's 5xx.
+                retryable = route.get("route") != "journal-cache" and not route.get("automatic_retry_blocked") and code not in {
+                    "TASK_OUTCOME_UNKNOWN", "TASK_OUTCOME_EXPIRED", "TASK_ID_PAYLOAD_CONFLICT"} and (
+                    self.transient(status, payload)
+                    or (status == 503 and code == "INTERACTIVE_SESSION_REQUIRED")
+                    or (is_safe(task["op"]) and status in {408, 429, 500, 502, 503, 504}))
+                if retryable:
+                    self.retry_failure(cid, state, code, True)
+                    return
+                ok = 200 <= status < 300 and not (
+                    isinstance(payload, dict) and payload.get("ok") is False)
+                state["completed_result"] = {
+                    "schema": RESULT_SCHEMA, "transport_version": 5,
+                    "inbox_issue": state["inbox_issue"], "comment_id": cid,
+                    "device": DEVICE, "task": task,
+                    "outcome": "PASS" if ok else "FAILED", "http_status": status,
+                    "route": route, "result": payload,
+                    "received_at_ms": state["received_at_ms"], "completed_at_ms": now_ms(),
+                    "worker_elapsed_ms": round((time.perf_counter() - started) * 1000, 2),
+                }
+                # Publication may fail before an outbox exists (large result).
+                # Resume this exact result, including read-only replies.
+                self.save_retry(cid, state)
+            result = state["completed_result"]
             self.publish_result(comment, task["task_id"], result)
             trace("execute_end", comment_id=cid, completed_at_ms=result["completed_at_ms"])
             queued_for_publish = True
             self.etag = None
-            self.retry_after.pop(cid, None)
-            if ok:
+            self.clear_retry(cid)
+            if result["outcome"] == "PASS":
                 self.counters["tasks_pass"] += 1
             else:
                 self.counters["tasks_failed"] += 1
             self.last_error = None
         except Exception as exc:
-            self.counters["tasks_failed"] += 1
             self.last_error = f"{type(exc).__name__}:{exc}"[:500]
+            # A failed local write cannot authorize a dispatch. Preserve pending
+            # identity and journal; throttle recovery even when disk is broken.
+            self.retry_after[cid] = time.monotonic() + self.retry_cap
+            if state is not None:
+                try:
+                    code = "GH_HTTP_" + str(exc.status) if isinstance(exc, GitHubHTTPError) else type(exc).__name__
+                    # Once an exact completed response was persisted, its
+                    # publication is idempotent even if the I/O exception is
+                    # not a network error. Retry the saved response, never the RPC.
+                    can_republish = "completed_result" in state
+                    self.retry_failure(cid, state, code,
+                                       can_republish or self.retryable_exception(exc, task))
+                except Exception:
+                    self.counters["tasks_failed"] += 1
         finally:
             if not queued_for_publish:
                 with self.active_lock:
@@ -1012,24 +1173,85 @@ class CommentTransport:
         if task is None:
             return
         cid = int(comment["id"])
-        if self.retry_after.get(cid, 0.0) > time.monotonic():
-            return
         with self.active_lock:
             if cid in self.active:
                 return
             self.active.add(cid)
-        self.last_received_at = time.monotonic()
-        saved = self.outbox / (str(cid) + ".json")
-        if saved.exists():
-            item = json.loads(saved.read_text(encoding="utf-8"))
-            if item.get("published"):
-                (self.requests / (str(cid) + ".json")).unlink(missing_ok=True)
+        handed_off = False
+        try:
+            self.last_received_at = time.monotonic()
+            saved = self.outbox / (str(cid) + ".json")
+            candidates = []
+            for path in (saved, saved.with_suffix(".tmp")):
+                try:
+                    candidates.append((path, path.read_bytes()))
+                except FileNotFoundError:
+                    continue
+            if candidates:
+                path, raw = candidates[0]
+                try:
+                    item = self.validate_outbox(raw, comment, task)
+                except (ValueError, TypeError, KeyError):
+                    item = None
+                for evidence_path, evidence in candidates:
+                    if item is None or evidence_path.suffix == ".tmp":
+                        self.quarantine_outbox(evidence_path, evidence, cid)
+                if item is not None:
+                    if path.suffix == ".tmp":
+                        self.save_outbox(item)
+                    if item["published"]:
+                        (self.requests / (str(cid) + ".json")).unlink(missing_ok=True)
+                    else:
+                        self.publish_queue.put(item)
+                        handed_off = True
+                    self.clear_retry(cid)
+                    return
+                # An unreadable outbox can mean an RPC already executed.
+                # Never automatically replay an unsafe operation.
+                self.retain_request(comment)
+                if not is_safe(task["op"]):
+                    status, payload, route = recover_outbox_result(task)
+                    self.publish_result(comment, task["task_id"], {
+                        "schema": RESULT_SCHEMA, "transport_version": 5,
+                        "inbox_issue": self.inbox, "comment_id": cid,
+                        "device": DEVICE, "task": task,
+                        "outcome": "FAILED" if status >= 300 or payload.get("ok") is False else "PASS",
+                        "http_status": status, "route": route, "result": payload,
+                        "completed_at_ms": now_ms(),
+                    })
+                    self.clear_retry(cid)
+                    handed_off = True
+                    return
+            request = self.requests / (str(cid) + ".json")
+            if request.exists():
+                original = json.loads(request.read_text(encoding="utf-8"))
+                original_task = parse_task(original)
+                if original_task is None:
+                    raise ValueError("PENDING_REQUEST_INVALID")
+                if self.retry_identity(original, original_task) != self.retry_identity(comment, task):
+                    state = self.load_retry(original, original_task)
+                    self.retry_failure(cid, state, "PENDING_REQUEST_IDENTITY_CONFLICT", False)
+                    return
+                comment = original
+                task = original_task
+            else:
+                self.retain_request(comment)
+            state = self.load_retry(comment, task)
+            if state["status"] == "quarantined" or self.retry_after.get(cid, 0) > time.monotonic():
+                return
+            self.pool.submit(self.process, comment, task, state["received_at_ms"])
+            handed_off = True
+        except Exception as exc:
+            self.last_error = f"{type(exc).__name__}:{exc}"[:500]
+            self.etag = None
+            raise
+        finally:
+            if not handed_off:
                 with self.active_lock:
                     self.active.discard(cid)
-            else:
-                self.publish_queue.put(item)
-            return
-        request = self.requests / (str(cid) + ".json")
+
+    def retain_request(self, comment):
+        request = self.requests / (str(int(comment["id"])) + ".json")
         if not request.exists():
             temp = request.with_suffix(".tmp")
             with temp.open("w", encoding="utf-8") as stream:
@@ -1037,18 +1259,112 @@ class CommentTransport:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temp, request)
-        self.pool.submit(self.process, comment, task, now_ms())
+
+
+    @staticmethod
+    def validate_outbox(raw, comment, task):
+        def unique_object(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError("OUTBOX_DUPLICATE_KEY")
+                obj[key] = value
+            return obj
+
+        item = json.loads(raw, object_pairs_hook=unique_object)
+        if not isinstance(item, dict) or type(item.get("comment_id")) is not int or \
+                item["comment_id"] != int(comment["id"]) or \
+                item.get("node_id") != comment.get("node_id") or \
+                type(item.get("published")) is not bool or not isinstance(item.get("body"), str):
+            raise ValueError("OUTBOX_IDENTITY_INVALID")
+        result = json.loads(item["body"], object_pairs_hook=unique_object)
+        if not isinstance(result, dict) or result.get("schema") != RESULT_SCHEMA or \
+                type(result.get("transport_version")) is not int or result["transport_version"] != 5 or \
+                type(result.get("inbox_issue")) is not int or result["inbox_issue"] <= 0 or \
+                type(result.get("comment_id")) is not int or result["comment_id"] != item["comment_id"] or \
+                result.get("device") != DEVICE or result.get("outcome") not in {"PASS", "FAILED"} or \
+                type(result.get("http_status")) is not int or not 100 <= result["http_status"] <= 599 or \
+                not isinstance(result.get("route"), dict):
+            raise ValueError("OUTBOX_RESULT_INVALID")
+        expected = task
+        if "large_result" in result and isinstance(result.get("task"), dict) and \
+                "args" not in result["task"] and "args_sha256" in result["task"]:
+            expected = {k: v for k, v in task.items() if k != "args"}
+            expected["args_sha256"] = hashlib.sha256(json.dumps(task.get("args"), sort_keys=True).encode()).hexdigest()
+        if json.dumps(result.get("task"), sort_keys=True) != json.dumps(expected, sort_keys=True):
+            raise ValueError("OUTBOX_TASK_CONFLICT")
+        large = result.get("large_result")
+        if "large_result" in result and (
+            not isinstance(large, dict) or large.get("encoding") != "gzip+json" or
+            not isinstance(large.get("branch"), str) or not large["branch"] or
+            not isinstance(large.get("path"), str) or not large["path"] or
+            not isinstance(large.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", large["sha256"]) or
+            any(type(large.get(key)) is not int or large[key] <= 0 for key in ("original_bytes", "stored_bytes"))
+        ):
+            raise ValueError("OUTBOX_LARGE_RESULT_INVALID")
+        if not isinstance(result.get("result"), dict) and large is None:
+            raise ValueError("OUTBOX_RESULT_MISSING")
+        if isinstance(result.get("result"), dict):
+            ok = 200 <= result["http_status"] < 300 and result["result"].get("ok") is not False
+            if result["outcome"] != ("PASS" if ok else "FAILED"):
+                raise ValueError("OUTBOX_OUTCOME_INVALID")
+        elif result["http_status"] >= 300 and result["outcome"] != "FAILED":
+            raise ValueError("OUTBOX_OUTCOME_INVALID")
+        return item
+
+
+    def quarantine_outbox(self, path, raw, cid):
+        digest = hashlib.sha256(raw).hexdigest()
+        root = self.outbox / "quarantine"
+        root.mkdir(exist_ok=True)
+        name = f"{cid}.{path.suffix[1:]}.{digest}"
+        for target, data in (
+            (root / (name + ".bin"), raw),
+            (root / (name + ".json"), json.dumps({
+                "comment_id": cid, "source": path.name, "sha256": digest,
+                "reason": "OUTBOX_INVALID_OR_INTERRUPTED", "at_ms": now_ms(),
+            }, separators=(",", ":")).encode("utf-8")),
+        ):
+            temp = target.with_suffix(target.suffix + ".tmp")
+            with temp.open("wb") as stream:
+                stream.write(data)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp, target)
+        trace("outbox_quarantined", comment_id=cid, sha256=digest, source=path.name)
+
 
     def recover_requests(self):
-        if time.monotonic() - self.last_recover_at < 15:
+        if time.monotonic() - self.last_recover_at < 1:
             return
         self.last_recover_at = time.monotonic()
         for path in self.requests.glob("*.json"):
-            self.submit(json.loads(path.read_text(encoding="utf-8")))
+            try:
+                self.submit(json.loads(path.read_text(encoding="utf-8")))
+            except Exception as exc:
+                # One unreadable request/outbox must not prevent dispatch of
+                # later healthy requests. Keep the original evidence in place.
+                self.last_error = "REQUEST_RECOVERY_" + type(exc).__name__
+                trace("request_recovery_error", file=path.name, error_type=type(exc).__name__)
 
     def health(self) -> None:
         with self.active_lock:
             active = len(self.active)
+        retry_states = []
+        waiting = 0
+        login = 0
+        for path in self.retries.glob("*.json"):
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+                if state.get("status") == "waiting":
+                    waiting += 1
+                    login += int(state.get("error_code") == "INTERACTIVE_SESSION_REQUIRED")
+                if state.get("status") == "quarantined":
+                    retry_states.append({"comment_id": state["identity"]["comment_id"],
+                                         "error_code": state.get("quarantine_reason"),
+                                         "attempts": state["attempts"]})
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                retry_states.append({"error_code": "RETRY_STATE_UNREADABLE", "file": path.name})
         write_health(
             {
                 "schema": "ff-win-github-comment-health-v5",
@@ -1064,7 +1380,10 @@ class CommentTransport:
             "trace_errors": _trace_error_count,
                 "api_rate": {"publisher": self.api.rate, "poller": self.poll_api.rate},
                 "durable_pending": len(self.durable_pending),
-                "waiting_for_login": len(self.retry_after),
+                "waiting_for_login": login,
+                "scheduled_retries": waiting,
+                "quarantined_requests": len(retry_states),
+                "quarantine_sample": retry_states[:16],
                 "mutation_hour_count": len(self.mutation_times),
                 "github_cooldown_seconds": max(0, round(_rate_gate_until-time.monotonic(),2)),
                 "last_poll_ms": now_ms(),

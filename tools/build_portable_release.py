@@ -28,7 +28,7 @@ ROOT_FILES = {
     "ADDONS.cmd", "OPTIONAL-ADDONS.md", "REMOTE-PAIRING.md",
     "CHATGPT-REMOTE-CONTROL.md",
 }
-TOOL_FILES = {"tools/bridge_remote_gh.py", "tools/optional_addons.py"}
+TOOL_FILES = {"tools/bridge_remote_gh.py", "tools/optional_addons.py", "tools/cua_cold_rollback_bundle.py", "tools/cua_cold_recovery_watchdog.py"}
 TEXT_EXTENSIONS = (".py", ".ps1", ".cmd", ".json", ".mjs", ".js", ".cs", ".md", ".txt")
 SECRET_PATTERNS = (
     rb"gh[pousr]_[A-Za-z0-9]{24,}", rb"github_pat_[A-Za-z0-9_]{30,}",

@@ -12,6 +12,7 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -27,9 +28,101 @@ from cua_windows_paths import extended_path
 
 SCHEMA = "cua-runtime-install/v1"
 LOCK_SCHEMA = "cua-runtime-deploy-lock/v1"
+JOURNAL_SCHEMA = LOCK_SCHEMA + "/journal/v2"
 MANIFEST_NAME = "installed-runtime-manifest.json"
 LOCK_NAME = ".cua-runtime-deploy-lock.json"
 TX_DIR_NAME = ".cua-deploy"
+
+
+@contextmanager
+def _windows_plain_handle(path: Path, *, directory: bool = False, delete: bool = False):
+    """Pin a non-reparse object; deny renames and (for files) concurrent writes."""
+    from ctypes import wintypes
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.GetFileInformationByHandleEx.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                   ctypes.c_void_p, wintypes.DWORD]
+    kernel.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    # READ_ATTRIBUTES alone is a metadata-only open and does not enforce
+    # sharing restrictions. FILE_LIST_DIRECTORY must participate in the open.
+    access = 0x81 if directory else 0x80000000  # list + attributes / GENERIC_READ
+    if delete:
+        access |= 0x10000  # DELETE
+    handle = kernel.CreateFileW(str(extended_path(path, force=True)), access,
+                                3 if directory else 1, None, 3,
+                                0x00200000 | (0x02000000 if directory else 0), None)
+    if handle == wintypes.HANDLE(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        attributes = (wintypes.DWORD * 2)()  # FILE_ATTRIBUTE_TAG_INFO
+        if not kernel.GetFileInformationByHandleEx(handle, 9, attributes, ctypes.sizeof(attributes)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if attributes[0] & 0x400 or bool(attributes[0] & 0x10) != directory:
+            raise RuntimeError("DEPLOY_REPARSE_OR_TYPE_FORBIDDEN")
+        yield handle
+    finally:
+        kernel.CloseHandle(handle)
+
+
+class _DirectoryPins(ExitStack):
+    """Keep checked Windows directory components from being swapped for junctions."""
+    def __init__(self):
+        super().__init__()
+        self.paths: dict[Path, ExitStack] = {}
+
+    def pin(self, path: Path, *, create: bool = False) -> None:
+        path = extended_path(Path(os.path.abspath(path)), force=True)
+        if path in self.paths:
+            return
+        if path.parent != path:
+            self.pin(path.parent, create=create)
+        if create:
+            path.mkdir(exist_ok=True)
+        context = self.enter_context(ExitStack())
+        if os.name == "nt":
+            context.enter_context(_windows_plain_handle(path, directory=True))
+        elif path.is_symlink() or not path.is_dir():
+            raise RuntimeError("DEPLOY_REPARSE_OR_TYPE_FORBIDDEN")
+        self.paths[path] = context
+
+    def release_tree(self, root: Path) -> None:
+        for path in reversed(list(self.paths)):
+            if path.is_relative_to(root):
+                self.paths.pop(path).close()
+
+
+def _retire_file(path: Path, expected_sha: str) -> None:
+    """Hash and delete the SAME locked file, never a later occupant of its name."""
+    if os.name != "nt":
+        raise RuntimeError("RETIRE_WINDOWS_REQUIRED")
+    import msvcrt
+    from ctypes import wintypes
+    with _windows_plain_handle(path, delete=True) as handle:
+        # Duplicate the handle: fdopen owns its duplicate, the context owns the original.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.DuplicateHandle.argtypes = [wintypes.HANDLE, wintypes.HANDLE, wintypes.HANDLE,
+                                           ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
+                                           wintypes.BOOL, wintypes.DWORD]
+        kernel.DuplicateHandle.restype = wintypes.BOOL
+        process = kernel.GetCurrentProcess()
+        duplicate = wintypes.HANDLE()
+        if not kernel.DuplicateHandle(process, handle, process, ctypes.byref(duplicate), 0, False, 2):
+            raise ctypes.WinError(ctypes.get_last_error())
+        with os.fdopen(msvcrt.open_osfhandle(duplicate.value, os.O_RDONLY | os.O_BINARY), "rb") as stream:
+            actual = hashlib.file_digest(stream, "sha256").hexdigest()
+        if actual != expected_sha:
+            raise RuntimeError("RETIRED_FILE_CHANGED")
+        kernel.SetFileInformationByHandle.argtypes = [wintypes.HANDLE, ctypes.c_int,
+                                                      ctypes.c_void_p, wintypes.DWORD]
+        kernel.SetFileInformationByHandle.restype = wintypes.BOOL
+        disposition = wintypes.BOOL(True)  # FILE_DISPOSITION_INFO
+        if not kernel.SetFileInformationByHandle(handle, 4, ctypes.byref(disposition), ctypes.sizeof(disposition)):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -196,6 +289,155 @@ def build_plan(repo: Path, ref: str = "HEAD") -> dict[str, Any]:
     }
 
 
+def _previous_owned_files(repo: Path, candidate: dict[str, Any], previous: Any) -> dict[str, str]:
+    """The installed manifest is a claim, not authority for retiring owner files.
+
+    Rebuild v1 identity from local Git, restricted to the candidate's history.
+    No fetch, mutable branch name, hash supplied only by the manifest, or
+    current module's legacy COMPONENTS constant can authorize retirement.
+    """
+    try:
+        if not isinstance(previous, dict) or previous.get("schema") != SCHEMA:
+            raise ValueError("schema")
+        head = previous.get("source_head")
+        if (not isinstance(head, str) or len(head) != 40
+                or any(c not in "0123456789abcdef" for c in head)):
+            raise ValueError("commit")
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", head, candidate["source_head"]],
+            capture_output=True, timeout=30, check=False,
+        )
+        if ancestry.returncode != 0:
+            raise ValueError("history unavailable or unrelated")
+        # Always derive old legacy mappings from that commit, even at HEAD.
+        mapping = (_public_runtime_source_map(repo, head)
+                   or _runtime_source_map_from_ref(repo, head))
+        files = []
+        for source, target in mapping.items():
+            raw = git_blob_bytes(repo, head, source)
+            files.append({"source": source, "target": target,
+                          "bytes": len(raw), "sha256": sha256_bytes(raw)})
+        identity = {"head": head, "files": files}
+        release_id = sha256_bytes(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        if previous.get("release_id") != release_id or previous.get("files") != files:
+            raise ValueError("identity differs from Git")
+        return {item["target"]: item["sha256"] for item in files}
+    except (ValueError, KeyError, TypeError, RuntimeError, subprocess.SubprocessError) as exc:
+        raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN") from exc
+
+
+
+def plan_manifest_reconciliation(
+    repo: Path, runtime_root: Path, *, trusted_head: str, ref: str = "HEAD"
+) -> dict[str, Any]:
+    """READ-ONLY proof for a stale installed manifest; never rewrite installation.
+
+    trusted_head is an independently selected, immutable Git commit. This proof
+    may be used in a separately authorized, backed-up migration, but is NOT
+    permission to replace the installed manifest or bypass apply_runtime().
+    """
+    if (not isinstance(trusted_head, str) or len(trusted_head) != 40
+            or any(c not in "0123456789abcdef" for c in trusted_head)):
+        raise RuntimeError("TRUSTED_HEAD_NOT_PINNED")
+    repo = repo.resolve()
+    root = extended_path(Path(os.path.abspath(runtime_root)), force=True)
+    with _DirectoryPins() as pins:
+        pins.pin(root)
+        manifest_path = root / MANIFEST_NAME
+        if (manifest_path.is_symlink()
+                or getattr(manifest_path, "is_junction", lambda: False)()
+                or not manifest_path.is_file()):
+            raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN")
+        if (root / LOCK_NAME).exists():
+            raise RuntimeError("RECONCILIATION_TRANSACTION_PRESENT")
+        # Historical journal/backup trees can remain without an active lock.
+        # Report them as a rollout blocker, but still prove source bytes.
+        transaction_root = root / TX_DIR_NAME
+        if (transaction_root.is_symlink()
+                or getattr(transaction_root, "is_junction", lambda: False)()
+                or (transaction_root.exists() and not transaction_root.is_dir())):
+            raise RuntimeError("RECONCILIATION_TRANSACTION_INVALID")
+        pending_transactions = 0
+        if transaction_root.is_dir():
+            pins.pin(transaction_root)
+            pending_transactions = sum(1 for _ in transaction_root.iterdir())
+        if os.name == "nt":
+            with _windows_plain_handle(manifest_path):
+                previous_bytes = manifest_path.read_bytes()
+        else:
+            previous_bytes = manifest_path.read_bytes()
+        try:
+            previous = json.loads(previous_bytes.decode("utf-8-sig"))
+            previous_head = previous["source_head"]
+            if (not isinstance(previous_head, str) or len(previous_head) != 40
+                    or any(c not in "0123456789abcdef" for c in previous_head)):
+                raise ValueError("old head not pinned")
+            previous_plan = build_plan(repo, ref=previous_head)
+            if any(previous.get(key) != previous_plan[key]
+                   for key in ("schema", "source_head", "release_id", "files")):
+                raise ValueError("manifest differs from exact Git history")
+        except (KeyError, ValueError, TypeError, RuntimeError,
+                UnicodeError, subprocess.SubprocessError) as exc:
+            raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN") from exc
+
+        trusted_plan = build_plan(repo, ref=trusted_head)
+        candidate_plan = build_plan(repo, ref=ref)
+        ancestry = subprocess.run(
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor",
+             trusted_head, candidate_plan["source_head"]],
+            capture_output=True, timeout=30, check=False,
+        )
+        if ancestry.returncode != 0:
+            raise RuntimeError("TRUSTED_HEAD_NOT_ANCESTOR")
+        prior_targets = {item["target"] for item in previous_plan["files"]}
+        trusted_targets = {item["target"] for item in trusted_plan["files"]}
+        candidate_targets = {item["target"] for item in candidate_plan["files"]}
+        # No automatic retirement of unrelated owner files through reconciliation.
+        if not prior_targets <= trusted_targets or not trusted_targets <= candidate_targets:
+            raise RuntimeError("RECONCILIATION_RETIREMENT_UNSUPPORTED")
+
+        for item in trusted_plan["files"]:
+            target = _recovery_target(root, item["target"])
+            pins.pin(target.parent)
+            if not target.is_file():
+                raise RuntimeError("TRUSTED_FILE_MISSING:" + item["target"])
+            if os.name == "nt":
+                with _windows_plain_handle(target):
+                    actual = sha256_file(target)
+            else:
+                actual = sha256_file(target)
+            if actual != item["sha256"]:
+                raise RuntimeError("TRUSTED_FILE_MISMATCH:" + item["target"])
+        # A future candidate might introduce a filename currently occupied by
+        # an owner's unknown file. Never silently claim or overwrite that file.
+        for name in candidate_targets - trusted_targets:
+            target = _recovery_target(root, name)
+            # A new candidate subdirectory may not exist yet. Pin the nearest
+            # existing ancestor; never create directories during a dry run.
+            ancestor = target.parent
+            while not ancestor.exists() and ancestor != root:
+                ancestor = ancestor.parent
+            pins.pin(ancestor)
+            if target.exists() or target.is_symlink():
+                raise RuntimeError("CANDIDATE_TARGET_OCCUPIED:" + name)
+        if manifest_path.read_bytes() != previous_bytes:
+            raise RuntimeError("PREVIOUS_MANIFEST_CHANGED")
+        return {
+            "schema": "cua-runtime-provenance-reconciliation-plan/v1",
+            "eligible": pending_transactions == 0,
+            "provenance_verified": True,
+            "unresolved_deploy_transactions": pending_transactions,
+            "requires_transaction_review": pending_transactions > 0,
+            "old_head": previous_head,
+            "trusted_head": trusted_head,
+            "candidate_head": candidate_plan["source_head"],
+            "verified_files": len(trusted_plan["files"]),
+            "previous_manifest_sha256": sha256_bytes(previous_bytes),
+            "trusted_manifest": trusted_plan,
+            "production_modified": False,
+        }
+
+
 def stage_plan(repo: Path, plan: dict[str, Any], stage_root: Path) -> None:
     # Prefix the root before joining children: a short root can have a child
     # beyond MAX_PATH. This also covers mkdir/copy/rename and external parsers.
@@ -208,7 +450,10 @@ def stage_plan(repo: Path, plan: dict[str, Any], stage_root: Path) -> None:
             raise RuntimeError(f"STAGE_SOURCE_HASH_MISMATCH:{item['source']}")
         dst = stage_root / str(item["target"])
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(raw)
+        with dst.open("xb") as output:
+            output.write(raw)
+            output.flush()
+            os.fsync(output.fileno())
         if sha256_file(dst) != item["sha256"]:
             raise RuntimeError(f"STAGE_WRITE_HASH_MISMATCH:{item['target']}")
 
@@ -301,12 +546,30 @@ def validate_stage(stage_root: Path, plan: dict[str, Any], *, strict_external: b
     }
 
 
-def _copy_replace(src: Path, dst: Path, txid: str) -> None:
+def _copy_replace(src: Path, dst: Path, txid: str, *, overwrite: bool = True) -> None:
     src, dst = extended_path(src, force=True), extended_path(dst, force=True)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(dst.name + f".{txid}.new")
-    shutil.copy2(src, tmp)
-    _replace_with_retry(tmp, dst)
+    # Unique exclusive slots neither follow links nor collide with a temporary
+    # file left by a crash during an earlier rollback attempt.
+    # Sources live in this same-volume transaction's stage/backup directory;
+    # a crash must leave scratch files there, not beside runnable modules.
+    fd, name = tempfile.mkstemp(prefix=dst.name + f".{txid}.", suffix=".new", dir=src.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as output, src.open("rb") as input_file:
+            shutil.copyfileobj(input_file, output)
+            output.flush()
+            os.fsync(output.fileno())
+        if overwrite:
+            _replace_with_retry(tmp, dst)
+        else:
+            # Win32 rename without REPLACE_EXISTING: recovery must not clobber
+            # a new owner file at the name of a retired module.
+            if os.name != "nt":
+                raise RuntimeError("RETIRE_WINDOWS_REQUIRED")
+            os.rename(tmp, dst)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -332,9 +595,13 @@ def _recovery_target(root: Path, name: Any) -> Path:
             or "\\" in name or ":" in name or name.startswith("/")):
         raise RuntimeError("ROLLBACK_TARGET_UNSAFE")
     parts = name.split("/")
-    if any(part in {"", ".", ".."} for part in parts):
+    devices = {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    devices.update(f"{prefix}{n}" for prefix in ("com", "lpt") for n in "123456789¹²³")
+    if any(part in {"", ".", ".."} or part.endswith((".", " "))
+           or any(ord(c) < 32 or c in '<>"|?*' for c in part)
+           or part.split(".")[0].casefold() in devices for part in parts):
         raise RuntimeError("ROLLBACK_TARGET_UNSAFE")
-    if parts[0] in {TX_DIR_NAME, LOCK_NAME, MANIFEST_NAME}:
+    if parts[0].casefold() in {TX_DIR_NAME, LOCK_NAME, MANIFEST_NAME}:
         raise RuntimeError("ROLLBACK_TARGET_UNSAFE")
     cursor = root
     for part in parts:
@@ -377,9 +644,15 @@ def _backup_at(expected: Path, supplied: Any, old_sha: Any) -> Path:
 
 
 def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
+    with _DirectoryPins() as pins:
+        pins.pin(runtime_root)
+        _restore_journal_pinned(runtime_root, journal, pins)
+
+
+def _restore_journal_pinned(runtime_root: Path, journal: dict[str, Any], pins: _DirectoryPins) -> None:
     """Prevalidate ALL recovery inputs before writing even the first target."""
     runtime_root = extended_path(runtime_root, force=True)
-    if not isinstance(journal, dict) or journal.get("schema") != LOCK_SCHEMA + "/journal":
+    if not isinstance(journal, dict) or journal.get("schema") not in {LOCK_SCHEMA + "/journal", JOURNAL_SCHEMA}:
         raise RuntimeError("ROLLBACK_JOURNAL_SCHEMA_INVALID")
     txid = journal.get("txid")
     if (not isinstance(txid, str) or len(txid) != 32
@@ -390,22 +663,29 @@ def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
     if not isinstance(rows, list) or len(rows) > 500 or not isinstance(previous, dict):
         raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
     backup_root = runtime_root / TX_DIR_NAME / txid / "backup"
-    prepared: list[tuple[Path, Path | None, str | None]] = []
+    pins.pin(backup_root)
+    prepared: list[tuple[Path, Path | None, str | None, bool]] = []
     seen: set[str] = set()
     for item in rows:
         if not isinstance(item, dict) or type(item.get("existed")) is not bool:
             raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
         name = item.get("target")
         target = _recovery_target(runtime_root, name)
+        pins.pin(target.parent)
         if name.casefold() in seen:
             raise RuntimeError("ROLLBACK_TARGET_DUPLICATE")
         seen.add(name.casefold())
         if item["existed"]:
             expected = backup_root.joinpath(*name.split("/"))
+            pins.pin(expected.parent)
             backup = _backup_at(expected, item.get("backup"), item.get("old_sha256"))
-            prepared.append((target, backup, item["old_sha256"]))
+            retired = "retired_sha256" in item
+            if retired and (item["retired_sha256"] != item["old_sha256"]
+                            or (target.exists() and sha256_file(target) != item["old_sha256"])):
+                raise RuntimeError("ROLLBACK_RETIRED_CONFLICT")
+            prepared.append((target, backup, item["old_sha256"], retired))
         else:
-            if item.get("old_sha256") is not None:
+            if item.get("old_sha256") is not None or "retired_sha256" in item:
                 raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
             supplied_backup = item.get("backup")
             if supplied_backup not in (None, ""):
@@ -418,7 +698,7 @@ def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
                         or _comparable_path(Path(supplied_backup)) != _comparable_path(expected)
                         or expected.exists()):
                     raise RuntimeError("ROLLBACK_BACKUP_PATH_INVALID")
-            prepared.append((target, None, None))
+            prepared.append((target, None, None, False))
     manifest_target = runtime_root / MANIFEST_NAME
     if type(previous.get("existed")) is not bool:
         raise RuntimeError("ROLLBACK_JOURNAL_INVALID")
@@ -433,9 +713,15 @@ def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
         manifest_backup = None
     # Every input is now validated; an invalid later entry cannot cause a
     # partial earlier rollback (or delete arbitrary owner files).
-    for target, backup, old_sha in prepared:
+    for target, backup, old_sha, retired in prepared:
         if backup is not None:
-            _copy_replace(backup, target, txid + ".rollback")
+            if retired and target.exists():
+                # Already restored (or never deleted). Do not overwrite it.
+                with _windows_plain_handle(target):
+                    if sha256_file(target) != old_sha:
+                        raise RuntimeError("ROLLBACK_RETIRED_CONFLICT")
+                continue
+            _copy_replace(backup, target, txid + ".rollback", overwrite=not retired)
             if sha256_file(target) != old_sha:
                 raise RuntimeError("ROLLBACK_HASH_MISMATCH")
         elif target.exists():
@@ -447,12 +733,18 @@ def _restore_journal(runtime_root: Path, journal: dict[str, Any]) -> None:
 
 
 def recover_stale(runtime_root: Path) -> dict[str, Any]:
-    runtime_root = extended_path(runtime_root.resolve(), force=True)
+    runtime_root = extended_path(Path(os.path.abspath(runtime_root)), force=True)
+    with _DirectoryPins() as pins:
+        pins.pin(runtime_root)
+        return _recover_stale_pinned(runtime_root, pins)
+
+
+def _recover_stale_pinned(runtime_root: Path, pins: _DirectoryPins) -> dict[str, Any]:
     lock_path = runtime_root / LOCK_NAME
-    if not lock_path.is_file():
-        return {"recovered": False}
     if lock_path.is_symlink() or getattr(lock_path, "is_junction", lambda: False)():
         raise RuntimeError("DEPLOY_LOCK_LINK_FORBIDDEN")
+    if not lock_path.is_file():
+        return {"recovered": False}
     lock = _read_json(lock_path)
     if not isinstance(lock, dict) or lock.get("schema") != LOCK_SCHEMA:
         raise RuntimeError("DEPLOY_LOCK_SCHEMA_INVALID")
@@ -475,6 +767,8 @@ def recover_stale(runtime_root: Path) -> dict[str, Any]:
              if started else _process_alive(pid))
     if pid != os.getpid() and alive:
         raise RuntimeError(f"DEPLOY_BUSY:{pid}")
+    if journal_path.parent.exists():
+        pins.pin(journal_path.parent)
     if not journal_path.is_file():
         # Targets are not modified until the journal has been durably written.
         # A dead owner with no journal therefore means the transaction stopped
@@ -527,8 +821,23 @@ def apply_runtime(
     before_replace: Callable[[], None] | None = None,
     after_install: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
+    # Do not resolve away a symlink/junction before checking the install root.
+    runtime_root = extended_path(Path(os.path.abspath(runtime_root)), force=True)
+    with _DirectoryPins() as pins:
+        pins.pin(runtime_root, create=True)
+        return _apply_runtime_pinned(
+            repo, runtime_root, pins, ref=ref, require_clean=require_clean,
+            strict_external=strict_external, fail_after=fail_after,
+            before_replace=before_replace, after_install=after_install,
+        )
+
+
+def _apply_runtime_pinned(
+    repo: Path, runtime_root: Path, pins: _DirectoryPins, *, ref: str,
+    require_clean: bool, strict_external: bool, fail_after: int | None,
+    before_replace: Callable[[], None] | None, after_install: Callable[[], None] | None,
+) -> dict[str, Any]:
     repo = repo.resolve()
-    runtime_root = extended_path(runtime_root.resolve(), force=True)
     if require_clean:
         cp = subprocess.run(["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True, timeout=20, check=False)
         if cp.returncode != 0 or cp.stdout.strip():
@@ -536,10 +845,45 @@ def apply_runtime(
     runtime_root.mkdir(parents=True, exist_ok=True)
     recovered = recover_stale(runtime_root)
     plan = build_plan(repo, ref)
+    manifest_target = runtime_root / MANIFEST_NAME
+    if manifest_target.is_symlink() or getattr(manifest_target, "is_junction", lambda: False)():
+        raise RuntimeError("PREVIOUS_MANIFEST_LINK_FORBIDDEN")
+    if manifest_target.exists() and not manifest_target.is_file():
+        raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN")
+    previous_bytes = manifest_target.read_bytes() if manifest_target.is_file() else None
+    if previous_bytes is None and any(p.name not in {TX_DIR_NAME, LOCK_NAME} for p in runtime_root.iterdir()):
+        raise RuntimeError("PREVIOUS_MANIFEST_MISSING_NONEMPTY")
+    previous_files: dict[str, str] = {}
+    if previous_bytes is not None:
+        try:
+            previous_data = json.loads(previous_bytes.decode("utf-8-sig"))
+        except (ValueError, UnicodeError) as exc:
+            raise RuntimeError("PREVIOUS_MANIFEST_UNPROVEN") from exc
+        previous_files = _previous_owned_files(repo, plan, previous_data)
+    plan_targets = {str(item["target"]) for item in plan["files"]}
+    retired_files = {name: digest for name, digest in previous_files.items() if name not in plan_targets}
+    if retired_files and os.name != "nt":
+        raise RuntimeError("RETIRE_WINDOWS_REQUIRED")
+    # Validate every old/new target before creating stage/backup directories.
+    seen: set[str] = set()
+    for name in list(plan_targets) + list(retired_files):
+        target = _recovery_target(runtime_root, name)
+        if name.casefold() in seen:
+            raise RuntimeError("DEPLOY_TARGET_DUPLICATE")
+        seen.add(name.casefold())
+        pins.pin(target.parent, create=True)
+        if target.exists() and not target.is_file():
+            raise RuntimeError("DEPLOY_TARGET_TYPE_INVALID")
+        if name in retired_files and target.is_file() and sha256_file(target) != retired_files[name]:
+            raise RuntimeError("RETIRED_FILE_UNPROVEN:" + name)
     txid = uuid.uuid4().hex
     tx_root = runtime_root / TX_DIR_NAME / txid
     stage_root = tx_root / "stage"
     backup_root = tx_root / "backup"
+    pins.pin(stage_root, create=True)
+    pins.pin(backup_root, create=True)
+    for name in plan_targets:
+        pins.pin((stage_root / name).parent, create=True)
     stage_plan(repo, plan, stage_root)
     validation = validate_stage(stage_root, plan, strict_external=strict_external)
 
@@ -556,29 +900,30 @@ def apply_runtime(
     _acquire_lock(lock_path, lock)
 
     journal_files = []
-    manifest_target = runtime_root / MANIFEST_NAME
     previous_manifest = {"existed": manifest_target.is_file(), "backup": None, "old_sha256": None}
     try:
-        backup_root.mkdir(parents=True, exist_ok=True)
-        previous_targets: set[str] = set()
-        if manifest_target.is_file():
-            previous_data = _read_json(manifest_target)
-            previous_targets = {
-                str(item["target"]) for item in previous_data.get("files", [])
-                if isinstance(item, dict) and item.get("target")
-            }
-        plan_targets = {str(item["target"]) for item in plan["files"]}
+        if (manifest_target.is_symlink()
+                or (manifest_target.read_bytes() if manifest_target.is_file() else None) != previous_bytes):
+            raise RuntimeError("PREVIOUS_MANIFEST_CHANGED")
         managed_targets = list(dict.fromkeys(
-            [str(item["target"]) for item in plan["files"]] + sorted(previous_targets - plan_targets)
+            [str(item["target"]) for item in plan["files"]] + sorted(retired_files)
         ))
         for target_name in managed_targets:
-            target = runtime_root / target_name
+            target = _recovery_target(runtime_root, target_name)
             existed = target.is_file()
+            # An absent retired name grants no right to delete a later occupant.
+            if target_name in retired_files and not existed:
+                continue
             backup = backup_root / target_name
             old_sha = sha256_file(target) if existed else None
+            if target_name in retired_files and old_sha != retired_files[target_name]:
+                raise RuntimeError("RETIRED_FILE_UNPROVEN:" + target_name)
             if existed:
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(target, backup)
+                pins.pin(backup.parent, create=True)
+                with backup.open("xb") as output, target.open("rb") as input_file:
+                    shutil.copyfileobj(input_file, output)
+                    output.flush()
+                    os.fsync(output.fileno())
                 if sha256_file(backup) != old_sha:
                     raise RuntimeError(f"BACKUP_HASH_MISMATCH:{target_name}")
             journal_files.append({
@@ -586,14 +931,20 @@ def apply_runtime(
                 "existed": existed,
                 "backup": str(backup) if existed else None,
                 "old_sha256": old_sha,
+                **({"retired_sha256": old_sha} if target_name in retired_files else {}),
             })
 
         if manifest_target.is_file():
             mb = backup_root / MANIFEST_NAME
-            shutil.copy2(manifest_target, mb)
-            previous_manifest = {"existed": True, "backup": str(mb), "old_sha256": sha256_file(manifest_target)}
+            with mb.open("xb") as output:
+                output.write(previous_bytes)
+                output.flush()
+                os.fsync(output.fileno())
+            previous_manifest = {"existed": True, "backup": str(mb), "old_sha256": sha256_bytes(previous_bytes)}
 
-        journal = {"schema": LOCK_SCHEMA + "/journal", "txid": txid, "files": journal_files, "previous_manifest": previous_manifest}
+        # Older recovery code must reject these journals, rather than silently
+        # ignoring the new retired-file conflict protection. We still read v1.
+        journal = {"schema": JOURNAL_SCHEMA, "txid": txid, "files": journal_files, "previous_manifest": previous_manifest}
         atomic_json(journal_path, journal)
 
         # Local lifecycle controller stops the exact server only after backups
@@ -603,7 +954,7 @@ def apply_runtime(
         replaced = 0
         unchanged = 0
         for item in plan["files"]:
-            target = runtime_root / str(item["target"])
+            target = _recovery_target(runtime_root, str(item["target"]))
             if target.is_file() and sha256_file(target) == item["sha256"]:
                 unchanged += 1
                 continue
@@ -611,10 +962,12 @@ def apply_runtime(
             replaced += 1
             if fail_after is not None and replaced >= fail_after:
                 raise RuntimeError(f"INJECTED_FAILURE_AFTER:{replaced}")
-        for target_name in sorted(previous_targets - plan_targets):
-            target = runtime_root / target_name
-            if target.exists():
-                target.unlink()
+        retired = 0
+        for row in journal_files:
+            if "retired_sha256" in row:
+                target = _recovery_target(runtime_root, row["target"])
+                _retire_file(target, row["retired_sha256"])
+                retired += 1
 
         installed = dict(plan)
         installed["installed_at"] = datetime.now(timezone.utc).isoformat()
@@ -627,6 +980,7 @@ def apply_runtime(
         if after_install is not None:
             after_install()
         lock_path.unlink()
+        pins.release_tree(tx_root)
         shutil.rmtree(tx_root, ignore_errors=True)
         return {
             "ok": True,
@@ -634,6 +988,7 @@ def apply_runtime(
             "validation": validation,
             "files_replaced": replaced,
             "files_unchanged": unchanged,
+            "files_retired": retired,
             **verified,
         }
     except Exception:
@@ -642,6 +997,8 @@ def apply_runtime(
                 _restore_journal(runtime_root, _read_json(journal_path))
                 if lock_path.exists():
                     lock_path.unlink()
+            else:
+                lock_path.unlink(missing_ok=True)
         except Exception as rollback_exc:
             raise RuntimeError(f"ROLLBACK_FAILED:{rollback_exc}") from sys.exc_info()[1]
         raise

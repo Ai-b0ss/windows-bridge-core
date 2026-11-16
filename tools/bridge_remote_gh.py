@@ -76,6 +76,8 @@ def discover(api, repo):
 
 
 def submit(api, repo, issue, device, op, args):
+    if not isinstance(device, str) or not re.fullmatch(r"[A-Za-z0-9._:-]{1,100}", device):
+        raise BridgeRemoteError("Specify exact paired target_device from --list; no fallback")
     if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,99}", op):
         raise BridgeRemoteError("Invalid Bridge RPC operation")
     task_id = "chatgpt-" + uuid.uuid4().hex
