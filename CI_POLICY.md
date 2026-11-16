@@ -1,45 +1,42 @@
 # Continuous integration policy (public Bridge Core)
 
-**Current development destination:** This PUBLIC repository, not the legacy private history.
+**Canonical development repository:** `Ai-b0ss/windows-bridge-core` (`main`).
 
-## Cost policy
+## Cost & runner safety policy
 
-- Standard GitHub-hosted `windows-latest` / `ubuntu-latest` runners are **free** for public repositories under GitHub's current Actions terms.
-- Do not use billed larger runners or private GitHub-hosted minutes for routine open-source Core CI.
-- Do not attach an owner's personal Windows self-hosted runner to untrusted public pull requests.
-- The legacy private repository keeps its full original history, configuration, and sensitive transport logs. It is **not** safe to flip the old repository public. Source files can only move here via targeted content audits and an explicit allowlist, never by importing historical refs or mirroring the original `.git`.
+- Standard GitHub-hosted `windows-latest` and `ubuntu-latest` runners are **free** for public repositories under [GitHub's Actions runner policy](https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job).
+- Do not use billed larger runners or paid private minutes for routine open-source Core CI.
+- **Never** attach a personal self-hosted Windows machine as a runner on this public repository (untrusted fork PRs could execute arbitrary code).
+- All third-party GitHub Actions in `.github/workflows/*.yml` must be pinned to full 40-character commit SHAs with minimal `permissions` (`contents: read` by default).
+- The legacy private repository retains historical configuration and private transport state; never mirror its `.git` history, hostnames, paths, tokens, or operational logs here.
 
-## What runs
+## Active GitHub Actions workflows
 
-1. `.github/workflows/ci.yml` on PR and pushes to `main`: compile the Core Python sources, parse PowerShell, test private-pairing behavior, verify the public source contains no vendored ML/browser asset directories.
-2. `.github/workflows/portable-release-smoke.yml` by manual dispatch: download an **existing published ZIP**, verify a pinned SHA-256, install on a fresh GitHub-hosted Windows runner in a separate folder without permanent startup, verify loopback-only listening and clean up test processes.
-3. Extra test suites must not require secrets from the owner or the private support transport. Any tests needing real Windows hardware/UAC or an authorized remote second laptop must be recorded separately; an ordinary CI pass **does not** prove those paths.
+1. **`.github/workflows/ci.yml` (`Safe public core CI`)** — runs on `push` to `main` and `pull_request`:
+   - Compiles all Python modules, parses PowerShell scripts, verifies `release-manifest.json` against Git LF blobs (`test_manifest_matches_git.py`), runs the unit/contract test suite (`ubuntu-latest` + `windows-latest`), and checks that no vendored browser/ML binary directories or secret patterns exist in the tree.
+2. **`.github/workflows/candidate-install.yml` (`Verified candidate package and installed RPC`)** — runs on `push` to `main` and `pull_request`:
+   - Downloads the SHA-pinned base vendor archive (`v2026.10.24-remote-beta2`), builds a candidate Full Core ZIP via `tools/build_portable_release.py` from the exact commit under test, installs it cleanly on `windows-latest` (`install.ps1 -NoStartup -Transport Local`), and runs `tests/integration/installed_package_smoke.py` over loopback RPC.
+3. **`.github/workflows/prelogin-recovery.yml` (`Transport and Prelogin Recovery CI`)** — runs on `push` to `main` and `pull_request`:
+   - Executes Node.js unit and fault-injection suites for `tools/prelogin-recovery` (`test-supervisor.mjs`) and `tools/cf-flight-controller` (`test-flight-controller.mjs`) on both `ubuntu-latest` and `windows-latest`.
+4. **`.github/workflows/windows-bridge-local-safety.yml` (`Windows Bridge Local Safety`)** — runs on `push` to `main` and `pull_request`:
+   - Verifies local safety boundaries, durable `Stop` latch behavior, and permission/authority contracts on `windows-latest` and `ubuntu-latest`.
+5. **`.github/workflows/portable-release-smoke.yml` (`Published release clean Windows smoke`)** — manual `workflow_dispatch` (`tag` + `sha256`):
+   - Downloads an **already published GitHub Release ZIP**, enforces its exact SHA-256, runs a clean isolated install on `windows-latest`, verifies loopback-only listening (`127.0.0.1`) and `installed_package_smoke.py`, and cleans up all test processes.
 
-## Operator/agent decision
+## Provenance, pinned vendor base & current preferred release
 
-- Code change in the deployable Windows Bridge Core or its installer -> issue/branch/PR **here**, wait for free public CI PASS and provide actual run URL.
-- Sensitive host-specific credentials, internal logs/history or private GitHub support collaboration -> **stay PRIVATE** and use scoped manual test evidence; no public CI artifacts.
-- Documentation-only change in the old private archive -> no hosted CI needed. Do not label disabled or skipped private checks as passing.
-- Never send raw remote RPC command/results, VPN subscription data, GitHub tokens, or screenshots containing personal data to the PUBLIC repository or to CI logs.
+- **Clean initial public commit:** `200a50ec1592b3731d307838dd370a57cd1383c9`.
+- **Immutable vendor binary asset source (keep permanently):** [`v2026.10.24-remote-beta2`](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.24-remote-beta2) (`Windows-Bridge-Full-Core-Remote-20261024-v2.zip`, SHA-256 `46e43217fe6cace1f7a55c8aa00afba694fd03926c276565671a7566cee0d540`) supplies the three SHA-locked vendor archives (`python-3.13.9-embed-amd64.zip`, `node-v22.14.0-win-x64.zip`, `gh_2.101.0_windows_amd64.zip`) used by `tools/build_portable_release.py` and `candidate-install.yml`.
+- **Current preferred Full Core release (`Latest`):** [`v2026.11.16-full-core`](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.11.16-full-core) — bundles the complete audited `main` runtime (WinSock zero-drop socket handover, durable `Stop`, cold rollback & independent watchdog, GitHub outbox recovery, per-window grants, and optional offline addon installer `ADDONS.cmd`), accompanied by `Windows-Bridge-ChatGPT-Skill.zip`, `Windows-Bridge-ChatGPT-Plugin.zip`, and `SHA256SUMS.txt`.
 
-## Provenance and reproducibility
+## Verification boundaries & open acceptance queue
 
-- Clean initial public repo commit: `200a50ec1592b3731d307838dd370a57cd1383c9`, not a fork that exposes private history.
-- [Remote Beta 2 release](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.24-remote-beta2) was installed on a [clean Windows runner](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40133081227) with success.
-- [Source and pairing CI](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40133853951): success.
-- GitHub's current source for public standard runner free use: https://docs.github.com/en/actions/how-tos/write-workflows/choose-where-workflows-run/choose-the-runner-for-a-job
+Passing GitHub-hosted CI proves source integrity, unit/contract behavior, deterministic packaging, and isolated runner installation; it **does not** substitute for physical multi-device hardware pairing, interactive UAC elevation, GPU inference, or live ChatGPT host UI trials. Those gates remain tracked openly:
 
-## Public implementation queue
+- [#4 — Real second-device pairing, consent and remote round-trip](https://github.com/Ai-b0ss/windows-bridge-core/issues/4) (`P0`, `hardware-gate`)
+- [#6 — Optional browser/vision addons without bloating 62 MB Full Core](https://github.com/Ai-b0ss/windows-bridge-core/issues/6) (`P1`, `addon-gate`)
+- [#7 — CLI/API-first Windows automation routing with native hidden UI fallback](https://github.com/Ai-b0ss/windows-bridge-core/issues/7) (`P1`, `routing`)
+- [#14 — Prove Windows Bridge Skill installation and automatic selection in a NEW ChatGPT chat](https://github.com/Ai-b0ss/windows-bridge-core/issues/14) (`P0`, `host-ui-gate`)
+- [#16 — Reconcile live/source/ZIP parity and prove task-capable Cursor/Antigravity/Office routes](https://github.com/Ai-b0ss/windows-bridge-core/issues/16) (`P0`, `parity-gate`)
 
-- [#4 — Real second-device pairing and consent](https://github.com/Ai-b0ss/windows-bridge-core/issues/4) **P0** (remains unverified on real friend hardware).
-- [#5 — Scoped signed approvals for high-impact RPC](https://github.com/Ai-b0ss/windows-bridge-core/issues/5) **P0**.
-- [#6 — Optional browser/vision addons](https://github.com/Ai-b0ss/windows-bridge-core/issues/6) **P1**.
-- [#7 — CLI/API-first and native hidden GUI routing](https://github.com/Ai-b0ss/windows-bridge-core/issues/7) **P1**.
-
-Agents: claim one public issue, branch from current public `main`, implement with evidence and create PR; use free public CI. Keep sensitive device-specific support evidence in the authorized private support channel, never in public issues or public CI logs.
-
-## October 25 release update — preferred new installation
-
-The preferred portable remote-support build is [Beta 3](https://github.com/Ai-b0ss/windows-bridge-core/releases/tag/v2026.10.25-remote-beta3): 61,788,313 bytes, SHA-256 `8b8696b39871ce1a635afe8ad14081821494f4af950eeaa383835ab8d5df6c3b`. It adds `ADDONS.cmd` and an offline, pinned optional browser/visual addon installer while keeping both large addons out of the default ZIP. See [OPTIONAL-ADDONS.md](OPTIONAL-ADDONS.md). The [clean GitHub-hosted Windows install plus addon-status smoke](https://github.com/Ai-b0ss/windows-bridge-core/actions/runs/40138294471) passed. The older Beta2 run above remains valid historical evidence, not the preferred new release.
-
-Real friend-laptop pairing, Windows elevation, advanced GPU inference and all individual browser/vision RPC routes remain independently unverified; do not infer coverage from a runner setup or checksum alone.
+Resolved items closed with CI and runtime evidence include [#5](https://github.com/Ai-b0ss/windows-bridge-core/issues/5) (scoped signed approvals / permission broker foundation) and [#105](https://github.com/Ai-b0ss/windows-bridge-core/issues/105) (`WinError 10054` socket handover under concurrent load, resolved via PR [#106](https://github.com/Ai-b0ss/windows-bridge-core/pull/106)).
