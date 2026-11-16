@@ -311,6 +311,29 @@ class SnapshotSafety(unittest.TestCase):
             proc.terminate()
             proc.wait(timeout=6)
 
+    def test_cross_profile_junction_and_outer_keeper_launcher_guard(self):
+        users_dir = self.base / "Users"
+        user_bv3 = users_dir / "owner" / "AppData" / "Local" / "FF-Windows-Bridge" / "bridge-v3"
+        user_bv3.parent.mkdir(parents=True)
+        if os.name == "nt":
+            subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(user_bv3), str(self.root)],
+                           check=True, capture_output=True)
+        else:
+            user_bv3.symlink_to(self.root, target_is_directory=True)
+        sys_env = {"LOCALAPPDATA": str(self.base / "systemprofile" / "AppData" / "Local")}
+        aliases, is_installed = bundle.runtime_aliases(
+            self.root.resolve(), self.root, env=sys_env, users_dir=users_dir)
+        self.assertTrue(is_installed)
+        self.assertTrue(any("users/owner/appdata/local/ff-windows-bridge/bridge-v3" in a for a in aliases))
+        launcher_row = {
+            "ProcessId": 12128, "Name": "powershell.exe",
+            "CommandLine": '"powershell.exe" -File "C:\\ProgramData\\FF-Windows-Bridge\\bridge-v3-keeper-launch.ps1"'
+        }
+        with mock.patch.object(bundle, "runtime_aliases", return_value=(aliases, True)):
+            with self.assertRaisesRegex(RuntimeError, "RESTORE_KEEPER_LAUNCHER_STILL_RUNNING"):
+                bundle._runtime_process_rows(
+                    self.root.resolve(), [launcher_row], target_port=39073, peer_port=39076)
+
     def test_duplicate_snapshot_refused(self):
         self.captured()
         with self.assertRaisesRegex(RuntimeError, "SNAPSHOT_DESTINATION_UNSAFE"):

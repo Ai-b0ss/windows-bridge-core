@@ -140,5 +140,21 @@ class RecoveryWatchdogTests(unittest.TestCase):
             receipt.assert_called_once()
 
 
+    def test_optional_keeper_launcher_terminated_before_keeper_and_candidate(self):
+        data = dict(self.data, keeper_launcher_pid=12128, keeper_launcher_token=776655)
+        calls = []
+        def fake_term(st, role):
+            calls.append(role)
+            return True
+        restore_mock = mock.Mock(return_value={"ok": True, "restored_files": 109})
+        restart_mock = mock.Mock()
+        with (mock.patch.object(watch, "probe_agent", return_value=None),
+              mock.patch.object(watch.bundle, "assert_runtime_quiescent",
+                                return_value={"peer_pids": [18096], "target_port": 39073})):
+            watch.recover_failed_rollout(data, terminate=fake_term,
+                                         restore=restore_mock, restart=restart_mock)
+        self.assertEqual(calls, ["keeper_launcher", "candidate", "keeper"])
+
+
 if __name__ == "__main__":
     unittest.main()

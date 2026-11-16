@@ -76,6 +76,8 @@ def _state(path: Path) -> dict:
         raise RuntimeError("WATCH_AGENT_HASH_UNPROVEN")
     if target.resolve() == backup.resolve() or backup.is_relative_to(target):
         raise RuntimeError("WATCH_PATHS_CONFLICT")
+    for role in ("candidate", "keeper", "keeper_launcher"):
+        _live_identity(data, role)
     return data
 
 
@@ -91,15 +93,7 @@ def _live_identity(state: dict, name: str) -> tuple[int, int] | None:
 def _known_process_commandline(state: dict, name: str, pid: int) -> bool:
     """Independently prove the named PID launches the expected runtime file."""
     runtime = Path(state["runtime"]).resolve()
-    script_names = ("ff_win_v3_main.py", "ff_win_v3_agent.py") if name == "candidate" else (
-        "ff_win_v3_keeper.ps1",)
-    paths = [str(runtime)]
-    alias = Path(os.environ.get("LOCALAPPDATA") or "") / "FF-Windows-Bridge" / "bridge-v3"
-    try:
-        if alias.resolve() == runtime:
-            paths.append(str(alias))
-    except (OSError, ValueError):
-        pass
+    aliases, _ = bundle.runtime_aliases(runtime, Path(state["runtime"]))
     command = (
         "$ErrorActionPreference='Stop'; "
         "$p=Get-CimInstance Win32_Process -Filter 'ProcessId=" + str(pid) + "'; "
@@ -116,12 +110,17 @@ def _known_process_commandline(state: dict, name: str, pid: int) -> bool:
         raise RuntimeError("WATCH_PROCESS_COMMANDLINE_UNVERIFIABLE") from exc
     if type(result.get("ProcessId")) is not int or result["ProcessId"] != pid:
         raise RuntimeError("WATCH_PROCESS_IDENTITY_UNVERIFIABLE")
-    cmd = str(result.get("CommandLine") or "").casefold().replace('"', "")
+    cmd = str(result.get("CommandLine") or "").casefold().replace('"', "").replace(chr(92), "/")
     exe = str(result.get("Name") or "").casefold()
+    if name == "keeper_launcher":
+        return (exe in {"powershell.exe", "pwsh.exe"}
+                and "programdata/ff-windows-bridge/bridge-v3-keeper-launch.ps1" in cmd)
+    script_names = ("ff_win_v3_main.py", "ff_win_v3_agent.py") if name == "candidate" else (
+        "ff_win_v3_keeper.ps1",)
     expected_exe = {"python.exe"} if name == "candidate" else {"powershell.exe", "pwsh.exe"}
     return exe in expected_exe and any(
-        str(Path(base) / script_name).casefold() in cmd
-        for base in paths for script_name in script_names
+        (base + "/" + script_name) in cmd
+        for base in aliases for script_name in script_names
     )
 
 
@@ -203,6 +202,8 @@ def recover_failed_rollout(state: dict, *,
     pair = _live_identity(state, "candidate")
     if current and (pair is None or current.get("pid") != pair[0]):
         raise RuntimeError("WATCH_UNKNOWN_AGENT_OWNS_PORT")
+    if state.get("keeper_launcher_pid") is not None or state.get("keeper_launcher_token") is not None:
+        terminate(state, "keeper_launcher")
     terminate(state, "candidate")
     terminate(state, "keeper")
     # Even a correctly terminated planned PID is not proof that no unrelated

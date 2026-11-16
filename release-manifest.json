@@ -492,8 +492,8 @@
     "tests/test_cli_contracts.py": "85554963e143767cef701deb30369958e906d57a2501c3fa1fa9ad9a1fdc011c",
     "tests/test_cli_discovery_safe_probe.py": "06d7cd0e8e42e859eb4cfb121d7a368fdbf4595001f4f3c2f607131c4d13a32a",
     "tests/test_cli_first_parity.py": "136cf55d9f227e71bcba9cda4c4d62af2ac3c6c6ef82e21bec333724e3dab8ed",
-    "tests/test_cold_recovery_watchdog.py": "6d291c68eb67362c4647cf15278846f5b60acde6b1ac55630e708a01f6f39f91",
-    "tests/test_cold_rollback_bundle.py": "c169fe0b75a2ecb62e4ca54e5232d13087117a786dff2cbf28e74807152b8547",
+    "tests/test_cold_recovery_watchdog.py": "89d79f366e622812d43e07e20015f1dd302c9e4e4d0bac385e422cf759defd81",
+    "tests/test_cold_rollback_bundle.py": "1c0f0db8f4954f7b1018f58602b3e64929dcd881efd0918642f8c58dde64e407",
     "tests/test_cua_browser_iframe_verify.mjs": "6574d65b9695a368a8fba3c6f437f3c9190664dcf48943fd82bbc6d0a1c14940",
     "tests/test_cua_owner_activity_guard.py": "49da2a01dc5085b9176b0979136a749f035086239433e565f3dff6f3ce8e29bb",
     "tests/test_cua_owner_chrome_attach.py": "befc65b0576e205e60e283c23c199fff3075e2f3249ea67f33802dac63337b54",
@@ -547,8 +547,8 @@
     "tests/test_windows_mcp_pool.py": "392ddc600ad99d419bbf8a1efb0e6310ced70964a86dedcc1ad865217959ebc2",
     "tests/test_windows_socket_handoff.py": "b8f067a581dbfac486ebf6278bac6112a1e432791b98708f7782313780a759c5",
     "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
-    "tools/cua_cold_recovery_watchdog.py": "d7c5d52ae243f3b5c84d8d1336c09d7f6604861fb9d2a4690e6686c1660c09bf",
-    "tools/cua_cold_rollback_bundle.py": "63672621bcb9dbffb338ab1f77d5f7b3d76e2aa8c3ba8e7f2ff495bb2f056590",
+    "tools/cua_cold_recovery_watchdog.py": "bd3d9a2a2098e3689f94a8a46b563557974e32d16690ad99d76a8bfdaec5aa0d",
+    "tools/cua_cold_rollback_bundle.py": "bec15aea080c9d5918a8b4fe89b05e61159f2709f1010031ef98861aa317c34f",
     "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0"
   }
 }

@@ -218,6 +218,43 @@ def verify_bundle(snapshot: Path) -> dict:
     return record
 
 
+def runtime_aliases(runtime: Path, requested_runtime: Path | None = None,
+                    *, env: dict[str, str] | None = None,
+                    users_dir: Path | None = None) -> tuple[list[str], bool]:
+    """Return normalized '/' runtime path spellings and user-junction ownership."""
+    env_map = os.environ if env is None else env
+    aliases: list[str] = []
+    def _add(p: Path) -> None:
+        norm = str(p).casefold().replace(chr(92), "/").rstrip("/")
+        if norm and norm not in aliases:
+            aliases.append(norm)
+    _add(runtime)
+    if requested_runtime is not None:
+        _add(requested_runtime)
+    installed_user_alias = False
+    candidates: list[Path] = []
+    local_appdata = env_map.get("LOCALAPPDATA") or ""
+    if local_appdata:
+        candidates.append(Path(local_appdata) / "FF-Windows-Bridge" / "bridge-v3")
+    u_root = users_dir if users_dir is not None else (
+        Path((env_map.get("SystemDrive") or "C:") + "/") / "Users"
+    )
+    try:
+        if u_root.is_dir():
+            for entry in u_root.iterdir():
+                candidates.append(entry / "AppData" / "Local" / "FF-Windows-Bridge" / "bridge-v3")
+    except OSError:
+        pass
+    for cand in candidates:
+        try:
+            if cand.exists() and cand.resolve() == runtime:
+                _add(cand)
+                installed_user_alias = True
+        except (OSError, ValueError):
+            pass
+    return aliases, installed_user_alias
+
+
 def _runtime_process_rows(runtime: Path, rows: list, *, target_port: int | None,
                           peer_port: int | None,
                           requested_runtime: Path | None = None) -> set[int]:
@@ -227,15 +264,7 @@ def _runtime_process_rows(runtime: Path, rows: list, *, target_port: int | None,
     from its Win32_Process CommandLine. Compare both the requested spelling
     and the resolved physical path: either must be considered, never ignored.
     """
-    aliases = [str(runtime).casefold().replace(chr(92), "/")]
-    if requested_runtime is not None:
-        aliases.append(str(requested_runtime).casefold().replace(chr(92), "/"))
-    alias_root = Path(os.environ.get("LOCALAPPDATA") or "") / "FF-Windows-Bridge" / "bridge-v3"
-    try:
-        if alias_root.resolve() == runtime:
-            aliases.append(str(alias_root).casefold().replace(chr(92), "/"))
-    except (OSError, ValueError):
-        pass
+    aliases, installed_user_alias = runtime_aliases(runtime, requested_runtime)
     allowed: set[int] = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -246,6 +275,9 @@ def _runtime_process_rows(runtime: Path, rows: list, *, target_port: int | None,
             continue
         if exe not in {"python.exe", "pythonw.exe", "powershell.exe", "pwsh.exe"}:
             continue
+        if (installed_user_alias and exe in {"powershell.exe", "pwsh.exe"}
+                and "bridge-v3-keeper-launch.ps1" in cmd):
+            raise RuntimeError("RESTORE_KEEPER_LAUNCHER_STILL_RUNNING")
         names = {name: any((base + "/" + name) in cmd for base in aliases)
                  for name in ("ff_win_v3_main.py", "ff_win_v3_agent.py", "ff_win_v3_keeper.ps1")}
         if not any(names.values()):
