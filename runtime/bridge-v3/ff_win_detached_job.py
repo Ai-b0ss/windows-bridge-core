@@ -114,6 +114,23 @@ def open_detached_job(session_id: str):
     return handle if handle else None
 
 
+def detached_job_active_members(session_id: str) -> int | None:
+    """None means no named job; query errors must remain visible."""
+    if os.name != "nt":
+        return None
+    api = kernel_api()
+    job = open_detached_job(session_id)
+    if not job:
+        return None
+    try:
+        info = Accounting()
+        require(api.QueryInformationJobObject(job, 1, C.byref(info), C.sizeof(info), None),
+                "DETACHED_JOB_ACCOUNTING_FAILED")
+        return int(info.active)
+    finally:
+        api.CloseHandle(job)
+
+
 def terminate_detached_job_by_name(session_id: str, timeout: float = 10.0) -> dict | None:
     if os.name != "nt":
         return None

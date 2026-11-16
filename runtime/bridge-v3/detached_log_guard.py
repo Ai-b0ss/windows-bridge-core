@@ -51,6 +51,10 @@ def read_bounded_lines(log_path: Path, pos: int, carry: bytes = b"",
                 buf = carry + data
                 parts = buf.split(b"\n")
                 carry = parts.pop()
+                # A long line is a stream too: never retain more than one chunk.
+                while len(carry) >= chunk_size:
+                    lines.append(carry[:chunk_size])
+                    carry = carry[chunk_size:]
                 for p in parts:
                     lines.append(p + b"\n")
     except OSError:

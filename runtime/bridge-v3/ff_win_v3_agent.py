@@ -536,21 +536,32 @@ class DetachedProcessStub:
         self.pid = pid
         self.creation_token = creation_token
         self.session_id = session_id
-        self._reference = ProcessReference(pid, creation_token)
-        self.exit_code_known = True
+        try:
+            self._reference = ProcessReference(pid, creation_token)
+        except OSError:
+            from ff_win_detached_job import detached_job_active_members
+            if not session_id or not detached_job_active_members(session_id):
+                raise
+            self._reference = None
+        self.exit_code_known = self._reference is not None
         self.stdin = None
         self.stdout = None
         self.stderr = None
 
     def poll(self) -> int | None:
         try:
-            return self._reference.poll()
+            return self._reference.poll() if self._reference is not None else 0
         except OSError:
             self.exit_code_known = False
             return -1  # Internal stopped sentinel; never exposed as a real exit.
 
     def terminate(self):
-        self._reference.terminate()
+        if self._reference is not None:
+            self._reference.terminate()
+
+    def close(self):
+        if self._reference is not None:
+            self._reference.close()
 
     def terminate_tree(self, timeout: float = 10.0) -> dict[str, Any]:
         if os.name == "nt" and self.session_id:
@@ -558,6 +569,8 @@ class DetachedProcessStub:
             receipt = terminate_detached_job_by_name(self.session_id, timeout=timeout)
             if receipt is not None:
                 return receipt
+        if self._reference is None:
+            return {"termination_scope": "detached_named_job_absent", "descendant_cleanup_verified": True}
         self._reference.terminate()
         return {"termination_scope": "owned_root_process", "descendant_cleanup_verified": False}
 
@@ -618,6 +631,15 @@ class Session:
             threading.Thread(target=self._waiter, daemon=True).start()
 
     def is_running(self) -> bool:
+        if self.detached and os.name == "nt":
+            from ff_win_detached_job import detached_job_active_members
+            try:
+                members = detached_job_active_members(self.id)
+            except OSError:
+                # Unknown is not stopped; keep the quota monitor alive.
+                return True
+            if members is not None:
+                return members > 0
         if self.process:
             return self.process.poll() is None
         if self.detached and self.pid > 0:
@@ -651,8 +673,14 @@ class Session:
                         self.quota_exceeded = True
                         try:
                             terminate_owned_session(self)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            self.append_event("meta", f"<log quota termination failed: {type(exc).__name__}; retrying>\n")
+                            time.sleep(0.2)
+                            continue
+                        if self.is_running():
+                            self.append_event("meta", "<log quota termination unconfirmed; retrying>\n")
+                            time.sleep(0.2)
+                            continue
                         try:
                             comp = compact_runaway_log_file(self.log_path)
                             pos = self.log_path.stat().st_size
@@ -809,6 +837,7 @@ def save_detached_session(session: Session) -> None:
             "log_path": str(session.log_path) if session.log_path else None,
             "created_at": session.created_at,
             "owner_scope": list(session.owner_scope) if session.owner_scope else None,
+            "max_log_bytes": getattr(session, "max_log_bytes", DEFAULT_DETACHED_LOG_MAX_BYTES),
         }
         atomic_write_text(DETACHED_STATE_PATH, json.dumps(current, indent=2))
     except Exception:
@@ -832,9 +861,13 @@ def recover_detached_sessions() -> dict[str, Session]:
         if not isinstance(info, dict):
             continue
         pid, token = info.get("pid"), info.get("pid_creation_token")
-        # No migration for legacy PID-only entries: ownership not proven.
-        if not process_identity_matches(pid, token):
+        # Retain the birth-token requirement even when the root already exited.
+        if type(pid) is not int or pid <= 0 or type(token) is not int or token <= 0:
             continue
+        if not process_identity_matches(pid, token):
+            from ff_win_detached_job import detached_job_active_members
+            if not detached_job_active_members(sid):
+                continue
         saved_log = info.get("log_path")
         if not isinstance(saved_log, str):
             continue
@@ -864,6 +897,9 @@ def recover_detached_sessions() -> dict[str, Session]:
             log_path=expected_log,
             created_at=created_at,
             owner_scope=tuple(owner) if owner else None,
+            max_log_bytes=(info.get("max_log_bytes") if
+                           type(info.get("max_log_bytes")) is int and info["max_log_bytes"] > 0
+                           else int(load_config().get("maxDetachedLogBytes", DEFAULT_DETACHED_LOG_MAX_BYTES))),
         )
         recovered[sid] = s
         updated[sid] = info
