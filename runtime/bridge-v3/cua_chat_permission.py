@@ -96,7 +96,7 @@ class ChatPermissionPolicy:
         if not cfg["enabled"]:
             raise ChatPermissionError("CHAT_PERMISSION_DISABLED")
         permission = args.get("owner_chat_permission")
-        if not isinstance(permission, dict) or set(permission) - {"quote", "apps", "duration_seconds"}:
+        if not isinstance(permission, dict) or set(permission) - {"quote", "apps", "duration_seconds", "purpose", "success_criteria"}:
             raise ChatPermissionError("CHAT_PERMISSION_INVALID")
         quote = permission.get("quote")
         if not isinstance(quote, str) or not 2 <= len(quote.strip()) <= 2000:
@@ -109,6 +109,15 @@ class ChatPermissionPolicy:
         if not isinstance(apps, list) or len(apps) > 16 or not all(
                 isinstance(a, str) and 1 <= len(a) <= 128 for a in apps):
             raise ChatPermissionError("CHAT_PERMISSION_APPS_INVALID")
+        # These fields describe the owner's goal for agent continuation.
+        # They are agent-supplied annotations, NOT independent owner consent and
+        # never a substitute for observing a real action postcondition.
+        purpose = permission.get("purpose")
+        if purpose is not None and (not isinstance(purpose, str) or not 1 <= len(purpose.strip()) <= 2000):
+            raise ChatPermissionError("CHAT_PERMISSION_PURPOSE_INVALID")
+        criteria = permission.get("success_criteria")
+        if criteria is not None and (not isinstance(criteria, str) or not 1 <= len(criteria.strip()) <= 1500):
+            raise ChatPermissionError("CHAT_PERMISSION_SUCCESS_CRITERIA_INVALID")
         duration = permission.get("duration_seconds", DEFAULT_TTL)
         if not _is_int(duration) or duration < MIN_TTL:
             raise ChatPermissionError("CHAT_PERMISSION_DURATION_INVALID")
@@ -118,6 +127,9 @@ class ChatPermissionPolicy:
         self._append("chat-permission.jsonl", {
             "kind": "GRANT", "agent_id": args["agent_id"], "task_id": args["task_id"],
             "quote": quote.strip(), "apps": apps, "duration_seconds": duration,
+            "purpose": purpose.strip() if purpose is not None else None,
+            "success_criteria": criteria.strip() if criteria is not None else None,
+            "task_context_is_authorization": False,
             "expires": expires,
         }, required=True)
         if not self.has_route_search(args["agent_id"], args["task_id"]):
