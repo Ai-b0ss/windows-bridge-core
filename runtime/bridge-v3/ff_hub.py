@@ -195,6 +195,8 @@ class Hub:
         self._hidden_lock = threading.RLock()
         self._gates_lock = threading.Lock()
         self._gates: dict[str, list[Any]] = {}
+        from ff_hub_io import HubIO
+        self.io = HubIO(self)
         self.started_at = time.time()
         self._stop = threading.Event()
         # Private desktops live inside the Hub process: after a restart none of the earlier ones
@@ -463,6 +465,7 @@ class Hub:
     def _cleanup(self, session: dict, held: list[dict]) -> dict:
         owner = self._owner(session)
         report = {"browser_tabs_closed": 0, "app_sessions_closed": 0, "locks_released": 0, "errors": []}
+        report["errors"].extend(self.io.cleanup(held))
         if getattr(self.browser, "running", lambda: True)():
             try:
                 known = {tab["tab_id"] for tab in self.browser.call("tab_list", {"owner": owner})["tabs"]}
@@ -540,6 +543,15 @@ class Hub:
                 "resource_claim": {"mutating": True, "args": {"kind": sorted(__import__("ff_hub_store").RESOURCE_KINDS),
                                                               "key": "str", "mode": "exclusive|shared", "wait_seconds": "0..60"}},
                 "resource_release": {"mutating": True}, "resource_list": {},
+                "files": {"mutating": "write", "commands": ["read", "stat", "write"],
+                          "args": {"path": "absolute path", "text": "UTF-8 string for write",
+                                   "expected_sha256": "current hash or null to create"},
+                          "locks": "exclusive canonical file lock until release/session_close; cooperative"},
+                "terminal": {"mutating": "start/cancel", "commands": ["start", "status", "list", "cancel"],
+                             "risk_class": "terminal_execute", "args": {"argv": "string[]; shell=false",
+                             "cwd": "absolute directory", "timeout_seconds": "0.1..300", "terminal_id": "exact saved ID"},
+                             "recovery": "supervisor survives Hub restart; poll exact ID, never relaunch",
+                             "scope": "current user, no sandbox; argv/cwd grants do not confine interpreter effects"},
                 "permission_check": {"args": {"risk_class": sorted(RISK_CLASSES), "target": "{path|app|host|secret}"}},
                 "permission_describe": {},
                 "secret_list": {}, "secret_use": {"mutating": True, "risk_class": "secret_use",
@@ -589,7 +601,9 @@ class Hub:
                 "sessions": self.store.sessions(), "private_desktops": len(self._hidden),
                 "browser_manager": {"running": getattr(self.browser, "running", lambda: None)(),
                                     "starts": getattr(self.browser, "starts", None)},
-                "pending_owner_requests": len(self.store.permission_requests())}
+                "pending_owner_requests": len(self.store.permission_requests()),
+                "resources": self.store.resources(),
+                "recovery": "resume saved session token; request_status by exact key; terminal status by exact ID"}
 
     # ---- dispatch ------------------------------------------------------------------------
     @contextmanager
@@ -656,15 +670,15 @@ class Hub:
                              session_id=session["session_id"], **report)
             return {"closed": True, "cleanup_verified": not report["errors"], **report}
         if op == "resource_claim":
-            if args.get("kind") in {"browser_tab", "app_session"}:
+            if args.get("kind") in {"browser_tab", "app_session", "terminal"}:
                 raise HubError("RESOURCE_KIND_MANAGED", "tabs and app sessions are claimed by opening them")
             if args.get("kind") in {"file", "directory"}:
-                args = {**args, "key": os.path.normcase(os.path.abspath(str(args.get("key") or "")))}
+                args = {**args, "key": os.path.normcase(os.path.realpath(os.path.abspath(str(args.get("key") or ""))))}
             return journaled(lambda: self.store.claim(session, args.get("kind"), args.get("key"), mode=args.get("mode", "exclusive"),
                                                       meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
                                                       wait_seconds=args.get("wait_seconds", 0)))
         if op == "resource_release":
-            managed = {"browser_tab", "app_session"}
+            managed = {"browser_tab", "app_session", "terminal"}
             resource_id = args.get("resource_id")
             if args.get("kind") in managed or (resource_id and any(
                     item["resource_id"] == resource_id and item["kind"] in managed
@@ -672,7 +686,7 @@ class Hub:
                 raise HubError("RESOURCE_KIND_MANAGED", "close managed tabs/apps through their lifecycle operations")
             key = args.get("key")
             if args.get("kind") in {"file", "directory"} and key:
-                key = os.path.normcase(os.path.abspath(str(key)))
+                key = os.path.normcase(os.path.realpath(os.path.abspath(str(key))))
             return self.store.release(session, resource_id=args.get("resource_id"), kind=args.get("kind"), key=key)
         if op == "resource_list":
             return {"resources": self.store.resources(session_id=session["session_id"], kind=args.get("kind"))}
@@ -708,6 +722,14 @@ class Hub:
             if args.get("command") in {"open", "navigate", "act", "evaluate", "restore", "close"}:
                 return journaled(lambda: self._browser(session, args))
             return self._browser(session, args)
+        if op == "files":
+            if args.get("command") == "write":
+                return journaled(lambda: self.io.files(session, args))
+            return self.io.files(session, args)
+        if op == "terminal":
+            if args.get("command") in {"start", "cancel"}:
+                return journaled(lambda: self.io.terminal(session, args, request_key))
+            return self.io.terminal(session, args)
         if op in {"app_open", "app_act", "app_close"}:
             return journaled(lambda: self._app(session, op, args))
         if op in {"app_discover", "app_windows", "app_observe", "app_find", "app_capture"}:
