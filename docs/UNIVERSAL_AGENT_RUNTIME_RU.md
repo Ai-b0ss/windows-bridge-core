@@ -20,6 +20,11 @@
   Это три протокольных клиента, **не три модельных провайдера**.
 - Реальный Chrome/extension: повторены relay recovery, hard-crash recovery двух
   вкладок с сохранением JS/форм, отказ захвату занятой вкладки и физический cleanup.
+- Найдена и исправлена потеря записей вкладок при EOF после падения **Python Hub**.
+  Новый live smoke завершает именно Python Hub, сразу запускает замену,
+  восстанавливает две прежние физические страницы с формами/JS и проверяет
+  отсутствие повторного эффекта. Закрытие Page handle при disconnect больше
+  не выдаётся за закрытие физической страницы.
 - Реальный GUI: функциональная проверка и невмешательство PASS; разные процессы
   и private desktops, точные HWND/PID/create_time, чужие окна отклонены,
   foreground/cursor/clipboard не изменились.
@@ -407,7 +412,7 @@ AppExecutionAlias, закреплённую за ним JobObject и точны�
 
 Независимо проверен основной Chrome 158.0.8127.36 (профиль Default,
 расширение Playwright 0.5.0); Playwright 1.65.1 установлен в отдельной
-тестовой папке K:\FF-Windows-Bridge\state\hub-playwright-165, без
+приватной тестовой папке state владельца, без
 обновления установленного Bridge. Ветка feat/universal-agent-runtime.
 
 Owner Chrome smoke через защищённый DPAPI launcher: 20 PASS / 0 FAIL,

@@ -10,7 +10,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/bridge-v3"))
-from ff_hub import Hub
+from ff_hub import BrowserManager, Hub
 from ff_hub_io import MAX_OUTPUT_BYTES
 from ff_hub_mcp import Adapter, handle
 from ff_hub_permissions import PermissionError_
@@ -103,6 +103,20 @@ class ClientIOTests(unittest.TestCase):
         with patch("ff_hub_mcp.ensure_running"), patch.object(self.client, "raw", side_effect=HubError("HUB_UNREACHABLE")) as raw:
             self.error("HUB_UNREACHABLE", lambda: adapter.call({"op": "capabilities"}))
             raw.assert_called_once()
+
+    @unittest.skipUnless(os.name == "nt", "Windows process incarnation")
+    def test_browser_start_waits_for_prior_manager_without_killing_or_reusing_a_pid(self):
+        from ff_win_process_identity import process_creation_token
+        manager = BrowserManager(self.root)
+        manager.state_dir.mkdir()
+        token = process_creation_token(os.getpid())
+        endpoint = manager.state_dir / "endpoint.json"
+        endpoint.write_text(json.dumps({"pid": os.getpid(), "create_time": token, "port": 1}))
+        self.error("BROWSER_MANAGER_RETIRING", lambda: manager._wait_for_prior_manager(timeout=.05))
+        self.assertEqual(token, process_creation_token(os.getpid()))
+        # A recycled PID is not the old manager. Never terminate or wait on it.
+        endpoint.write_text(json.dumps({"pid": os.getpid(), "create_time": token + 1, "port": 1}))
+        manager._wait_for_prior_manager(timeout=.05)
 
     def test_restart_adapter_reuses_checkpoint_explicit_resume_revokes_old_secret(self):
         old = json.loads(next(self.a.checkpoints.glob("*.json")).read_text())

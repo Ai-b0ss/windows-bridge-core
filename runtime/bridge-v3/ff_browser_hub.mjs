@@ -917,9 +917,20 @@ export class BrowserHub {
             if (tab.page?.isClosed() || tab.state === 'closed') { tab.state = 'closed'; closed++; }
             else errors.push({tab_id: tab.id, code: 'TAB_CLOSE_FAILED'});
           }
-      this._persist();
       const connection = this.connection;
       this.connection = null;
+      if (!close_tabs) {
+        // Playwright emits Page.close when its transport disconnects even if
+        // the physical Chrome page survives. Detach handles BEFORE closing
+        // the connection so _wire cannot erase durable identities as closed.
+        for (const tab of this.tabs.values()) {
+          if (!['live', 'opening'].includes(tab.state)) continue;
+          tab.state = 'lost';
+          tab.lost_at = this.clock();
+          tab.page = null;
+        }
+      }
+      this._persist();
       // Only pages explicitly registered to an agent are closed. Initial/foreign pages stay.
       if (connection) await connection.browser.close().catch(() => {});
       return {closed_tabs: closed, errors};
@@ -994,6 +1005,12 @@ function option(name, fallback = null) {
   return index > 0 && index + 1 < process.argv.length ? process.argv[index + 1] : fallback;
 }
 
+export function releaseAfterParentLoss(hub) {
+  // EOF is a transport crash, not an owner's request to discard work. Keep
+  // physical pages and the exact-target ledger for the replacement Hub.
+  return hub.shutdown({close_tabs: false});
+}
+
 async function main() {
   if (process.argv.includes('--preflight')) {
     process.stdout.write(JSON.stringify(await backgroundCapability()) + '\n');
@@ -1008,13 +1025,18 @@ async function main() {
   const hub = new BrowserHub(connector, {artifactDir: path.join(stateDir, 'screenshots'), ledgerFile: path.join(stateDir, 'tab-ledger.json'),
     maxTabsPerOwner: Number(option('max-tabs-per-owner', 8)), maxTabs: Number(option('max-tabs', 32))});
   const endpointFile = option('endpoint-file', path.join(stateDir, 'endpoint.json'));
-  const cleanup = () => { try { fs.unlinkSync(endpointFile); } catch {} };
+  const cleanup = () => {
+    try {
+      if (JSON.parse(fs.readFileSync(endpointFile, 'utf8')).pid === process.pid) fs.unlinkSync(endpointFile);
+    } catch {}
+  };
   const server = await serve(hub, {key, port: Number(option('port', 0)), onShutdown: () => { cleanup(); setTimeout(() => process.exit(0), 200); }});
   const record = {version: VERSION, pid: process.pid, port: server.address().port, started_at: now(), route: connector.describe()};
   fs.writeFileSync(`${endpointFile}.tmp`, JSON.stringify(record));
   fs.renameSync(`${endpointFile}.tmp`, endpointFile);
-  // The parent holds our stdin: when it goes away without a shutdown call, leave cleanly.
-  process.stdin.on('end', async () => { await hub.shutdown({close_tabs: true}).catch(() => {}); cleanup(); process.exit(0); });
+  // Explicit shutdown RPC still closes owned tabs; unexpected parent loss only
+  // disconnects the relay. Never delete unfinished forms because the Hub died.
+  process.stdin.on('end', async () => { await releaseAfterParentLoss(hub).catch(() => {}); cleanup(); process.exit(0); });
   process.stdin.resume();
   for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, async () => { await hub.shutdown({close_tabs: true}).catch(() => {}); cleanup(); process.exit(0); });
 }

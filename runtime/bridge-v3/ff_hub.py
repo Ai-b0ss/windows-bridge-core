@@ -91,6 +91,29 @@ class BrowserManager:
         self._failures = 0
         self.starts = 0
 
+    def _wait_for_prior_manager(self, timeout: float = 10.0) -> None:
+        # After a parent Hub crash the old Node process drains its accepted
+        # work, preserves pages and releases the relay on stdin EOF. Do not
+        # race that ledger writer or replace its endpoint while it retires.
+        endpoint = self.state_dir / "endpoint.json"
+        try:
+            previous = json.loads(endpoint.read_text(encoding="utf-8"))
+            pid, token = previous["pid"], previous.get("create_time")
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if type(pid) is not int or pid <= 0:
+            raise HubError("BROWSER_MANAGER_ENDPOINT_INVALID", execution_started=False)
+        deadline = time.monotonic() + timeout
+        while endpoint.exists():
+            alive = (process_identity_matches(pid, token) if os.name == "nt" and type(token) is int
+                     else _pid_alive(pid))
+            if not alive:
+                return
+            if time.monotonic() >= deadline:
+                raise HubError("BROWSER_MANAGER_RETIRING", "previous manager has not released the relay yet",
+                               execution_started=False, retry_safe=True, retry_after_ms=1000)
+            time.sleep(.05)
+
     def _start(self) -> None:
         now = time.monotonic()
         if now < self._next_start:
@@ -98,6 +121,7 @@ class BrowserManager:
                            retry_after_ms=int((self._next_start - now) * 1000), retry_safe=True)
         powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._wait_for_prior_manager()
         endpoint_file = self.state_dir / "endpoint.json"
         endpoint_file.unlink(missing_ok=True)
         key = _secrets.token_urlsafe(48)
@@ -119,6 +143,9 @@ class BrowserManager:
             if endpoint_file.is_file():
                 try:
                     self._endpoint = json.loads(endpoint_file.read_text(encoding="utf-8"))
+                    self._endpoint["create_time"] = process_creation_token(self._endpoint["pid"])
+                    from ff_hub_io import atomic_json
+                    atomic_json(endpoint_file, self._endpoint)
                     self._process, self._key, self._failures = process, key, 0
                     self.starts += 1
                     return
@@ -581,7 +608,7 @@ class Hub:
                                               "read-only probe: node ff_browser_hub.mjs --preflight; never falls back to foreground",
                 "browser_manager_crash": "a durable ledger keeps owner and exact CDP target id of every agent tab; after a manager crash "
                                          "restore/close reattach the same physical tab only on an exact target-id match "
-                                         "(proven on an isolated CDP browser; not yet proven through the owner extension relay). "
+                                         "through the pinned extension relay; occupied foreign targets are never taken over. "
                                          "Without a match: TAB_RECOVERY_UNAVAILABLE / TAB_CLEANUP_UNCONFIRMED, no URL adoption, "
                                          "no duplicate reopening",
                 "background_browser_input": "actions are DOM-level (untrusted events); sites that demand real pointer/keyboard "
