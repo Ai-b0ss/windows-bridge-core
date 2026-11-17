@@ -16,6 +16,18 @@ def agent_workflows() -> dict:
         "owner_chat_permission_attested": False,
         "foreground_input_allowed": False,
         "agent_safe_no_effect_discovery": True,
+        "shared_hub": {
+            "feature": "capabilities.features.universal_agent_runtime",
+            "bridge_op": "hub",
+            "require_enabled": True,
+            "request": {"op": "capabilities", "args": {}},
+            "session_required_for_work": True,
+            "request_key_required_for_mutations": True,
+            "resume_requires_saved_token": True,
+            "foreground_input_available": False,
+            "discovery_is_task_proof": False,
+            "instruction": "If disabled, keep existing routes; never enable or restart production to probe a feature",
+        },
         # The manifest is static. The connected runtime's dispatcher may be
         # an older version even when this workflow was copied forward.
         "preflight_actual_rpc_support_verified": False,

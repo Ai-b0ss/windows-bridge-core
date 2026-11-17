@@ -98,8 +98,9 @@ def _medium_create(k, cmd, environment, current_dir, extended, pi):
         if medium:k.LocalFree(medium)
 
 class HiddenDesktopSession:
-    def __init__(self, package_root: str | Path, *, worker_integrity="owner", webview_debug=False):
-        if type(worker_integrity) is not str or worker_integrity not in {"owner","medium"} or type(webview_debug) is not bool:
+    def __init__(self, package_root: str | Path, *, worker_integrity="owner", webview_debug=False, allow_generic_launch=False):
+        if (type(worker_integrity) is not str or worker_integrity not in {"owner","medium"}
+                or type(webview_debug) is not bool or type(allow_generic_launch) is not bool):
             raise HiddenDesktopError("HIDDEN_START_OPTION_INVALID")
         if os.name != "nt":
             raise HiddenDesktopError("HIDDEN_DESKTOP_WINDOWS_ONLY")
@@ -146,7 +147,8 @@ class HiddenDesktopSession:
             extended.lpAttributeList=ctypes.cast(attributes,w.LPVOID)
             cmd=ctypes.create_unicode_buffer(subprocess.list2cmdline([sys.executable,str(self.root/"cua_hidden_worker.py")]))
             pi=_ProcessInfo()
-            child_env=dict(os.environ)
+            from cua_hidden_apps import hidden_worker_environment
+            child_env=hidden_worker_environment(os.environ,allow_generic_launch=allow_generic_launch)
             # Debugging is explicit, confined to owned children, and inspected
             # only after loopback/listener/ancestry checks in the worker.
             child_env.pop('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS',None)

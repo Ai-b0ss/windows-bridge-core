@@ -44,7 +44,7 @@ def sha(data: bytes) -> str:
 def bundled_subtree_file(name: str) -> bool:
     path = Path(name)
     return (path.parts[0] in {"runtime", "tests"} and
-            "__pycache__" not in path.parts and
+            not {"__pycache__", "node_modules"} & set(path.parts) and
             path.suffix.lower() not in {".pyc", ".pyd", ".exe", ".dll", ".zip"})
 
 
@@ -60,12 +60,17 @@ def source_tree(repo: Path) -> dict[str, bytes]:
         if not root.is_dir():
             raise ValueError("Required public source tree missing: " + subtree)
         for file in sorted(root.rglob("*")):
+            name = file.relative_to(repo).as_posix()
+            # npm ci installs reproducible dependencies locally for tests.
+            # Never bundle their untracked bytes or accidentally package a
+            # vendor token/cache. Still reject any unexpected source file or
+            # symlink outside the dependency directory.
+            if "node_modules" in file.relative_to(repo).parts:
+                continue
             if file.is_symlink():
                 raise ValueError("Public source file/link not allowed: " + str(file))
-            if file.is_file():
-                name = file.relative_to(repo).as_posix()
-                if bundled_subtree_file(name):
-                    bundle[name] = file.read_bytes()
+            if file.is_file() and bundled_subtree_file(name):
+                bundle[name] = file.read_bytes()
     if "runtime/bridge-v3/ff_win_v3_main.py" not in bundle:
         raise ValueError("Core runtime entrypoint missing")
     return bundle

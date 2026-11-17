@@ -33,6 +33,18 @@ extras.register(core)
 documents.register(core, extras)
 upgrade.register(core)
 _TASK_AUTHORITY = AuthorityStore(core.BRIDGE_ROOT / "state" / "task-authority")
+from ff_hub_rpc import HubGateway, HubGatewayError
+_HUB_GATEWAY = HubGateway(core.BRIDGE_ROOT)
+
+
+def _hub_rpc(args):
+    try:
+        return _HUB_GATEWAY.call(args)
+    except HubGatewayError as exc:
+        raise core.RPCError(exc.code, details=exc.details) from None
+
+
+core.OPS["hub"] = _hub_rpc
 
 _CUA_CONTROL_PLANE = cua_bridge_v3.CuaBridgeControlPlane(Path(__file__).resolve().parent)
 # Register exact owned CUA surface targets for CLI-first policy; no title guessing.
@@ -679,6 +691,7 @@ def _install_gui_guards() -> None:
             "independent_app_task_success_attested": False,
         }
         features["agent_workflows_discovery"] = True
+        features["universal_agent_runtime"] = _HUB_GATEWAY.discovery()
         features["owner_chat_permission"] = _CHAT_PERMISSION.status()
         features["trusted_skill_input_pilot"] = {
             "version": 1,
