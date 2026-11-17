@@ -197,6 +197,7 @@ class Hub:
         self._gates: dict[str, list[Any]] = {}
         self.started_at = time.time()
         self._stop = threading.Event()
+        self._stopping=False
         # Private desktops live inside the Hub process: after a restart none of the earlier ones
         # exists. Say so in the records instead of leaving ownership of windows that are gone.
         for item in self.store.drop_resources("app_session"):
@@ -372,7 +373,36 @@ class Hub:
             code = getattr(exc, "code", None)
             if not code:
                 raise
-            raise HubError(code, None, **{**getattr(exc, "details", {}), "retry_safe": False}) from None
+            details={**getattr(exc, "details", {}), "retry_safe": False}
+            if code=='HIDDEN_ACTION_OUTCOME_UNKNOWN':details.update(outcome_unknown=True,attempted=True)
+            if getattr(hidden,'closed',False):
+                for owner,value in list(self._hidden.items()):
+                    if value is hidden:self._hidden.pop(owner,None)
+            raise HubError(code, None, **details) from None
+
+    def _private_browser(self, session: dict, args: dict) -> dict:
+        """Owned OS-private Chrome; effects are journaled by dispatch, including submit."""
+        command=args.get('command')
+        if command=='open':
+            self._permit(session,'app_launch',{'app':'chrome.exe'},action='private_browser.open')
+            hidden=self._hidden_session(session,create=True)
+            window=self._hidden_request(hidden,{'command':'browser.launch'},timeout=60)
+            browser_id=f"private-browser-{window['pid']}-{window['create_time']}"
+            self.store.claim(session,'app_session',browser_id,meta={**window,'private_browser':True})
+            return {'browser_id':browser_id,**{k:v for k,v in window.items() if k not in {'browser_ws_endpoint','cdp_endpoint','browser_ws_path'}}}
+        resource=self.store.require_owned(session,'app_session',str(args.get('browser_id') or ''))
+        if not resource['meta'].get('private_browser'):raise HubError('PRIVATE_BROWSER_NOT_OWNED',execution_started=False)
+        hidden=self._hidden_session(session,create=False)
+        if command=='close':
+            others=[r for r in self.store.resources(session_id=session['session_id'],kind='app_session') if r['key']!=resource['key']]
+            if others:raise HubError('PRIVATE_DESKTOP_HAS_OTHER_APPS','close apps first, or session_close to cancel the whole task',execution_started=False)
+            closed=self._close_hidden(self._owner(session))
+            if not closed:raise HubError('PRIVATE_BROWSER_CLEANUP_FAILED',outcome_unknown=True,retry_safe=False)
+            self.store.release(session,resource_id=resource['resource_id'])
+            return {'closed':True,'browser_profile_cleanup':getattr(hidden,'browser_profile_cleanup',[])}
+        self._permit(session,'browser_script' if command=='evaluate' else 'browser_own_tabs',action='private_browser.'+str(command))
+        payload={k:v for k,v in args.items() if k!='browser_id'}
+        return self._hidden_request(hidden,{'command':'browser.rpc','args':payload},timeout=60)
 
     def _app(self, session: dict, op: str, args: dict) -> dict:
         if op == "app_discover":
@@ -407,7 +437,8 @@ class Hub:
                                attempted=True, retry_safe=False)
             app_id = f"app-{window['pid']}-{window['create_time']}-{window['hwnd']}"
             self.store.claim(session, "app_session", app_id, meta={"pid": window["pid"], "hwnd": window["hwnd"],
-                                                                    "create_time": window["create_time"], "executable": app["executable"]})
+                                                                    "create_time": window["create_time"], "executable": app["executable"],
+                                                                    "document_path":args.get('document_path')})
             return {**window, "app_id": app_id, "route_status": hidden_route["status"], "route_note": hidden_route.get("note"),
                     "visible_to_owner": False}
         resource = self.store.require_owned(session, "app_session", str(args.get("app_id") or ""))
@@ -438,6 +469,14 @@ class Hub:
         if op == "app_capture":
             self._permit(session, "read_diagnose", action=op)
             return self._hidden_request(hidden, {"command": "capture_window", "hwnd": args.get("hwnd", hwnd)})
+        if op == 'app_document':
+            self._permit(session,'own_resources',action=op)
+            action=args.get('command')
+            if action not in {'read','replace','save'}:raise HubError('APP_DOCUMENT_COMMAND_INVALID',execution_started=False)
+            document=resource['meta'].get('document_path')
+            if not document:raise HubError('APP_DOCUMENT_NOT_BOUND',execution_started=False)
+            return self._hidden_request(hidden,{'command':'document.'+action,'hwnd':target_hwnd,'document_path':document,
+                **{k:args[k] for k in ('expected_text','replacement_text','slide_id','shape_id','shape_name') if k in args}},timeout=60)
         if op == "app_close":
             result = self._hidden_request(hidden, {"command": "close_app", "pid": pid,
                                                    "create_time": resource["meta"].get("create_time")})
@@ -453,6 +492,8 @@ class Hub:
         if hidden is not None:
             try:
                 hidden.close()
+                cleanup=[*getattr(hidden,'browser_profile_cleanup',[]),*getattr(hidden,'editor_profile_cleanup',[])]
+                if any(item.get('removed') is not True for item in cleanup):return False
             except Exception:
                 with self._hidden_lock:
                     self._hidden[owner] = hidden
@@ -481,10 +522,12 @@ class Hub:
         # A launch may create an owned process before returning a window/app_id. Close the
         # private worker even if no app_session record could be materialized.
         if owner in self._hidden:
+            hidden=self._hidden[owner]
             if self._close_hidden(owner):
                 report["app_sessions_closed"] = sum(item["kind"] == "app_session" for item in held)
             else:
                 report["errors"].append({"kind": "app_session", "code": "HIDDEN_CLEANUP_FAILED"})
+            report['profile_cleanup']=[*getattr(hidden,'browser_profile_cleanup',[]),*getattr(hidden,'editor_profile_cleanup',[])]
         report["locks_released"] = sum(item["kind"] not in {"browser_tab", "app_session"} for item in held)
         return report
 
@@ -536,7 +579,12 @@ class Hub:
             "operations": {
                 "capabilities": {"session": False}, "hub_status": {"session": False},
                 "session_open": {"session": False, "args": {"agent_id": "str", "task_id": "str", "resume_token": "str?"}},
+                "private_browser": {"mutating":"all except info/tabs/observe/read/screenshot/download_read","request_key_required":True,
+                    "commands":["open","close","tabs","tab_open","tab_close","navigate","observe","read","act","upload","download_prepare","download_read","screenshot","evaluate"],
+                    "transport":"owned Chrome on private Windows Desktop; CDP broker; Hub durable receipts"},
+                "app_document": {"commands":["read","replace","save"],"document":"exact path bound at app_open","mutating":"replace/save"},
                 "session_heartbeat": {}, "session_status": {}, "session_close": {"mutating": True},
+                "task_cancel": {"mutating":True,"durable_receipt_after_close":True}, "hub_shutdown_idle":{"session":False,"requires_idle":True},
                 "resource_claim": {"mutating": True, "args": {"kind": sorted(__import__("ff_hub_store").RESOURCE_KINDS),
                                                               "key": "str", "mode": "exclusive|shared", "wait_seconds": "0..60"}},
                 "resource_release": {"mutating": True}, "resource_list": {},
@@ -614,7 +662,7 @@ class Hub:
         op, args = request.get("op"), request.get("args") or {}
         if not isinstance(args, dict):
             raise HubError("ARGS_INVALID")
-        if op in {"capabilities", "hub_status", "request_status", "session_status", "session_heartbeat",
+        if op in {"capabilities", "hub_status", "hub_shutdown_idle", "request_status", "session_status", "session_heartbeat",
                   "resource_list", "permission_check", "permission_describe", "secret_list", "audit_read", "app_discover"}:
             return self._dispatch(request)
         if op == "session_open":
@@ -622,7 +670,7 @@ class Hub:
                 raise HubError("IDENTITY_INVALID")
             owner = self._owner(args)
         else:
-            owner = self._owner(self.store.authenticate(request.get("session_id"), request.get("session_secret")))
+            owner = self._owner(self.store.authenticate(request.get("session_id"), request.get("session_secret"),allow_closed=op in {'task_cancel','request_status'}))
         with self._owner_gate(owner):
             return self._dispatch(request)
 
@@ -636,14 +684,29 @@ class Hub:
             return self.capabilities()
         if op == "hub_status":
             return self.status()
+        if op=='hub_shutdown_idle':
+            with self._hidden_lock:
+                if self.store.sessions() or self._hidden:raise HubError('HUB_BUSY','cancel/finish owned tasks before stopping',retry_safe=False)
+                callback=getattr(self,'_shutdown_request',None)
+                if callback is None:raise HubError('HUB_SHUTDOWN_UNAVAILABLE')
+                self._stopping=True;callback()
+            return {'stopping':True,'idle_verified':True}
         if op == "session_open":
-            return self.store.open_session(args.get("agent_id"), args.get("task_id"),
-                                           resume_token=args.get("resume_token"), note=args.get("note"))
-        session = self.store.authenticate(request.get("session_id"), request.get("session_secret"))
+            with self._hidden_lock:
+                if self._stopping:raise HubError('HUB_STOPPING',execution_started=False)
+                return self.store.open_session(args.get("agent_id"), args.get("task_id"),
+                                               resume_token=args.get("resume_token"), note=args.get("note"))
+        session = self.store.authenticate(request.get("session_id"), request.get("session_secret"),allow_closed=op in {'task_cancel','request_status'})
         request_key = request.get("request_key")
 
         def journaled(run: Callable[[], dict]) -> dict:
             return self.store.journal_execute(session, request_key, op, args, run)
+
+        if op=='task_cancel':
+            def cancel():
+                held=self.store.close_session(session['session_id']);report=self._cleanup(session,held)
+                return {'closed':True,'cleanup_verified':not report['errors'],**report}
+            return journaled(cancel)
 
         if op == "session_heartbeat":
             return {"ok": True, **session}
@@ -708,6 +771,13 @@ class Hub:
             if args.get("command") in {"open", "navigate", "act", "evaluate", "restore", "close"}:
                 return journaled(lambda: self._browser(session, args))
             return self._browser(session, args)
+        if op=='private_browser':
+            from cua_private_browser import READ_COMMANDS
+            if args.get('command') in READ_COMMANDS:return self._private_browser(session,args)
+            return journaled(lambda:self._private_browser(session,args))
+        if op=='app_document':
+            if args.get('command')=='read':return self._app(session,op,args)
+            return journaled(lambda:self._app(session,op,args))
         if op in {"app_open", "app_act", "app_close"}:
             return journaled(lambda: self._app(session, op, args))
         if op in {"app_discover", "app_windows", "app_observe", "app_find", "app_capture"}:
@@ -734,7 +804,9 @@ def make_handler(hub: Hub, key: str) -> type:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            try:self.wfile.write(data)
+            except (BrokenPipeError,ConnectionResetError):
+                hub.store.audit('client_disconnected',reply_committed=True)
 
         def do_POST(self) -> None:
             if not hmac.compare_digest(self.headers.get("X-FF-Hub-Key", ""), key):
@@ -887,6 +959,7 @@ def _serve_locked(state_dir: Path, port: int) -> int:
     hub = Hub(state_dir)
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), make_handler(hub, key))
     server.daemon_threads = True
+    hub._shutdown_request=lambda:threading.Thread(target=server.shutdown,daemon=True).start()
     record = {"version": HUB_VERSION, "pid": os.getpid(), "create_time": process_creation_token(os.getpid()),
               "port": server.server_address[1], "started_at": time.time(),
               "package": str(PACKAGE)}

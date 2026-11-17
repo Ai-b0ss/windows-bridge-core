@@ -162,16 +162,16 @@ class HubStore:
                 "agent_id": agent_id, "task_id": task_id, "resumed": bool(previous), "adopted_resources": adopted,
                 "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
 
-    def authenticate(self, session_id: Any, secret: Any) -> dict:
+    def authenticate(self, session_id: Any, secret: Any, *, allow_closed=False) -> dict:
         if not isinstance(session_id, str) or not isinstance(secret, str):
             raise HubError("SESSION_REQUIRED", "open a session first (session_open)")
         with self._lock:
             row = self._session_row(session_id)
             if row is None or not secrets.compare_digest(row["secret_hash"], _hash(secret)):
                 raise HubError("SESSION_INVALID", "unknown session or wrong session secret")
-            if row["state"] != "active":
+            if row["state"] != "active" and not allow_closed:
                 raise HubError("SESSION_CLOSED", "this session ended; open or resume one", state=row["state"])
-            self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
+            if row['state']=='active':self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
         return {"session_id": session_id, "agent_id": row["agent_id"], "task_id": row["task_id"]}
 
     def close_session(self, session_id: str) -> list[dict]:

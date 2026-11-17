@@ -141,6 +141,11 @@ def launch_chrome(root, args, *, register, windows, owns, window_info, desktop, 
     if executable is None:
         raise HiddenChromeError("HIDDEN_CHROME_NOT_INSTALLED", {"attempted": False})
     root, owner, profile = _profile(root)
+    # Never fall back to the owner's Downloads if a CDP client disconnects.
+    downloads=root/'artifacts'/'downloads';downloads.mkdir(parents=True)
+    preferences=profile/'Default';preferences.mkdir()
+    (preferences/'Preferences').write_text(json.dumps({'download':{'default_directory':str(downloads),
+        'prompt_for_download':False,'directory_upgrade':True}}),encoding='utf-8')
     si = subprocess.STARTUPINFO()
     si.dwFlags = subprocess.STARTF_USESHOWWINDOW
     si.wShowWindow = 4  # SW_SHOWNOACTIVATE, on the inherited private desktop.

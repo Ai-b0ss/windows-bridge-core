@@ -46,6 +46,7 @@ ui_core=None
 panels={}
 editors={}
 chrome=None
+private_browser=None
 def windows(pid):
     found=[];callback_type=ctypes.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
     @callback_type
@@ -75,7 +76,7 @@ def owns(hwnd):
     pid=w.DWORD();U.GetWindowThreadProcessId(int(hwnd),ctypes.byref(pid))
     return live_app(pid.value) and int(hwnd) in windows(pid.value)
 def handle(args):
-    global uia_backend,uia_core,ui_backend,ui_core,chrome
+    global uia_backend,uia_core,ui_backend,ui_core,chrome,private_browser
     from cua_desktop_identity import require_private_desktop
     identity=require_private_desktop(desktop)
     command=args.get("command")
@@ -92,6 +93,11 @@ def handle(args):
         from cua_hidden_chrome import verify_chrome
         if chrome is None:raise HiddenLaunchError('HIDDEN_CHROME_NOT_STARTED')
         return verify_chrome(chrome,owns=owns,desktop=desktop)
+    if command=='browser.rpc':
+        from cua_private_browser import PrivateBrowser
+        if chrome is None:raise HiddenLaunchError('HIDDEN_CHROME_NOT_STARTED')
+        if private_browser is None:private_browser=PrivateBrowser(chrome,owns,desktop)
+        return private_browser.dispatch(args.get('args') or {})
     if command=='editor.launch':
         from cua_owned_editor_launch import launch_editor
         def register(proc):register_app(proc)
