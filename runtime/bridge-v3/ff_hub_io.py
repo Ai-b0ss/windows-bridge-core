@@ -18,6 +18,8 @@ import threading
 import time
 import uuid
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from ff_hub_store import HubError
 
 MAX_FILE_BYTES = 1024 * 1024

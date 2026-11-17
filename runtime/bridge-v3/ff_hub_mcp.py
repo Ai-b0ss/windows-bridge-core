@@ -14,6 +14,9 @@ import os
 from pathlib import Path
 import sys
 
+# Portable embedded Python omits the script directory from its isolated path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 from ff_hub import HubClient, default_state_dir, ensure_running
 from ff_hub_io import atomic_json
 from ff_hub_store import HubError, _ident

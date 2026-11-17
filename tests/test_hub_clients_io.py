@@ -4,9 +4,11 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
+import uuid
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/bridge-v3"))
@@ -87,6 +89,35 @@ class ClientIOTests(unittest.TestCase):
         self.assertNotIn("resume_token", json.dumps(reply))
         self.assertIsNone(handle(self.a, {"jsonrpc": "2.0", "method": "notifications/initialized"}))
         self.assertEqual(-32601, handle(self.a, {"jsonrpc": "2.0", "id": 4, "method": "unsupported"})["error"]["code"])
+
+    def test_stdio_entrypoint_bootstraps_with_an_isolated_python_import_path(self):
+        script = Path(__file__).resolve().parents[1] / "runtime/bridge-v3/ff_hub_mcp.py"
+        requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "isolated-python", "version": "1"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
+        result = subprocess.run([sys.executable, "-I", "-S", str(script), "--agent", "portable-probe"],
+                                input="".join(json.dumps(item) + "\n" for item in requests), cwd=self.root,
+                                capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(0, result.returncode, result.stderr)
+        replies = [json.loads(line) for line in result.stdout.splitlines()]
+        self.assertEqual("hub", replies[1]["result"]["tools"][0]["name"])
+
+    def test_terminal_worker_bootstraps_with_an_isolated_python_import_path(self):
+        script = Path(__file__).resolve().parents[1] / "runtime/bridge-v3/ff_hub_io.py"
+        directory = self.root / "isolated-worker"
+        directory.mkdir()
+        spec = {"terminal_id": "portable-worker", "job_token": uuid.uuid4().hex[:16],
+                "argv": [sys.executable, "-I", "-S", "-c", "print('portable-worker-proof')"],
+                "cwd": str(directory), "timeout_seconds": 5, "output_limit": 1024}
+        (directory / "spec.json").write_text(json.dumps(spec), encoding="utf-8")
+        result = subprocess.run([sys.executable, "-I", "-S", str(script), "--worker", str(directory)],
+                                cwd=self.root, capture_output=True, text=True, encoding="utf-8", timeout=15)
+        self.assertEqual(0, result.returncode, result.stderr)
+        status = json.loads((directory / "status.json").read_text())
+        self.assertEqual("completed", status["state"])
+        self.assertEqual(0, status["exit_code"])
+        self.assertTrue(status["cleanup_verified"])
+        self.assertIn("portable-worker-proof", (directory / "output.log").read_text())
 
     def test_owner_opt_in_start_never_enables_feature_and_never_replays_failed_call(self):
         adapter = Adapter(self.root / "hub", "owner-start", client=self.client, start_if_stopped=True)
