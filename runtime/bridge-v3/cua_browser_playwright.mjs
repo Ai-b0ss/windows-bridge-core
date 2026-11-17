@@ -408,7 +408,22 @@ export class PlaywrightEngine {
     return this._bounded('ACTION_TIMEOUT',timeout,async()=>{
       if(action==='click'){
         if(args.dialog){ const dialogPromise=h.page.waitForEvent('dialog',{timeout}).then(async dialog=>{ const evidence={type:dialog.type(),message:dialog.message()}; if(args.dialog.action==='dismiss')await dialog.dismiss(); else await dialog.accept(args.dialog.promptText); return evidence; }); const [,dialogEvidence]=await Promise.all([locator.click({timeout}),dialogPromise]); return {trace_refs:[{kind:'dialog',...dialogEvidence}]}; }
-        await locator.click({timeout}); return {};
+        const forceAriaLink=args.force_aria_link===true;
+        if(forceAriaLink){
+          // Exceptional owner-scoped retry for moving ARIA links. Do not bypass a
+          // disabled, hidden, offscreen or obscured target; never accept generic force.
+          const eligible=await locator.evaluate(el=>{
+            if(el.tagName!=='DIV'||el.getAttribute('role')!=='link'||el.getAttribute('tabindex')!=='0'||el.getAttribute('aria-disabled')==='true'||!el.isConnected)return false;
+            const style=getComputedStyle(el),box=el.getBoundingClientRect();
+            if(style.display==='none'||style.visibility==='hidden'||style.pointerEvents==='none'||box.width<1||box.height<1)return false;
+            const x=box.left+box.width/2,y=box.top+box.height/2;
+            if(x<0||y<0||x>=innerWidth||y>=innerHeight)return false;
+            const top=document.elementFromPoint(x,y);
+            return top===el||el.contains(top);
+          });
+          if(!eligible)throw new BrowserSidecarError('FORCED_ARIA_LINK_NOT_ELIGIBLE');
+        }
+        await locator.click({timeout,force:forceAriaLink}); return {};
       }
       if(action==='fill'){await locator.fill(String(args.text??''),{timeout});return {};}
       if(action==='clear'){await locator.fill('',{timeout});return {};}

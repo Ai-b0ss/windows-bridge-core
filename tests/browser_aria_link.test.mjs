@@ -55,3 +55,36 @@ test('ARIA links advertise and execute a guarded browser click in every discover
     handle.ownedPages.add(handle.page);
   } finally { await sidecar.close(surface_id); }
 });
+
+test('opt-in forced click handles animated visible ARIA link, but rejects unsafe targets', async () => {
+  const sidecar=new BrowserSidecar(new PlaywrightEngine(pw));
+  const {surface_id}=await sidecar.attach({headless:true,
+    ...(process.env.FF_TEST_CHROME?{executablePath:process.env.FF_TEST_CHROME}:{})});
+  try{
+    const fixture=`<!doctype html><style>
+      @keyframes wobble {0%{transform:translateX(0)}50%{transform:translateX(4px)}100%{transform:translateX(0)}}
+      #choice {display:block;padding:20px;animation:wobble .17s infinite linear}
+    </style>
+    <div id="choice" role="link" tabindex="0">Animated account</div>
+    <div role="link" tabindex="0" aria-disabled="true">Disabled account</div>
+    <button>Dangerous button</button>
+    <p id="result">IDLE</p>
+    <script>document.querySelector('#choice').addEventListener('click',e=>{
+      document.querySelector('#result').textContent=e.isTrusted?'TRUSTED_CLICK_OK':'UNTRUSTED_CLICK';
+    });</script>`;
+    await sidecar.navigate(surface_id,'data:text/html,'+encodeURIComponent(fixture));
+    const a=await sidecar.find(surface_id,{role:'link',text:'Animated account'});
+    await assert.rejects(sidecar.act(surface_id,{ref:a.matches[0].ref,generation:a.generation,
+      action:'click',args:{timeout_ms:500}}),{code:'ACTION_TIMEOUT'});
+    const b=await sidecar.find(surface_id,{role:'link',text:'Animated account'});
+    const result=await sidecar.act(surface_id,{ref:b.matches[0].ref,generation:b.generation,
+      action:'click',args:{force_aria_link:true,timeout_ms:3000},verify:{text:'TRUSTED_CLICK_OK'}});
+    assert.equal(result.verified,true);
+    const button=await sidecar.find(surface_id,{role:'button',text:'Dangerous button'});
+    await assert.rejects(sidecar.act(surface_id,{ref:button.matches[0].ref,generation:button.generation,
+      action:'click',args:{force_aria_link:true}}),{code:'FORCED_ARIA_LINK_NOT_ELIGIBLE'});
+    const disabled=await sidecar.find(surface_id,{role:'link',text:'Disabled account'});
+    await assert.rejects(sidecar.act(surface_id,{ref:disabled.matches[0].ref,generation:disabled.generation,
+      action:'click',args:{force_aria_link:true}}),{code:'FORCED_ARIA_LINK_NOT_ELIGIBLE'});
+  }finally{await sidecar.close(surface_id);}
+});
