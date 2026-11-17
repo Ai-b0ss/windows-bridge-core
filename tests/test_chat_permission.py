@@ -54,6 +54,32 @@ class ChatPermissionTests(unittest.TestCase):
         self.assertEqual(rows[0]["quote"],"да, можно")
         self.assertEqual(rows[0]["task_id"],"task-1")
 
+    def test_owner_motive_and_result_are_persisted_but_not_treated_as_verification(self):
+        self.enable()
+        purpose="Verify a real sign-in for the owner's own preview application without reading other accounts"
+        criteria="Server confirms an authenticated session and a test workspace survives logout and login"
+        self.policy.note_route_search("chatgpt","task-1","task_preflight")
+        store=AuthorityStore(self.root/"authority")
+        modes=DesktopModes(self.root/"mode",store,lambda hwnd:None,chat_permission=self.policy)
+        reply=modes.transition(request(duration_seconds=180,purpose=purpose,success_criteria=criteria))
+        self.assertEqual(reply["owner_task_context"]["purpose"],purpose)
+        self.assertEqual(reply["owner_task_context"]["success_criteria"],criteria)
+        self.assertFalse(reply["owner_task_context"]["is_action_verification"])
+        again=DesktopModes(self.root/"mode",store,lambda hwnd:None,chat_permission=self.policy)
+        self.assertEqual(again.status("chatgpt","task-1")["your_grant"]["owner_task_context"]["purpose"],purpose)
+        rows=[json.loads(line) for line in (self.root/"log/chat-permission.jsonl").read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(rows[0]["purpose"],purpose)
+        self.assertEqual(rows[0]["success_criteria"],criteria)
+        self.assertFalse(rows[0]["task_context_is_authorization"])
+
+    def test_context_validation_rejects_invalid_fields_without_grant(self):
+        self.enable()
+        for invalid in [request(purpose=" "),request(purpose="x"*2001),
+                        request(purpose=123),request(success_criteria=""),
+                        request(success_criteria="x"*1501),request(success_criteria=[])]:
+            with self.assertRaises(ChatPermissionError):
+                self.policy.authorize(invalid)
+
     def test_default_duration_and_validation(self):
         self.enable()
         self.assertEqual(self.policy.authorize(request()),self.clock.now+3600)

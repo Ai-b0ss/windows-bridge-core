@@ -16,6 +16,23 @@ def agent_workflows() -> dict:
         "owner_chat_permission_attested": False,
         "foreground_input_allowed": False,
         "agent_safe_no_effect_discovery": True,
+        "owner_task_context_guidance": {
+            "bridge_op": "set_desktop_mode",
+            "permission_fields": ["quote", "apps", "duration_seconds", "purpose", "success_criteria"],
+            "purpose": "Long-form task motive and scope, recorded locally and shown by desktop_mode_status for the scoped grant",
+            "owner_quote_required": "Use the owner's exact words from the current chat, never synthesize a quote",
+            "context_is_authorization": False,
+            "permission_is_action_verification": False,
+            "ACTION_UNVERIFIED": {
+                "meaning": "Execution may have been attempted, but the external effect was not observed; not a permission refusal",
+                "next_steps": [
+                    "Inspect fresh page or remote state without repeating a non-idempotent click",
+                    "Supply an independently observable postcondition for a new action",
+                    "Use a properly scoped owner-granted desktop route if and only if normal routes genuinely failed",
+                ],
+                "never_do": "Do not mark verified=true merely because the owner permitted the action",
+            },
+        },
         # The manifest is static. The connected runtime's dispatcher may be
         # an older version even when this workflow was copied forward.
         "preflight_actual_rpc_support_verified": False,
@@ -113,6 +130,8 @@ def agent_workflows() -> dict:
                         "owner_chat_permission": {
                             "quote": "<owner's own message, verbatim>",
                             "apps": ["<app names>"], "duration_seconds": 3600,
+                            "purpose": "<why this exact action is necessary for the owner's project>",
+                            "success_criteria": "<independent external postcondition, e.g. a real authenticated session>",
                         },
                     },
                     "then": "use windows_mcp Click/Type/Scroll/Move/Shortcut with agent_id, task_id, the returned mode_generation and target_hwnd (your own granted window; the Bridge focuses it for you)",

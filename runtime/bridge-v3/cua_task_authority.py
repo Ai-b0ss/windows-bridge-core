@@ -389,9 +389,17 @@ class DesktopModes:
         """Single-grant shaped answer (what clients of the old global mode read)."""
         if grant is None:
             return {"mode": "coexist", "generation": state["generation"], "other_grants": len(state["grants"])}
-        return {"mode": "dedicated", "agent_id": grant["agent_id"], "task_id": grant["task_id"],
+        view = {"mode": "dedicated", "agent_id": grant["agent_id"], "task_id": grant["task_id"],
                 "targets": grant["targets"], "expires": grant["expires"], "generation": grant["generation"],
                 "other_grants": len(state["grants"]) - 1}
+        if grant.get("purpose") is not None or grant.get("success_criteria") is not None:
+            view["owner_task_context"] = {
+                "purpose": grant.get("purpose"),
+                "success_criteria": grant.get("success_criteria"),
+                "source": "agent_reported_under_owner_chat_grant",
+                "is_action_verification": False,
+            }
+        return view
 
     def transition(self, args):
         from cua_global_resources import _StateLock
@@ -417,6 +425,14 @@ class DesktopModes:
                     self.stop_input()
                 generation = state["generation"] + 1
                 grant = {"agent_id": agent, "task_id": task, "targets": targets, "expires": expires, "generation": generation}
+                # Permission was validated in _grant_expiry; store optional
+                # non-authorizing purpose so agents can inspect the task scope
+                # through desktop_mode_status rather than an unrelated file.
+                permission = args.get("owner_chat_permission")
+                if isinstance(permission, dict):
+                    for key in ("purpose", "success_criteria"):
+                        if permission.get(key) is not None:
+                            grant[key] = permission[key].strip()
                 state = {"generation": generation,
                          "grants": [g for g in state["grants"] if g is not mine] + [grant]}
                 self._write(state)
