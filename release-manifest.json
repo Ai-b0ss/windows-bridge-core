@@ -357,7 +357,7 @@
     "runtime/bridge-v3/cua_browser_companion_host.cs": "19f798aac1f4b85d23b0c6857f00428ffbf8a1990ad9c7222e2dd03a2ea1042f",
     "runtime/bridge-v3/cua_browser_companion_install.ps1": "43cc790cc7b0a0ca2d3c4434476646e22e63f8c06f6ca2afcd2f7faea7a56d6c",
     "runtime/bridge-v3/cua_browser_extension_rpc.ps1": "491b5df346e6a2b9725106bd49d1101bd1360522c081c14f7d586016334e3489",
-    "runtime/bridge-v3/cua_browser_playwright.mjs": "fd43c0baa98c620b8762a74ecd7ce73e382ddf72951fd583efa1197ad0165dc0",
+    "runtime/bridge-v3/cua_browser_playwright.mjs": "9831fa1f9383fc8fe41859673a10d15281e3129166dfa31d6b71c4e1fe945c19",
     "runtime/bridge-v3/cua_browser_profiles.py": "13353e1724565d1419e7e424e70129568efd35a969fdc926ef9e18a2e76862ae",
     "runtime/bridge-v3/cua_browser_rpc.mjs": "3876f2e51a3a1d568e458e74e0c44d21b92fd3fc574f02aa387f6044c9e4cb2c",
     "runtime/bridge-v3/cua_browser_sidecar.mjs": "83379b02531eff8f9bde00390599ba0bb3f82c57e6f9cf25983dec137d418911",
@@ -558,6 +558,8 @@
     "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
     "tools/cua_cold_recovery_watchdog.py": "2fabe980fada6db85e3cc10e8a4df8e1c9d4928002ad342504a8c40d70de9061",
     "tools/cua_cold_rollback_bundle.py": "bec15aea080c9d5918a8b4fe89b05e61159f2709f1010031ef98861aa317c34f",
-    "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0"
+    "tools/optional_addons.py": "06b4687c2a08fbba1254d7f01584f700f6b707e66af653fbfcd7d419e9a441f0",
+    "tests/browser_aria_link.test.mjs": "cf139c8de875f2cbb028bd5e92e10436147554fb37233820fbe9b20e75c78cd4",
+    "tests/test_browser_aria_link.py": "caa548e65df7a858d133c3becf82d4cb0742c4310f6e5ca10490b8ac72267bfc"
   }
 }
