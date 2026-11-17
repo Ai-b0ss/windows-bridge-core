@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 import sys
 
-from ff_hub import HubClient, default_state_dir
+from ff_hub import HubClient, default_state_dir, ensure_running
 from ff_hub_io import atomic_json
 from ff_hub_store import HubError, _ident
 
@@ -76,12 +76,23 @@ def public_result(value):
 
 
 class Adapter:
-    def __init__(self, state: Path, agent: str, *, client=None):
+    def __init__(self, state: Path, agent: str, *, client=None, start_if_stopped=False):
         self.state, self.agent = Path(state), _ident(agent, "agent_id")
         self.client = client or HubClient(self.state)
+        self.start_if_stopped = start_if_stopped
         self.checkpoints = self.state / "clients" / hashlib.sha256(agent.encode()).hexdigest()[:24]
 
     def _send(self, op, args=None, session=None, key=None):
+        if self.start_if_stopped:
+            # Owner opt-in only. Neither MCP arguments nor an RPC can create it.
+            try:
+                flag = json.loads((self.state.parent / "universal-agent-runtime.json").read_text(encoding="utf-8"))
+            except (ValueError, OSError):
+                flag = None
+            if (not isinstance(flag, dict) or type(flag.get("version")) is not int
+                    or flag.get("version") != 1 or flag.get("enabled") is not True):
+                raise HubError("HUB_FEATURE_DISABLED", execution_started=False)
+            ensure_running(self.state)
         request = {"op": op, "args": args or {}}
         if session:
             request.update(session_id=session["session_id"], session_secret=session["session_secret"])
@@ -170,8 +181,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, default=None)
     parser.add_argument("--agent", required=True)
+    parser.add_argument("--start-if-stopped", action="store_true",
+                        help="owner opt-in: start this installed Hub version if stopped; requires enabled local feature flag")
     options = parser.parse_args()
-    adapter = Adapter(options.state_dir or default_state_dir(), options.agent)
+    adapter = Adapter(options.state_dir or default_state_dir(), options.agent, start_if_stopped=options.start_if_stopped)
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8", newline="\n")
     while True:

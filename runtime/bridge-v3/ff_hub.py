@@ -727,7 +727,13 @@ class Hub:
                 return journaled(lambda: self.io.files(session, args))
             return self.io.files(session, args)
         if op == "terminal":
-            if args.get("command") in {"start", "cancel"}:
+            if args.get("command") == "start":
+                # Only admission/launch is serialized, never job execution.
+                # Another owner must not see a resource before its initial
+                # durable status exists or race the global admission limit.
+                with self.io.launch_lock:
+                    return journaled(lambda: self.io.terminal(session, args, request_key))
+            if args.get("command") == "cancel":
                 return journaled(lambda: self.io.terminal(session, args, request_key))
             return self.io.terminal(session, args)
         if op in {"app_open", "app_act", "app_close"}:

@@ -47,6 +47,7 @@ class HubIO:
     def __init__(self, hub):
         self.hub = hub
         self.root = hub.state_dir / "terminal"
+        self.launch_lock = threading.Lock()
 
     def files(self, session: dict, args: dict) -> dict:
         command = args.get("command")
@@ -112,6 +113,17 @@ class HubIO:
             if type(timeout) not in (int, float) or not 0.1 <= timeout <= 300:
                 raise HubError("TERMINAL_TIMEOUT_INVALID", execution_started=False)
             self.hub._permit(session, "terminal_execute", {"path": str(cwd), "app": executable}, action="terminal.start")
+            held = self.hub.store.resources(kind="terminal")
+            live = []
+            for row in held:
+                try:
+                    state = self._status(row["key"])["state"]
+                except HubError:
+                    state = "unknown"
+                if state in {"prepared", "running", "unknown"}:
+                    live.append(row)
+            if len(live) >= 24 or sum(row["session_id"] == session["session_id"] for row in live) >= 8:
+                raise HubError("TERMINAL_QUOTA_EXCEEDED", execution_started=False, max_per_session=8, max_total=24)
             # Known before launch, and present in resource_list even if the reply is lost.
             token = hashlib.sha256((session["agent_id"] + "\x1f" + session["task_id"] + "\x1f" + str(request_key)).encode()).hexdigest()[:16]
             terminal_id = "term-" + token
@@ -147,6 +159,7 @@ class HubIO:
         if command == "cancel":
             # Only the already-owned supervisor interprets this signal. No PID guessing.
             (self.root / terminal_id / "cancel.flag").touch()
+            self._reconcile_cancel(terminal_id)
         return self._status(terminal_id)
 
     def _status(self, terminal_id: str) -> dict:
@@ -155,6 +168,10 @@ class HubIO:
             result = json.loads((directory / "status.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise HubError("TERMINAL_STATE_UNAVAILABLE", terminal_id=terminal_id, automatic_replay=False) from None
+        if os.name == "nt" and result.get("state") == "running":
+            from ff_win_process_identity import process_identity_matches
+            if not process_identity_matches(result.get("supervisor_pid"), result.get("supervisor_create_time")):
+                result.update(state="unknown", reason="TERMINAL_SUPERVISOR_LOST", automatic_replay=False)
         log = directory / "output.log"
         if log.exists():
             with log.open("rb") as stream:
@@ -163,10 +180,29 @@ class HubIO:
             result["output_tail_only"] = log.stat().st_size > 65536
         return result
 
+    def _reconcile_cancel(self, terminal_id: str) -> None:
+        status = self._status(terminal_id)
+        if os.name == "nt" and status.get("reason") == "TERMINAL_SUPERVISOR_LOST":
+            from ff_win_detached_job import terminate_detached_job_by_name
+            token = terminal_id.removeprefix("term-")
+            try:
+                proof = terminate_detached_job_by_name(token)
+            except OSError:
+                raise HubError("TERMINAL_CLEANUP_UNCONFIRMED", terminal_id=terminal_id) from None
+            # A named job persists while a member exists. Its absence confirms
+            # that no member of this exact job remains, not a guess by PID/name.
+            atomic_json(self.root / terminal_id / "status.json",
+                        {**status, "state": "cancelled", "cleanup_verified": True,
+                         "termination_evidence": proof or "exact_named_job_absent", "finished_at": time.time()})
+
     def cleanup(self, held: list[dict]) -> list[dict]:
         terminals = [row for row in held if row["kind"] == "terminal"]
         for row in terminals:
             (self.root / row["key"] / "cancel.flag").touch()
+            try:
+                self._reconcile_cancel(row["key"])
+            except HubError:
+                pass
         deadline = time.monotonic() + 12
         errors = []
         for row in terminals:
@@ -190,6 +226,8 @@ def run_worker(directory: Path) -> int:
     log = directory / "output.log"
     result = {"terminal_id": spec["terminal_id"], "state": "running", "supervisor_pid": os.getpid(),
               "started_at": time.time(), "automatic_replay": False}
+    from ff_win_process_identity import process_creation_token
+    result["supervisor_create_time"] = process_creation_token(os.getpid())
     process = None
     try:
         if os.name == "nt":
@@ -201,7 +239,6 @@ def run_worker(directory: Path) -> int:
                 process = subprocess.Popen(spec["argv"], cwd=spec["cwd"], stdin=subprocess.DEVNULL,
                                            stdout=stream, stderr=subprocess.STDOUT, start_new_session=True)
         result["pid"] = process.pid
-        from ff_win_process_identity import process_creation_token
         result["create_time"] = process_creation_token(process.pid)
         atomic_json(directory / "status.json", result)
         deadline = time.monotonic() + spec["timeout_seconds"]

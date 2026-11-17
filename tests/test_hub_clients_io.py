@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime/bridge-v3"))
 from ff_hub import Hub
@@ -87,6 +88,22 @@ class ClientIOTests(unittest.TestCase):
         self.assertIsNone(handle(self.a, {"jsonrpc": "2.0", "method": "notifications/initialized"}))
         self.assertEqual(-32601, handle(self.a, {"jsonrpc": "2.0", "id": 4, "method": "unsupported"})["error"]["code"])
 
+    def test_owner_opt_in_start_never_enables_feature_and_never_replays_failed_call(self):
+        adapter = Adapter(self.root / "hub", "owner-start", client=self.client, start_if_stopped=True)
+        flag = self.root / "universal-agent-runtime.json"
+        with patch("ff_hub_mcp.ensure_running") as starter:
+            for content in (None, '{"version":true,"enabled":true}', '{"version":1,"enabled":false}', '{}'):
+                if content is not None:
+                    flag.write_text(content)
+                self.error("HUB_FEATURE_DISABLED", lambda: adapter.call({"op": "capabilities"}))
+                starter.assert_not_called()
+            flag.write_text('{"version":1,"enabled":true}')
+            self.assertIn("operations", adapter.call({"op": "capabilities"}))
+            starter.assert_called_once_with(self.root / "hub")
+        with patch("ff_hub_mcp.ensure_running"), patch.object(self.client, "raw", side_effect=HubError("HUB_UNREACHABLE")) as raw:
+            self.error("HUB_UNREACHABLE", lambda: adapter.call({"op": "capabilities"}))
+            raw.assert_called_once()
+
     def test_restart_adapter_reuses_checkpoint_explicit_resume_revokes_old_secret(self):
         old = json.loads(next(self.a.checkpoints.glob("*.json")).read_text())
         fresh = Adapter(self.root, "client-a", client=self.client)
@@ -156,6 +173,36 @@ class ClientIOTests(unittest.TestCase):
                                      "cwd": str(self.root)}, "quota-1")
         self.assertEqual("output_limit", self.wait(job["terminal_id"])["state"])
         self.assertLessEqual((self.root / "terminal" / job["terminal_id"] / "output.log").stat().st_size, MAX_OUTPUT_BYTES)
+
+    @unittest.skipUnless(os.name == "nt", "Windows exact process/Job identity")
+    def test_supervisor_crash_reports_unknown_and_cancel_reconciles_exact_job(self):
+        from ff_win_process_identity import ProcessReference
+        self.grant()
+        job = self.call("terminal", {"command": "start", "argv": [sys.executable, "-c", "import time;time.sleep(30)"],
+                                     "cwd": str(self.root)}, "supervisor-crash-1")
+        deadline = time.monotonic() + 10
+        while True:
+            status = self.call("terminal", {"command": "status", "terminal_id": job["terminal_id"]})
+            if status["state"] == "running":
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        reference = ProcessReference(status["supervisor_pid"], status["supervisor_create_time"])
+        try:
+            reference.terminate()
+        finally:
+            reference.close()
+        deadline = time.monotonic() + 5
+        while True:
+            status = self.call("terminal", {"command": "status", "terminal_id": job["terminal_id"]})
+            if status["state"] == "unknown":
+                break
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(.05)
+        self.assertFalse(status["automatic_replay"])
+        cancelled = self.call("terminal", {"command": "cancel", "terminal_id": job["terminal_id"]}, "supervisor-cancel-1")
+        self.assertEqual("cancelled", cancelled["state"])
+        self.assertTrue(cancelled["cleanup_verified"])
 
 
 if __name__ == "__main__":

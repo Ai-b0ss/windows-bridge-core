@@ -56,6 +56,7 @@ class MCP:
 
 
 def main():
+    started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix="ff-hub-mcp-") as directory:
         root = Path(directory)
         state = root / "state/hub"
@@ -109,9 +110,14 @@ def main():
                 verify(client.call("session_close")["cleanup_verified"], "CLEANUP_UNCONFIRMED")
             print(json.dumps({"all_passed": True, "independent_mcp_clients": 3, "model_providers": 0,
                               "file_and_terminal_isolation": True, "hard_hub_crash_recovery": True,
-                              "same_key_no_duplicate": True, "revocation_after_restart": True}))
+                              "same_key_no_duplicate": True, "revocation_after_restart": True,
+                              "elapsed_seconds": round(time.monotonic() - started, 3), "completed_terminal_jobs": 3}))
         finally:
             for client in clients:
+                try:
+                    client.call("session_close")
+                except Exception:
+                    pass
                 client.close()
             stop(hub)
 
