@@ -45,6 +45,7 @@ ui_backend=None
 ui_core=None
 panels={}
 editors={}
+chrome=None
 def windows(pid):
     found=[];callback_type=ctypes.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
     @callback_type
@@ -74,8 +75,23 @@ def owns(hwnd):
     pid=w.DWORD();U.GetWindowThreadProcessId(int(hwnd),ctypes.byref(pid))
     return live_app(pid.value) and int(hwnd) in windows(pid.value)
 def handle(args):
-    global uia_backend,uia_core,ui_backend,ui_core
+    global uia_backend,uia_core,ui_backend,ui_core,chrome
+    from cua_desktop_identity import require_private_desktop
+    identity=require_private_desktop(desktop)
     command=args.get("command")
+    if command=='browser.launch':
+        from cua_hidden_chrome import launch_chrome
+        from cua_native_hwnd import Win32Transport
+        if chrome is not None:raise HiddenLaunchError('HIDDEN_CHROME_ALREADY_LAUNCHED')
+        root=args.get('__owned_browser_root')
+        public={key:value for key,value in args.items() if key!='__owned_browser_root'}
+        chrome=launch_chrome(root,public,register=register_app,windows=windows,owns=owns,
+            window_info=Win32Transport().window_info,desktop=desktop)
+        return chrome['result']
+    if command=='browser.info':
+        from cua_hidden_chrome import verify_chrome
+        if chrome is None:raise HiddenLaunchError('HIDDEN_CHROME_NOT_STARTED')
+        return verify_chrome(chrome,owns=owns,desktop=desktop)
     if command=='editor.launch':
         from cua_owned_editor_launch import launch_editor
         def register(proc):register_app(proc)
@@ -135,7 +151,7 @@ def handle(args):
         return fp.panel_action(discovery,command,action_args=args.get('action_args'))
     if command=="health":
         from cua_owned_editor_launch import available_editors
-        return {"desktop":desktop,"input_desktop":input_desktop,"physical_input_used":False,"supported_apps":available_apps(),'supported_editor_apps':available_editors(),"uia_pid":uia_backend.supervisor.process.pid if uia_backend and uia_backend.supervisor.process else None,
+        return {"desktop":desktop,"input_desktop":identity["input"],"physical_input_used":False,"supported_apps":available_apps(),'supported_editor_apps':available_editors(),"uia_pid":uia_backend.supervisor.process.pid if uia_backend and uia_backend.supervisor.process else None,
                 "ui_pid":ui_backend.supervisor.process.pid if ui_backend and ui_backend.supervisor.process else None,
                 "apps":[{"pid":p.pid,"create_time":app_tokens[p.pid],"hwnds":windows(p.pid)} for p in apps.values() if live_app(p.pid)]}
     if command=="describe_owned_windows":

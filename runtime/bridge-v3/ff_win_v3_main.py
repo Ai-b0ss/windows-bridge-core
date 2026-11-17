@@ -145,6 +145,7 @@ _HIDDEN_LOCK = __import__("threading").Lock()
 def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
     from cua_hidden_desktop import HiddenDesktopSession, HiddenDesktopError
     command = args.get("command")
+    session = None
     try:
         if command == "hidden_start":
             if set(args)-{"command","worker_integrity","webview_debug"}:
@@ -168,13 +169,21 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
             raise core.RPCError("HIDDEN_SESSION_NOT_FOUND")
         if command == "hidden_close":
             session.close()
-            return {"closed": True, "session_id": session_id,'editor_profile_cleanup':session.editor_profile_cleanup}
+            return {"closed": True, "session_id": session_id,'editor_profile_cleanup':session.editor_profile_cleanup,
+                    'browser_profile_cleanup':session.browser_profile_cleanup}
         payload = args.get("request")
         if not isinstance(payload, dict):
             raise core.RPCError("HIDDEN_REQUEST_INVALID")
         return session.request(payload,timeout_s=args.get("timeout_s",15))
     except HiddenDesktopError as exc:
-        raise core.RPCError(exc.code, details={**exc.details,"retry_safe": False}) from exc
+        if session is not None and session.closed:
+            with _HIDDEN_LOCK:
+                if _HIDDEN_SESSIONS.get(session.session_id) is session:
+                    _HIDDEN_SESSIONS.pop(session.session_id, None)
+        details={**exc.details,"retry_safe": False}
+        if session is not None and session.closed:
+            details.update({'session_closed':True,'browser_profile_cleanup':session.browser_profile_cleanup})
+        raise core.RPCError(exc.code, details=details) from exc
 
 def _desktop_grant_active(args: dict[str, Any]) -> bool:
     """True when the desktop is dedicated to exactly this agent/task/generation."""
@@ -718,6 +727,8 @@ def _install_gui_guards() -> None:
         features["hidden_desktop_supported_apps"] = available_apps()
         features["hidden_uia_no_focus_msaa_invoke"] = True
         features["hidden_worker_integrity_modes"] = ["owner","medium"]
+        features['hidden_chrome_commands']=['browser.launch','browser.info']
+        features['hidden_chrome_scope']='native window on private Desktop; fresh owned profile; verified loopback CDP; sandbox enabled'
         features["hidden_owned_panel_commands"] = ["panel.discover","panel.inspect","panel.type","panel.invoke","panel.verify"]
         from cua_owned_editor_launch import available_editors
         features['hidden_owned_editor_apps']=available_editors()

@@ -38,3 +38,13 @@ def require_input_desktop(hwnd=None):
     if identity["current"] != identity["input"] or identity.get("target", identity["current"]) != identity["input"]:
         raise DesktopIdentityError("PHYSICAL_INPUT_DESKTOP_MISMATCH")
     return identity
+
+
+def require_private_desktop(expected=None):
+    """Revalidate on every worker request, not only at worker startup."""
+    identity = desktop_identity()
+    if (not identity["current"].startswith("FFBridge-Agent-")
+            or identity["current"] == identity["input"]
+            or (expected is not None and identity["current"] != expected)):
+        raise DesktopIdentityError("HIDDEN_DESKTOP_IDENTITY_INVALID")
+    return identity

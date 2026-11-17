@@ -111,6 +111,7 @@ class HiddenDesktopSession:
         self._desktop=None;self._process=None;self._job=None;self._writer=None;self._reader=None
         self._stderr=None;self.pid=None;self._closed=False
         self._editor_profiles=[];self.editor_profile_cleanup=[]
+        self._chrome_profile=None;self.browser_profile_cleanup=[]
         self.worker_integrity=worker_integrity;self.webview_port=None
         self._u=ctypes.WinDLL("user32",use_last_error=True);self._k=ctypes.WinDLL("kernel32",use_last_error=True)
         self._u.CreateDesktopW.argtypes=[w.LPCWSTR,w.LPCWSTR,ctypes.c_void_p,w.DWORD,w.DWORD,ctypes.c_void_p];self._u.CreateDesktopW.restype=w.HANDLE
@@ -199,6 +200,14 @@ class HiddenDesktopSession:
         with self._lock:
             if self._closed:raise HiddenDesktopError("HIDDEN_WORKER_CLOSED")
             if '__owned_editor_root' in payload:raise HiddenDesktopError('EDITOR_INTERNAL_ROOT_FORBIDDEN')
+            if '__owned_browser_root' in payload:raise HiddenDesktopError('BROWSER_INTERNAL_ROOT_FORBIDDEN')
+            if payload.get('command')=='browser.launch':
+                if set(payload)!={'command'}:raise HiddenDesktopError('HIDDEN_CHROME_OPTION_FORBIDDEN')
+                if self._chrome_profile is not None:raise HiddenDesktopError('HIDDEN_CHROME_ALREADY_LAUNCHED')
+                from cua_browser_profiles import ManagedBrowserProfiles
+                state=Path(os.environ.get('FF_BRIDGE_ROOT') or Path(os.environ['LOCALAPPDATA'])/'FF-Windows-Bridge')/'state/hidden-chrome'
+                self._chrome_profile=ManagedBrowserProfiles(state)
+                payload={**payload,'__owned_browser_root':str(self._chrome_profile.path)}
             if payload.get('command')=='editor.launch':
                 from cua_browser_profiles import ManagedBrowserProfiles
                 profiles=ManagedBrowserProfiles(Path(os.environ['LOCALAPPDATA'])/'FFWindowsBridge/state/owned-editor')
@@ -213,8 +222,16 @@ class HiddenDesktopSession:
                 raise HiddenDesktopError("HIDDEN_ACTION_OUTCOME_UNKNOWN")
             if reply.get("fatal") or reply.get("id")!=request_id:
                 self.close();raise HiddenDesktopError("HIDDEN_ACTION_OUTCOME_UNKNOWN")
-            if not reply.get("ok"):raise HiddenDesktopError(reply.get("error_code","HIDDEN_WORKER_ERROR"),reply.get("details"))
+            if not reply.get("ok"):
+                # A failed launch can leave Chrome descendants after its root
+                # exits. Close the enclosing Job before removing its profile.
+                if payload.get('command')=='browser.launch':self.close()
+                raise HiddenDesktopError(reply.get("error_code","HIDDEN_WORKER_ERROR"),reply.get("details"))
             return reply["result"]
+
+    @property
+    def closed(self):
+        return self._closed
 
     def close(self):
         if self._closed:return
@@ -232,6 +249,12 @@ class HiddenDesktopSession:
             except OSError:pass
         if self._stderr:self._stderr.close()
         if self._desktop:self._u.CloseDesktop(self._desktop);self._desktop=None
+        if self._chrome_profile is not None:
+            profile,self._chrome_profile=self._chrome_profile,None
+            try:
+                self.browser_profile_cleanup.append({'root':str(profile.path),'removed':profile.close()})
+            except Exception as exc:
+                self.browser_profile_cleanup.append({'root':str(profile.path),'removed':False,'error_type':type(exc).__name__,'error':str(exc)})
         for profiles in self._editor_profiles:
             try:
                 # Preserve small protocol outcome summaries before erasing the private profile.
