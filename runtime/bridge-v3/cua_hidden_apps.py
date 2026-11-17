@@ -4,9 +4,16 @@ import hashlib,json,os,re,subprocess,uuid
 from cua_global_resources import _StateLock
 from cua_browser_profiles import linked
 
-SUPPORTED_APPS=("notepad","wordpad","paint","excel","word","powerpoint")
+SUPPORTED_APPS=("notepad","wordpad","paint","excel","word","powerpoint","claude")
 
 def app_path(app):
+    if app=="claude":
+        # A real MSIX AppExecutionAlias retains the package identity. Direct
+        # CreateProcess of the WindowsApps binary fails with ACCESS_DENIED.
+        # Never copy package binaries or change their ACL.
+        local=os.environ.get("LOCALAPPDATA")
+        if not local:return Path("__missing_claude_alias__")
+        return Path(local)/"Microsoft"/"WindowsApps"/"claude-desktop.exe"
     if app in {"excel","word","powerpoint"}:
         executable={"excel":"EXCEL.EXE","word":"WINWORD.EXE","powerpoint":"POWERPNT.EXE"}[app]
         roots=[os.environ.get("ProgramFiles"),os.environ.get("ProgramFiles(x86)")]
@@ -25,12 +32,36 @@ def available_apps():
         return []
     return [app for app in SUPPORTED_APPS if app_path(app).is_file()]
 
+def claude_code_link(url):
+    """Validate the exact Claude Desktop Code URL without performing activation."""
+    from urllib.parse import urlsplit, parse_qs
+    if not isinstance(url,str) or len(url)>20000 or "\x00" in url:
+        raise ValueError("HIDDEN_CLAUDE_LINK_INVALID")
+    parsed=urlsplit(url)
+    if (parsed.scheme!="claude" or parsed.netloc!="code" or parsed.path!="/new"
+            or parsed.fragment or not parsed.query):
+        raise ValueError("HIDDEN_CLAUDE_LINK_INVALID")
+    values=parse_qs(parsed.query,keep_blank_values=True)
+    if set(values)!={"q","folder"} or any(len(items)!=1 for items in values.values()):
+        raise ValueError("HIDDEN_CLAUDE_LINK_INVALID")
+    prompt,folder=values["q"][0],values["folder"][0]
+    if not prompt.strip() or len(prompt)>12000:
+        raise ValueError("HIDDEN_CLAUDE_LINK_INVALID")
+    target=Path(folder)
+    if not target.is_absolute() or not target.is_dir():
+        raise ValueError("HIDDEN_CLAUDE_FOLDER_INVALID")
+    return url
+
 def launch_spec(args):
-    if set(args)-{"command","app","document_path"}:
+    if set(args)-{"command","app","document_path","code_link"}:
         raise ValueError("HIDDEN_LAUNCH_OPTION_FORBIDDEN")
     app="notepad" if args.get("command")=="launch_notepad" else args.get("app")
     if app not in SUPPORTED_APPS:
         raise ValueError("HIDDEN_APP_UNSUPPORTED")
+    if "code_link" in args:
+        if app!="claude":
+            raise ValueError("HIDDEN_LAUNCH_OPTION_FORBIDDEN")
+        claude_code_link(args["code_link"])
     if "document_path" in args:
         value=args["document_path"]
         suffix={"excel":".xlsx","word":".docx","powerpoint":".pptx"}.get(app)
@@ -41,8 +72,62 @@ def launch_spec(args):
         raise ValueError("HIDDEN_APP_NOT_INSTALLED")
     return app,path
 
+GENERIC_LAUNCH_ENV="FF_HIDDEN_GENERIC_LAUNCH"
+
+def hidden_worker_environment(environment, *, allow_generic_launch=False):
+    """The Hub opts in only its own worker; ambient flags never enable another session."""
+    if type(allow_generic_launch) is not bool:
+        raise ValueError("HIDDEN_START_OPTION_INVALID")
+    child=dict(environment)
+    child.pop(GENERIC_LAUNCH_ENV,None)
+    if allow_generic_launch:
+        child[GENERIC_LAUNCH_ENV]="1"
+    return child
+
+def generic_launch_spec(args):
+    """Any installed executable on the private desktop. Off unless the session owner (the
+    agent Hub, after its permission check) set FF_HIDDEN_GENERIC_LAUNCH=1 for this worker."""
+    if os.environ.get(GENERIC_LAUNCH_ENV)!="1":
+        raise ValueError("HIDDEN_GENERIC_LAUNCH_DISABLED")
+    if set(args)-{"command","executable","arguments","working_directory","window_timeout_s"}:
+        raise ValueError("HIDDEN_LAUNCH_OPTION_FORBIDDEN")
+    executable=args.get("executable")
+    if (not isinstance(executable,str) or not Path(executable).is_absolute()
+            or Path(executable).suffix.casefold()!=".exe" or not Path(executable).is_file()):
+        raise ValueError("HIDDEN_EXECUTABLE_INVALID")
+    executable=Path(executable).resolve()
+    # A private desktop does not isolate an application's process-singleton IPC.
+    # Launching these with the default profile can activate or send arguments to
+    # an owner's existing process before this worker observes that its child quit.
+    # They require their existing explicit own-instance route, never generic Popen.
+    directory=executable.parent
+    if (executable.name.casefold() in {"chrome.exe","msedge.exe","chromium.exe","brave.exe",
+            "opera.exe","vivaldi.exe","cursor.exe","code.exe","electron.exe",
+            "excel.exe","winword.exe","powerpnt.exe"}
+            or "windowsapps" in {part.casefold() for part in executable.parts}
+            or (directory/"resources"/"app.asar").is_file()
+            or (directory/"resources"/"app").is_dir()
+            or (directory/"chrome_elf.dll").is_file()
+            or any(directory.glob("chrome_*.pak"))):
+        raise ValueError("HIDDEN_APP_ISOLATION_ROUTE_REQUIRED")
+    arguments=args.get("arguments",[])
+    if (not isinstance(arguments,list) or len(arguments)>32
+            or any(not isinstance(item,str) or len(item)>2048 or "\0" in item for item in arguments)):
+        raise ValueError("HIDDEN_ARGUMENTS_INVALID")
+    directory=args.get("working_directory")
+    if directory is not None and (not isinstance(directory,str) or not Path(directory).is_absolute() or not Path(directory).is_dir()):
+        raise ValueError("HIDDEN_WORKING_DIRECTORY_INVALID")
+    timeout=args.get("window_timeout_s",15)
+    if type(timeout) not in (int,float) or not 1<=timeout<=60:
+        raise ValueError("HIDDEN_WINDOW_TIMEOUT_INVALID")
+    return executable,list(arguments),directory,float(timeout)
+
 def main_window_area(app,info,visible,owned):
-    expected={"notepad":"Notepad","wordpad":"WordPadClass","paint":"MSPaintApp","excel":"XLMAIN","word":"OpusApp","powerpoint":"PPTFrameClass"}[app]
+    expected={"notepad":"Notepad","wordpad":"WordPadClass","paint":"MSPaintApp",
+              "excel":"XLMAIN","word":"OpusApp","powerpoint":"PPTFrameClass",
+              "claude":"Chrome_WidgetWin_1"}[app]
+    if app=="claude" and info.get("title")!="Claude":
+        return None
     if not visible or owned or info["class_name"].casefold()!=expected.casefold():
         return None
     geometry=info.get("geometry") or {}

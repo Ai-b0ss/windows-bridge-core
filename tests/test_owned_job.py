@@ -68,11 +68,18 @@ class TestActualWindowsOwnedJob(unittest.TestCase):
         return process
 
     def wait_file(self, path):
+        # A file appearing in the directory is not evidence its JSON write
+        # finished; Windows can expose a zero-length or partial fixture.
         deadline = time.monotonic() + 10
-        while not path.is_file():
-            if time.monotonic() >= deadline:
-                self.fail("OWNED_FIXTURE_FILE_TIMEOUT")
+        while time.monotonic() < deadline:
+            try:
+                if path.is_file():
+                    json.loads(path.read_text(encoding="utf-8"))
+                    return
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
             time.sleep(.02)
+        self.fail("OWNED_FIXTURE_FILE_TIMEOUT")
 
     def reference(self, pid):
         reference = ProcessReference(pid, process_creation_token(pid))

@@ -748,10 +748,17 @@ internal static class NoFocusInvoke {
             try {
                 InvokeRawAccessible(hwnd,walker,element);
                 return "RAW_MSAA";
-            } catch(MsaaTargetUnavailableBeforeDispatch) {
-                // No accDoDefaultAction was reached. Some UIA controls expose
-                // a Legacy pattern but are absent from the MSAA host tree.
-                // Select the native pattern only after exact revalidation.
+            } catch(Exception msaaError) {
+                if (!(msaaError is MsaaTargetUnavailableBeforeDispatch) &&
+                    !(msaaError is InvalidOperationException &&
+                     (msaaError.Message=="MSAA traversal limit" || msaaError.Message=="MSAA child limit")))
+                    throw;
+                // No accDoDefaultAction was reached: traversal did not complete.
+                // Chromium/Electron expose large trees which exceed the bounded
+                // MSAA traversal budget. Never raise that budget or pick a
+                // partial match. Instead use the single exact UIA element,
+                // already guarded by path + RuntimeId, with AutoSetFocus=false.
+                // Native Invoke is selected only before mutating dispatch.
                 Release(ref pattern);
                 stage="native-invoke-revalidate-after-empty-msaa";
                 if(!RuntimeId(element).SequenceEqual(runtime))throw new ElementNotAvailableException("runtime identity changed after MSAA selection");
