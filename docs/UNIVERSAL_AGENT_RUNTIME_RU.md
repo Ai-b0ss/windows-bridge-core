@@ -46,9 +46,9 @@
 
 | Критерий | Проверенный результат |
 | --- | --- |
-| Python / Node | 623/623 Python; 40/40 Node Hub и 2/2 ARIA — PASS |
+| Python / Node | 625/625 Python после объединения PR #117; 40/40 Node Hub и 2/2 ARIA — PASS |
 | Поставляемый Python | Реальные embedded Hub, MCP, supervisor и дочерняя команда; файл и cleanup — PASS |
-| Единый API | Установленный Hub `ebd0c4c`: Chrome/DOM, private GUI, files, terminal, sessions и ownership — PASS |
+| Единый API | Версионный установленный Hub: Chrome/DOM, private GUI, files, terminal, sessions и ownership — PASS |
 | Разделение ресурсов | Три независимых MCP-процесса; отказы чужим вкладкам, файлам, терминалам и GUI — PASS |
 | Восстановление | Relay, Node crash, Python Hub crash с живыми формами, terminal supervisor crash, dedupe — PASS |
 | Локальная пропускная способность | 150 heartbeat-вызовов от трёх MCP-клиентов: около 21 вызова/с, p95 около 175 мс; не скорость inference |
@@ -64,6 +64,11 @@
 удаления прежних серверов; загрузка её работающим Desktop остаётся UNTESTED.
 Cursor CLI авторизован, однако остаток включённого usage и отсутствие платных
 overages не доказаны, поэтому модельный запуск не выполнялся.
+
+Из актуального `main` сохранён PR #117: `shared_hub` и
+`owner_task_context_guidance` одновременно доступны в discovery. `purpose` и
+`success_criteria` остаются описанием задачи; они не дают новых прав и не
+заменяют независимую проверку результата действия.
 
 Обновлён именно отдельный Hub. Основной Bridge, feature source, установленный
 Hub и ранее собранный portable ZIP учитываются раздельно. Новая сборка архива
