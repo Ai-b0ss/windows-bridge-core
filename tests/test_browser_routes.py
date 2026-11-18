@@ -316,6 +316,106 @@ class BrowserRoutesTests(unittest.TestCase):
                 if isinstance(obj, sqlite3.Connection):
                     obj.close()
 
+    def test_private_browser_claim_rollback_and_handler_audit_fault_containment(self) -> None:
+        import json as _json
+        import threading
+        import urllib.request
+        from ff_hub import HubHTTPServer, make_handler
+
+        created = []
+
+        class _RollbackHidden:
+            def __init__(self) -> None:
+                self.closed = False
+                self.job_cleanup_verified = True
+                self.browser_profile_cleanup: list[dict] = []
+                self.editor_profile_cleanup: list[dict] = []
+                self._launched = False
+
+            def request(self, payload: dict, timeout_s: float = 30) -> dict:
+                if payload.get("command") == "browser.launch":
+                    if self._launched:
+                        raise HubError("HIDDEN_CHROME_ALREADY_LAUNCHED")
+                    self._launched = True
+                    n = len(created)
+                    return {"pid": 6100 + n, "hwnd": 7100 + n, "create_time": 8100 + n, "desktop": "FFBridge-Agent-rb"}
+                return {"ok": True}
+
+            def close(self) -> None:
+                self.closed = True
+                self._launched = False
+
+        def make_hidden() -> _RollbackHidden:
+            inst = _RollbackHidden()
+            created.append(inst)
+            return inst
+
+        Policy(self.state_dir / "policy.json").add_grant(
+            ["app_launch"], apps=["chrome", "chrome.exe"], agents=["a-rb"], ttl_seconds=600,
+        )
+        hub = Hub(self.state_dir, hidden_factory=make_hidden)
+        httpd = HubHTTPServer(("127.0.0.1", 0), make_handler(hub, "test-admin-secret"))
+        httpd.daemon_threads = True
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            auth = EntryAuthority(self.state_dir)
+            _, token = auth.issue(
+                client_id="c-rb", agent_id="a-rb", task_id="t-rb",
+                scopes=["private_browser"], apps=[], ttl=600,
+            )
+            bearer = "Bearer " + token
+            sess = entry_call(hub, auth, bearer, {"op": "session_open"})["session_id"]
+
+            # 1. If store.claim fails with OperationalError after browser.launch, _close_hidden rolls back
+            orig_claim = hub.store.claim
+            with mock.patch.object(hub.store, "claim", side_effect=sqlite3.OperationalError("disk full")):
+                with self.assertRaises(sqlite3.OperationalError):
+                    entry_call(hub, auth, bearer, {
+                        "op": "private_browser", "session_id": sess, "request_key": "req-rb-fail-1",
+                        "args": {"command": "open"},
+                    })
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+
+            # Subsequent open must succeed cleanly rather than failing with HIDDEN_CHROME_ALREADY_LAUNCHED
+            hub.store.claim = orig_claim
+            opened = entry_call(hub, auth, bearer, {
+                "op": "private_browser", "session_id": sess, "request_key": "req-rb-ok-2",
+                "args": {"command": "open"},
+            })
+            self.assertEqual(len(created), 2)
+            self.assertTrue(opened["browser_id"].startswith("private-browser-"))
+
+            # 2. HTTP make_handler returns JSON HUB_INTERNAL_ERROR even if hub.store.audit also throws OperationalError
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{httpd.server_port}/agent/v1",
+                method="POST",
+                headers={"Authorization": bearer, "Content-Type": "application/json"},
+                data=_json.dumps({"op": "capabilities"}).encode("utf-8"),
+            )
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            with mock.patch("ff_agent_entry.EntryAuthority.authorize", side_effect=sqlite3.OperationalError("db locked")), \
+                 mock.patch.object(hub.store, "audit", side_effect=sqlite3.OperationalError("disk full")):
+                with opener.open(req, timeout=5) as resp:
+                    payload = _json.load(resp)
+            self.assertFalse(payload["ok"])
+            self.assertEqual(payload["error_code"], "HUB_INTERNAL_ERROR")
+            self.assertEqual(payload["message"], "OperationalError")
+
+            cancelled = entry_call(hub, auth, bearer, {
+                "op": "task_cancel", "session_id": sess, "request_key": "req-rb-cancel",
+            })
+            self.assertTrue(cancelled["cleanup_verified"])
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            hub.shutdown()
+            for obj in vars(hub.store).values():
+                if isinstance(obj, sqlite3.Connection):
+                    obj.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -543,12 +543,18 @@ class Hub:
         command=args.get('command')
         if command=='open':
             self._permit(session,'app_launch',{'app':'chrome.exe'},action='private_browser.open')
+            had_desktop_apps=any(not r['meta'].get('managed_browser') for r in self.store.resources(session_id=session['session_id'],kind='app_session'))
             hidden=self._hidden_session(session,create=True)
             window=self._hidden_request(hidden,{'command':'browser.launch'},timeout=60)
             browser_id=f"private-browser-{window['pid']}-{window['create_time']}"
             public_window = {key: value for key, value in window.items()
                              if key not in {"browser_ws_endpoint", "cdp_endpoint", "browser_ws_path", "cdp_port"}}
-            self.store.claim(session, "app_session", browser_id, meta={**public_window, "private_browser": True})
+            try:
+                self.store.claim(session, "app_session", browser_id, meta={**public_window, "private_browser": True})
+            except BaseException:
+                if not had_desktop_apps:
+                    self._close_hidden(self._owner(session))
+                raise
             return {"browser_id": browser_id, **public_window}
         resource=self.store.require_owned(session,'app_session',str(args.get('browser_id') or ''))
         if not resource['meta'].get('private_browser'):raise HubError('PRIVATE_BROWSER_NOT_OWNED',execution_started=False)
@@ -1294,8 +1300,11 @@ def make_handler(hub: Hub, key: str) -> type:
                 body = {"ok": False, "error_code": exc.code, "message": exc.code, "details": exc.details}
             except Exception as exc:
                 # Exception strings can include request headers or secret-bearing URLs.
-                hub.store.audit("internal_error", op=str(request.get("op")) if isinstance(request, dict) else None,
-                                error=type(exc).__name__)
+                try:
+                    hub.store.audit("internal_error", op=str(request.get("op")) if isinstance(request, dict) else None,
+                                    error=type(exc).__name__)
+                except Exception:
+                    pass
                 body = {"ok": False, "error_code": "HUB_INTERNAL_ERROR", "message": type(exc).__name__,
                         "details": {"retry_safe": False}}
             body["duration_ms"] = int((time.monotonic() - started) * 1000)
