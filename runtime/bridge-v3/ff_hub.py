@@ -21,6 +21,7 @@ import http.server
 import json
 import os
 import secrets as _secrets
+import shutil
 import socket
 import subprocess
 import sys
@@ -37,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ff_hub_apps as apps
 from ff_agent_entry import ENTRY_PATH, SCHEMA as ENTRY_SCHEMA, EntryArtifacts, EntryAuthority, entry_call
+from ff_browser_routes import RouteAffinityStore, route_plan as live_route_plan
 from ff_hub_permissions import RISK_CLASSES, PermissionError_, Policy
 from ff_hub_secrets import SecretError, Vault
 from ff_hub_store import HubError, HubStore
@@ -77,14 +79,14 @@ def _pid_alive(pid: int) -> bool:
         ctypes.windll.kernel32.CloseHandle(handle)
 
 
-# ---- browser session manager client ------------------------------------------------------
-class BrowserManager:
-    """Starts the Node browser hub on demand, keeps it alive, restarts it with backoff."""
+class _BaseNodeRpcClient:
+    """Shared lifecycle, exponential backoff and loopback RPC transport for Node managers."""
 
-    def __init__(self, state_dir: Path, *, playwright_root: str | None = None, profile: str | None = None):
-        self.state_dir = state_dir / "browser"
+    def __init__(self, state_dir: Path, *, header_name: str, playwright_root: str | None = None, log_name: str):
+        self.state_dir = state_dir
         self.playwright_root = playwright_root or os.environ.get("FF_PLAYWRIGHT_ROOT") or str(PACKAGE)
-        self.profile = profile
+        self._header_name = header_name
+        self._log_name = log_name
         self._lock = threading.RLock()
         self._process: subprocess.Popen | None = None
         self._endpoint: dict | None = None
@@ -92,6 +94,129 @@ class BrowserManager:
         self._next_start = 0.0
         self._failures = 0
         self.starts = 0
+
+    def _poll_endpoint(
+        self,
+        process: subprocess.Popen,
+        endpoint_file: Path,
+        key: str,
+        *,
+        start_error_code: str,
+        start_error_message: str,
+        error_details: dict | None = None,
+        decorate_endpoint: Callable[[dict], None] | None = None,
+    ) -> None:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                break
+            if endpoint_file.is_file():
+                try:
+                    endpoint = json.loads(endpoint_file.read_text(encoding="utf-8"))
+                    if decorate_endpoint:
+                        decorate_endpoint(endpoint)
+                    self._process, self._endpoint, self._key, self._failures = process, endpoint, key, 0
+                    self.starts += 1
+                    return
+                except ValueError:
+                    pass
+            time.sleep(0.05)
+        if process.poll() is None:
+            process.kill()
+        self._failures += 1
+        self._next_start = time.monotonic() + min(2.0 ** self._failures, 120.0)
+        tail = ""
+        try:
+            tail = (self.state_dir / self._log_name).read_bytes()[-600:].decode("utf-8", "replace").strip()
+        except OSError:
+            pass
+        raise HubError(
+            start_error_code,
+            start_error_message,
+            cause=tail.splitlines()[-1][:300] if tail else "no output",
+            retry_safe=True,
+            **(error_details or {}),
+        )
+
+    def _open_log(self):
+        log = open(self.state_dir / self._log_name, "ab", buffering=0)
+        if log.tell() > 2 * 1024 * 1024:
+            log.truncate(0)
+        return log
+
+    def call(self, op: str, args: dict | None = None, *, timeout: float = 150.0) -> dict:
+        with self._lock:
+            if self._process is None or self._process.poll() is not None:
+                self._process = None
+                self._start()
+            endpoint, key = self._endpoint, self._key
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{endpoint['port']}/rpc",
+            method="POST",
+            data=json.dumps({"op": op, "args": args or {}}).encode("utf-8"),
+            headers={"content-type": "application/json", self._header_name: key},
+        )
+        try:
+            with _loopback_opener().open(request, timeout=timeout) as response:
+                reply = json.loads(response.read())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            # The request may have reached the browser. Say so instead of guessing.
+            raise HubError(
+                "BROWSER_MANAGER_UNREACHABLE",
+                "no reply from the browser session manager",
+                cause=type(exc).__name__,
+                attempted=True,
+                retry_safe=False,
+                outcome_unknown=True,
+            ) from None
+        if reply.get("ok"):
+            return reply["result"]
+        raise HubError(reply.get("error_code") or "BROWSER_ERROR", reply.get("message"), **(reply.get("details") or {}))
+
+    def running(self) -> bool:
+        return self._process is not None and self._process.poll() is None
+
+    def stop(self) -> None:
+        with self._lock:
+            process, self._process = self._process, None
+            if process is None or process.poll() is not None:
+                return
+            try:
+                self.call_raw_shutdown()
+            except Exception:
+                pass
+            if process.stdin:
+                try:
+                    process.stdin.close()
+                except OSError:
+                    pass
+            try:
+                process.wait(timeout=8)
+            except Exception:
+                process.kill()
+                try:
+                    process.wait(timeout=3)
+                except Exception:
+                    pass
+
+    def call_raw_shutdown(self, args: dict | None = None) -> None:
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self._endpoint['port']}/rpc",
+            method="POST",
+            data=json.dumps({"op": "shutdown", "args": args if args is not None else {"close_tabs": True}}).encode("utf-8"),
+            headers={"content-type": "application/json", self._header_name: self._key},
+        )
+        _loopback_opener().open(request, timeout=10).read()
+
+
+# ---- browser session manager client ------------------------------------------------------
+class BrowserManager(_BaseNodeRpcClient):
+    """Starts the Node browser hub on demand, keeps it alive, restarts it with backoff."""
+
+    def __init__(self, state_dir: Path, *, playwright_root: str | None = None, profile: str | None = None):
+        super().__init__(state_dir / "browser", header_name="x-ff-browser-key",
+                         playwright_root=playwright_root, log_name="browser-hub.log")
+        self.profile = profile
 
     def _wait_for_prior_manager(self, timeout: float = 10.0) -> None:
         # After a parent Hub crash the old Node process drains its accepted
@@ -132,85 +257,73 @@ class BrowserManager:
                 "-PlaywrightRoot", self.playwright_root]
         if self.profile:
             argv += ["-ProfileDirName", self.profile]
-        log = open(self.state_dir / "browser-hub.log", "ab", buffering=0)
-        if log.tell() > 2 * 1024 * 1024:
-            log.truncate(0)
-        process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=log, stderr=log, cwd=str(PACKAGE),
-                                   env={**os.environ, "FF_BROWSER_HUB_KEY": key},
-                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            if process.poll() is not None:
-                break
-            if endpoint_file.is_file():
-                try:
-                    self._endpoint = json.loads(endpoint_file.read_text(encoding="utf-8"))
-                    self._endpoint["create_time"] = process_creation_token(self._endpoint["pid"])
-                    from ff_hub_io import atomic_json
-                    atomic_json(endpoint_file, self._endpoint)
-                    self._process, self._key, self._failures = process, key, 0
-                    self.starts += 1
-                    return
-                except ValueError:
-                    pass
-            time.sleep(0.05)
-        if process.poll() is None:
-            process.kill()
-        self._failures += 1
-        self._next_start = time.monotonic() + min(2.0 ** self._failures, 120.0)
-        tail = ""
+        log = self._open_log()
         try:
-            tail = (self.state_dir / "browser-hub.log").read_bytes()[-600:].decode("utf-8", "replace").strip()
-        except OSError:
-            pass
-        raise HubError("BROWSER_MANAGER_START_FAILED", "the browser session manager did not start",
-                       cause=tail.splitlines()[-1][:300] if tail else "no output", retry_safe=True, isolated_fallback=False)
+            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=log, stderr=log, cwd=str(PACKAGE),
+                                       env={**os.environ, "FF_BROWSER_HUB_KEY": key},
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        finally:
+            log.close()
+        from ff_hub_io import atomic_json
 
-    def call(self, op: str, args: dict | None = None, *, timeout: float = 150.0) -> dict:
-        with self._lock:
-            if self._process is None or self._process.poll() is not None:
-                self._process = None
-                self._start()
-            endpoint, key = self._endpoint, self._key
-        request = urllib.request.Request(f"http://127.0.0.1:{endpoint['port']}/rpc", method="POST",
-                                         data=json.dumps({"op": op, "args": args or {}}).encode("utf-8"),
-                                         headers={"content-type": "application/json", "x-ff-browser-key": key})
+        def decorate(ep: dict) -> None:
+            ep["create_time"] = process_creation_token(ep["pid"])
+            atomic_json(endpoint_file, ep)
+
+        self._poll_endpoint(
+            process,
+            endpoint_file,
+            key,
+            start_error_code="BROWSER_MANAGER_START_FAILED",
+            start_error_message="the browser session manager did not start",
+            error_details={"isolated_fallback": False},
+            decorate_endpoint=decorate,
+        )
+
+
+class ManagedBrowserManager(_BaseNodeRpcClient):
+    """Starts the persistent headless Playwright manager (`ff_playwright_managed.mjs`)."""
+
+    def __init__(self, state_dir: Path, *, playwright_root: str | None = None):
+        super().__init__(state_dir / "managed-playwright", header_name="x-ff-managed-key",
+                         playwright_root=playwright_root, log_name="managed-playwright.log")
+
+    def _start(self) -> None:
+        now = time.monotonic()
+        if now < self._next_start:
+            raise HubError("MANAGED_BROWSER_BACKOFF", "the managed Playwright process is cooling down",
+                           retry_after_ms=int((self._next_start - now) * 1000), retry_safe=True)
+        node = shutil.which("node")
+        if not node:
+            raise HubError("NODE_NOT_INSTALLED", "Node.js is required for persistent Playwright")
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        endpoint_file = self.state_dir / "endpoint.json"
+        endpoint_file.unlink(missing_ok=True)
+        key = _secrets.token_urlsafe(48)
+        argv = [node, str(PACKAGE / "ff_playwright_managed.mjs"),
+                "--state-dir", str(self.state_dir),
+                "--endpoint-file", str(endpoint_file),
+                "--playwright-root", self.playwright_root]
+        log = self._open_log()
         try:
-            with _loopback_opener().open(request, timeout=timeout) as response:
-                reply = json.loads(response.read())
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            # The request may have reached the browser. Say so instead of guessing.
-            raise HubError("BROWSER_MANAGER_UNREACHABLE", "no reply from the browser session manager",
-                           cause=type(exc).__name__, attempted=True, retry_safe=False, outcome_unknown=True) from None
-        if reply.get("ok"):
-            return reply["result"]
-        raise HubError(reply.get("error_code") or "BROWSER_ERROR", reply.get("message"), **(reply.get("details") or {}))
-
-    def running(self) -> bool:
-        return self._process is not None and self._process.poll() is None
-
-    def stop(self) -> None:
-        with self._lock:
-            process, self._process = self._process, None
-            if process is None or process.poll() is not None:
-                return
-            try:
-                self.call_raw_shutdown()
-                process.wait(timeout=8)
-            except Exception:
-                process.kill()
-
-    def call_raw_shutdown(self) -> None:
-        request = urllib.request.Request(f"http://127.0.0.1:{self._endpoint['port']}/rpc", method="POST",
-                                         data=json.dumps({"op": "shutdown", "args": {"close_tabs": True}}).encode("utf-8"),
-                                         headers={"content-type": "application/json", "x-ff-browser-key": self._key})
-        _loopback_opener().open(request, timeout=10).read()
+            process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=log, stderr=log, cwd=str(PACKAGE),
+                                       env={**os.environ, "FF_MANAGED_PW_KEY": key},
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        finally:
+            log.close()
+        self._poll_endpoint(
+            process,
+            endpoint_file,
+            key,
+            start_error_code="MANAGED_BROWSER_START_FAILED",
+            start_error_message="the managed Playwright process did not start",
+        )
 
 
 # ---- the hub -----------------------------------------------------------------------------
 class Hub:
-    def __init__(self, state_dir: str | Path, *, browser: Any = None, hidden_factory: Callable[[], Any] | None = None,
-                 store: HubStore | None = None):
+    def __init__(self, state_dir: str | Path, *, browser: Any = None, managed_browser: Any = None,
+                 hidden_factory: Callable[[], Any] | None = None, store: HubStore | None = None):
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or HubStore(self.state_dir / "hub.db")
@@ -222,6 +335,10 @@ class Hub:
         config = self._config()
         self.browser = browser or BrowserManager(self.state_dir, playwright_root=config.get("playwright_root"),
                                                  profile=config.get("chrome_profile"))
+        self.managed_browser = managed_browser or ManagedBrowserManager(
+            self.state_dir, playwright_root=config.get("playwright_root")
+        )
+        self.route_affinity = RouteAffinityStore(self.state_dir)
         self._hidden_factory = hidden_factory
         self._hidden: dict[str, Any] = {}
         self._hidden_lock = threading.RLock()
@@ -447,6 +564,66 @@ class Hub:
         payload={k:v for k,v in args.items() if k!='browser_id'}
         return self._hidden_request(hidden,{'command':'browser.rpc','args':payload},timeout=60)
 
+    def _managed_browser(self, session: dict, args: dict) -> dict:
+        """Managed isolated persistent Playwright browser with durable sticky affinity."""
+        if args.get("foreground") is True:
+            raise HubError("FOREGROUND_ROUTE_REQUIRED", "managed Playwright never falls back to foreground",
+                           execution_started=False, retry_safe=False)
+        command = str(args.get("command") or "")
+        owner = self._owner(session)
+        if command == "status":
+            return (self.managed_browser.call("status") if getattr(self.managed_browser, "running", lambda: False)()
+                    else {"connected": False, "started": False})
+        if command == "open":
+            host = urllib.parse.urlsplit(str(args.get("url") or "")).hostname or ""
+            self._permit(session, "browser_own_tabs", {"host": host}, action="managed_browser.open")
+            res = self.managed_browser.call("open", {"owner": owner, **{k: args[k] for k in ("url", "sticky") if k in args}})
+            if not any(r["key"] == res["browser_id"] for r in self.store.resources(session_id=session["session_id"], kind="app_session")):
+                self.store.claim(
+                    session,
+                    "app_session",
+                    res["browser_id"],
+                    meta={
+                        "managed_browser": True,
+                        "url": res.get("url"),
+                        "tab_id": res.get("tab_id"),
+                        "target_id": res.get("target_id"),
+                    },
+                )
+            self.route_affinity.record(
+                session["agent_id"],
+                session["task_id"],
+                route="persistent_playwright",
+                browser_id=res["browser_id"],
+                tab_id=res.get("tab_id"),
+                target_id=res.get("target_id"),
+            )
+            return res
+        resource = self.store.require_owned(session, "app_session", str(args.get("browser_id") or ""))
+        if not resource["meta"].get("managed_browser"):
+            raise HubError("MANAGED_BROWSER_NOT_OWNED", execution_started=False)
+        if command == "close":
+            res = self.managed_browser.call("close", {"owner": owner, "browser_id": resource["key"]})
+            self.store.release(session, resource_id=resource["resource_id"])
+            self.route_affinity.clear(session["agent_id"], session["task_id"])
+            return res
+        host = urllib.parse.urlsplit(str(args.get("url") or resource["meta"].get("url") or "")).hostname or ""
+        self._permit(session, "browser_script" if command == "evaluate" else "browser_own_tabs",
+                     {"host": host}, action=f"managed_browser.{command}")
+        payload = {"owner": owner, "browser_id": resource["key"],
+                   **{k: v for k, v in args.items() if k not in {"command", "browser_id"}}}
+        res = self.managed_browser.call(command, payload)
+        if command in {"navigate", "tab_open"}:
+            self.route_affinity.record(
+                session["agent_id"],
+                session["task_id"],
+                route="persistent_playwright",
+                browser_id=resource["key"],
+                tab_id=res.get("tab_id"),
+                target_id=res.get("target_id"),
+            )
+        return res
+
     def _app(self, session: dict, op: str, args: dict) -> dict:
         if op == "app_discover":
             return apps.plan(str(args.get("app") or ""), catalog=self.app_catalog)
@@ -642,20 +819,35 @@ class Hub:
                 report["errors"].append({"kind": "browser_tab", "code": exc.code})
         elif any(item["kind"] == "browser_tab" for item in held):
             report["errors"].append({"kind": "browser_tab", "code": "BROWSER_MANAGER_NOT_RUNNING"})
+        managed_apps = [item for item in held if item["kind"] == "app_session" and item["meta"].get("managed_browser")]
+        if managed_apps:
+            if getattr(self.managed_browser, "running", lambda: False)():
+                try:
+                    closed_pw = self.managed_browser.call("close_owner", {"owner": owner})
+                    report["app_sessions_closed"] += int(closed_pw.get("closed") or 0)
+                    for err in closed_pw.get("errors") or []:
+                        report["errors"].append({"kind": "managed_browser", **err})
+                except HubError as exc:
+                    report["errors"].append({"kind": "managed_browser", "code": exc.code})
+            else:
+                report["errors"].append({"kind": "managed_browser", "code": "MANAGED_BROWSER_NOT_RUNNING"})
+            self.route_affinity.clear(session["agent_id"], session["task_id"])
         # A launch may create an owned process before returning a window/app_id. Close the
         # private worker even if no app_session record could be materialized.
         if owner in self._hidden:
             hidden=self._hidden[owner]
             if self._close_hidden(owner):
-                owned_apps = [item for item in held if item["kind"] == "app_session"]
-                identities = {(item["meta"].get("pid"), item["meta"].get("create_time")) for item in owned_apps}
+                owned_apps = [item for item in held if item["kind"] == "app_session"
+                              and not item["meta"].get("managed_browser")
+                              and item["meta"].get("pid") and item["meta"].get("create_time")]
+                identities = {(item["meta"]["pid"], item["meta"]["create_time"]) for item in owned_apps}
                 deadline = time.monotonic() + 4
                 pending = {identity for identity in identities if process_identity_matches(*identity)}
                 while pending and time.monotonic() < deadline:
                     time.sleep(.05)
                     pending = {identity for identity in pending if process_identity_matches(*identity)}
-                report["app_sessions_closed"] = sum((item["meta"].get("pid"), item["meta"].get("create_time"))
-                                                    not in pending for item in owned_apps)
+                report["app_sessions_closed"] += sum((item["meta"]["pid"], item["meta"]["create_time"])
+                                                     not in pending for item in owned_apps)
                 if pending:
                     report["errors"].append({"kind": "app_session", "code": "OWNED_PROCESSES_STILL_RUNNING",
                                              "pids": sorted(pid for pid, _ in pending)})
@@ -708,9 +900,10 @@ class Hub:
         self._stop.set()
         for owner in list(self._hidden):
             self._close_hidden(owner)
-        stop = getattr(self.browser, "stop", None)
-        if stop:
-            stop()
+        for mgr in (self.browser, self.managed_browser):
+            stop = getattr(mgr, "stop", None)
+            if stop:
+                stop()
 
     # ---- discovery -----------------------------------------------------------------------
     def capabilities(self) -> dict:
@@ -731,10 +924,14 @@ class Hub:
             ],
             "operations": {
                 "capabilities": {"session": False}, "hub_status": {"session": False},
+                "route_plan": {"session": False, "args": {"surface": "browser|app", "capability": "dom|extension_bridge|download?", "prefer": "str?"}},
                 "session_open": {"session": False, "args": {"agent_id": "str", "task_id": "str", "resume_token": "str?"}},
                 "private_browser": {"mutating":"all except info/tabs/observe/read/screenshot/download_read","request_key_required":True,
                     "commands":["open","close","tabs","tab_open","tab_close","navigate","observe","read","act","upload","download_prepare","download_read","screenshot","evaluate"],
                     "transport":"owned Chrome on private Windows Desktop; CDP broker; Hub durable receipts"},
+                "managed_browser": {"mutating":"all except status/info/tabs/observe/snapshot/read/screenshot/download_read","request_key_required":True,
+                    "commands":["status","open","close","info","tabs","tab_open","tab_close","navigate","observe","snapshot","read","act","upload","download_prepare","download_read","screenshot","evaluate"],
+                    "transport":"isolated headless Playwright persistent context; sticky task affinity; Hub durable receipts"},
                 "app_document": {"commands":["read","replace","save"],"document":"exact path bound at app_open","mutating":"replace/save"},
                 "session_heartbeat": {}, "session_status": {}, "session_close": {"mutating": True},
                 "task_cancel": {"mutating":True,"durable_receipt_after_close":True}, "hub_shutdown_idle":{"session":False,"requires_idle":True},
@@ -799,6 +996,8 @@ class Hub:
                 "sessions": self.store.sessions(), "private_desktops": len(self._hidden),
                 "browser_manager": {"running": getattr(self.browser, "running", lambda: None)(),
                                     "starts": getattr(self.browser, "starts", None)},
+                "managed_browser": {"running": getattr(self.managed_browser, "running", lambda: None)(),
+                                    "starts": getattr(self.managed_browser, "starts", None)},
                 "pending_owner_requests": len(self.store.permission_requests()),
                 "resources": self.store.resources(),
                 "recovery": "resume saved session token; request_status by exact key; terminal status by exact ID"}
@@ -853,7 +1052,7 @@ class Hub:
         op, args = request.get("op"), request.get("args") or {}
         if not isinstance(args, dict):
             raise HubError("ARGS_INVALID")
-        if op in {"capabilities", "hub_status", "hub_shutdown_idle", "request_status", "session_status", "session_heartbeat",
+        if op in {"capabilities", "hub_status", "hub_shutdown_idle", "route_plan", "request_status", "session_status", "session_heartbeat",
                   "resource_list", "permission_check", "permission_describe", "secret_list", "audit_read", "app_discover"}:
             if check_access:
                 check_access()
@@ -879,6 +1078,18 @@ class Hub:
             return self.capabilities()
         if op == "hub_status":
             return self.status()
+        if op == "route_plan":
+            scope = {"agent_id": args.get("agent_id"), "task_id": args.get("task_id")}
+            if request.get("session_id") and request.get("session_secret"):
+                sess = self.store.authenticate(request.get("session_id"), request.get("session_secret"))
+                scope = {"agent_id": sess["agent_id"], "task_id": sess["task_id"]}
+            return live_route_plan(
+                scope,
+                surface=str(args.get("surface") or "browser"),
+                hub=self,
+                capability=str(args.get("capability") or "dom"),
+                prefer=args.get("prefer"),
+            )
         if op=='hub_shutdown_idle':
             with self._hidden_lock:
                 if self.store.sessions() or self._hidden:raise HubError('HUB_BUSY','cancel/finish owned tasks before stopping',retry_safe=False)
@@ -995,6 +1206,10 @@ class Hub:
             from cua_private_browser import READ_COMMANDS
             if args.get('command') in READ_COMMANDS:return self._private_browser(session,args)
             return journaled(lambda:self._private_browser(session,args))
+        if op == "managed_browser":
+            if args.get("command") in {"status", "info", "tabs", "observe", "snapshot", "read", "download_read", "screenshot"}:
+                return self._managed_browser(session, args)
+            return journaled(lambda: self._managed_browser(session, args))
         if op=='app_document':
             if args.get('command')=='read':return self._app(session,op,args)
             return journaled(lambda:self._app(session,op,args))

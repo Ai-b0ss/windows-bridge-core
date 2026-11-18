@@ -22,10 +22,10 @@ from ff_hub_io import atomic_json
 from ff_hub_store import HubError, _ident
 
 PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25")
-PUBLIC = {"capabilities", "hub_status"}
+PUBLIC = {"capabilities", "hub_status", "route_plan"}
 OPS = PUBLIC | {"session_open", "session_resume", "session_heartbeat", "session_status", "session_close", "task_cancel",
                 "resource_claim", "resource_release", "resource_list", "permission_check", "permission_describe",
-                "browser", "private_browser", "app_discover", "app_open", "app_windows", "app_observe", "app_find",
+                "browser", "private_browser", "managed_browser", "app_discover", "app_open", "app_windows", "app_observe", "app_find",
                 "app_act", "app_capture", "app_document", "app_close", "files", "terminal", "request_status",
                 "audit_read"}
 TOOL = {

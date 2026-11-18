@@ -1,0 +1,558 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FF Bridge — Local Web Control Stand</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f6f8fb;
+      --card: #ffffff;
+      --ink: #17202a;
+      --muted: #5b6673;
+      --border: #d5dce4;
+      --accent: #0f62fe;
+      --accent-ink: #ffffff;
+      --error: #c62828;
+      --error-bg: #fdecea;
+      --ok: #1b5e20;
+      --ok-bg: #e8f5e9;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #11161c;
+        --card: #1a212b;
+        --ink: #eef2f6;
+        --muted: #9aa7b6;
+        --border: #303a47;
+        --accent: #4589ff;
+        --accent-ink: #0c1118;
+        --error: #ff8a80;
+        --error-bg: #3b191b;
+        --ok: #81c784;
+        --ok-bg: #17331d;
+      }
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 1.5rem;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      line-height: 1.5;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    main {
+      max-inline-size: 62rem;
+      margin-inline: auto;
+      display: grid;
+      gap: 1.25rem;
+    }
+
+    section.card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      padding: 1.25rem;
+    }
+
+    h1, h2 { margin-block: 0 0.75rem; }
+
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+      margin-block-end: 1rem;
+    }
+
+    button, .button-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.55rem 0.9rem;
+      border-radius: 0.5rem;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--ink);
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+    }
+
+    button.primary {
+      background: var(--accent);
+      color: var(--accent-ink);
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+
+    .field {
+      display: grid;
+      gap: 0.25rem;
+      margin-block-end: 1rem;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 0.875rem;
+    }
+
+    input[type="text"],
+    input[type="email"],
+    input[type="search"],
+    select {
+      padding: 0.5rem 0.65rem;
+      border: 1px solid var(--border);
+      border-radius: 0.45rem;
+      font: inherit;
+      background: var(--card);
+      color: var(--ink);
+      max-inline-size: 28rem;
+    }
+
+    .error-msg {
+      display: none;
+      color: var(--error);
+      font-size: 0.875rem;
+    }
+
+    input:is(:user-invalid, .user-invalid-fallback),
+    select:is(:user-invalid, .user-invalid-fallback) {
+      border-color: var(--error);
+      background-color: var(--error-bg);
+    }
+
+    input:is(:user-invalid, .user-invalid-fallback) + .error-msg,
+    select:is(:user-invalid, .user-invalid-fallback) + .error-msg {
+      display: block;
+    }
+
+    input:is(:user-valid, .user-valid-fallback),
+    select:is(:user-valid, .user-valid-fallback) {
+      border-color: var(--ok);
+    }
+
+    .banner {
+      padding: 0.65rem 0.9rem;
+      border-radius: 0.5rem;
+      border: 1px solid var(--border);
+      background: var(--ok-bg);
+      color: var(--ok);
+      font-weight: 500;
+    }
+
+    .banner[hidden] { display: none; }
+
+    /* Responsive + sticky + sortable table */
+    .table-wrapper {
+      overflow: auto;
+      max-inline-size: 100%;
+      max-block-size: min(460px, 70vh);
+      container-type: inline-size;
+      border: 1px solid var(--border);
+      border-radius: 0.5rem;
+    }
+
+    table {
+      inline-size: 100%;
+      min-inline-size: 36rem;
+      border-collapse: separate;
+      border-spacing: 0;
+    }
+
+    caption {
+      text-align: start;
+      font-weight: 600;
+      padding: 0.65rem 0.75rem;
+    }
+
+    th, td {
+      padding: 0.55rem 0.75rem;
+      border-block-end: 1px solid var(--border);
+      text-align: start;
+      white-space: nowrap;
+    }
+
+    thead {
+      position: sticky;
+      inset-block-start: 0;
+      z-index: 2;
+      background: var(--card);
+    }
+
+    tbody th {
+      position: sticky;
+      inset-inline-start: 0;
+      background: var(--card);
+      z-index: 1;
+      font-weight: 600;
+    }
+
+    thead th button {
+      border: 0;
+      padding: 0;
+      background: transparent;
+      font-weight: 700;
+      inline-size: 100%;
+      justify-content: space-between;
+    }
+
+    thead th[aria-sort="ascending"] button::after { content: " ▲"; }
+    thead th[aria-sort="descending"] button::after { content: " ▼"; }
+
+    @container (width < 600px) {
+      table, thead, tbody, tr, th, td {
+        display: block;
+      }
+      table {
+        min-inline-size: 0;
+      }
+      thead {
+        display: none;
+      }
+      tr {
+        margin-block-end: 0.75rem;
+        border-block-end: 2px solid var(--border);
+      }
+      td {
+        display: flex;
+        justify-content: space-between;
+        gap: 0.75rem;
+      }
+      td::before {
+        content: attr(data-label);
+        font-weight: 600;
+        color: var(--muted);
+      }
+    }
+
+    dialog[open] {
+      display: grid;
+      gap: 0.9rem;
+      max-inline-size: min(32rem, 92vw);
+      padding: 1.25rem;
+      border: 1px solid var(--border);
+      border-radius: 0.75rem;
+      background: var(--card);
+      color: var(--ink);
+    }
+
+    dialog:modal {
+      overscroll-behavior: contain;
+    }
+
+    dialog::backdrop {
+      overflow: hidden;
+      overscroll-behavior: contain;
+      background: rgb(0 0 0 / 0.45);
+    }
+
+    .dialog-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 0.65rem;
+    }
+
+    .visually-hidden:where(:not(:focus-within, :active)) {
+      position: absolute !important;
+      clip-path: inset(50%) !important;
+      overflow: hidden !important;
+      width: 1px !important;
+      height: 1px !important;
+      margin: -1px !important;
+      padding: 0 !important;
+      border: 0 !important;
+      white-space: nowrap !important;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <h1>FF Bridge Local Browser Acceptance Stand</h1>
+      <p class="hint">Deterministic localhost test fixture covering modal dialog, post-interaction validation, sortable data grid, and file download.</p>
+    </header>
+
+    <section class="card" aria-labelledby="actions-heading">
+      <h2 id="actions-heading">Actions &amp; Modal Workflow</h2>
+      <div class="toolbar">
+        <button id="open-dialog-btn" type="button" class="primary" command="show-modal" commandfor="task-dialog">
+          Open Task Dialog
+        </button>
+        <a id="download-csv-link" class="button-link" href="/download/report.csv" download="report.csv">
+          Download Report CSV
+        </a>
+        <span id="dialog-result" class="banner" hidden></span>
+      </div>
+    </section>
+
+    <section class="card" aria-labelledby="form-heading">
+      <h2 id="form-heading">Scoped Task Form</h2>
+      <form id="task-form" novalidate>
+        <div class="field">
+          <label for="agent-email">Operator Email</label>
+          <span id="agent-email-hint" class="hint">Format: operator@example.com</span>
+          <input
+            type="email"
+            id="agent-email"
+            name="agent_email"
+            required
+            autocomplete="email"
+            aria-describedby="agent-email-hint"
+            data-error="agent-email-error"
+          >
+          <div id="agent-email-error" class="error-msg">
+            <span role="img" aria-label="Error">❌</span> Enter an email address in the format operator@example.com.
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="task-code">Task Ticket Code</label>
+          <span id="task-code-hint" class="hint">Uppercase letters, digits, or hyphens, 4–24 characters (e.g. QA-002).</span>
+          <input
+            type="text"
+            id="task-code"
+            name="task_code"
+            required
+            pattern="[A-Z0-9\-]{4,24}"
+            aria-describedby="task-code-hint"
+            data-error="task-code-error"
+          >
+          <div id="task-code-error" class="error-msg">
+            <span role="img" aria-label="Error">❌</span> Enter 4–24 uppercase letters, numbers, or hyphens.
+          </div>
+        </div>
+
+        <button id="submit-form-btn" type="submit" class="primary">Submit Task Form</button>
+      </form>
+      <p id="form-result" class="banner" hidden></p>
+    </section>
+
+    <section class="card" aria-labelledby="table-section-heading">
+      <h2 id="table-section-heading">Route Inventory Table</h2>
+      <div class="field">
+        <label for="table-filter">Filter routes by name or role</label>
+        <input type="search" id="table-filter" placeholder="Type e.g. playwright or cdp">
+      </div>
+      <div tabindex="0" role="region" aria-labelledby="stand-table-caption" class="table-wrapper">
+        <table id="routes-table">
+          <caption id="stand-table-caption">Browser control routes</caption>
+          <thead>
+            <tr>
+              <th scope="col" data-col="0" data-type="text"><button type="button" data-sort-col="0">Route</button></th>
+              <th scope="col" data-col="1" data-type="text"><button type="button" data-sort-col="1">Role</button></th>
+              <th scope="col" data-col="2" data-type="number"><button type="button" data-sort-col="2">Latency (ms)</button></th>
+            </tr>
+          </thead>
+          <tbody id="routes-tbody">
+            <tr>
+              <th>owner_chrome_extension</th>
+              <td data-label="Role">signed-in</td>
+              <td data-label="Latency (ms)" data-value="42">42</td>
+            </tr>
+            <tr>
+              <th>persistent_playwright</th>
+              <td data-label="Role">headless-context</td>
+              <td data-label="Latency (ms)" data-value="18">18</td>
+            </tr>
+            <tr>
+              <th>private_cdp</th>
+              <td data-label="Role">isolated-desktop</td>
+              <td data-label="Latency (ms)" data-value="29">29</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div id="table-status" role="status" class="visually-hidden"></div>
+    </section>
+  </main>
+
+  <dialog id="task-dialog" aria-labelledby="task-dialog-title">
+    <h2 id="task-dialog-title">Confirm Route Dispatch</h2>
+    <p>Confirm dispatching this local test workflow action in background mode.</p>
+    <div class="field">
+      <label for="dialog-note">Confirmation Note</label>
+      <input type="text" id="dialog-note" value="approved-route" autofocus>
+    </div>
+    <form method="dialog" class="dialog-actions">
+      <button type="submit" value="cancel">Cancel</button>
+      <button id="dialog-confirm-btn" type="submit" class="primary" value="confirm">Confirm</button>
+    </form>
+  </dialog>
+
+  <script>
+    (() => {
+      // Fallback for Invoker Commands (`command="show-modal"`).
+      const dialog = document.getElementById('task-dialog');
+      const openBtn = document.getElementById('open-dialog-btn');
+      const dialogResult = document.getElementById('dialog-result');
+      const dialogNote = document.getElementById('dialog-note');
+      if (!('commandForElement' in HTMLButtonElement.prototype)) {
+        openBtn.addEventListener('click', () => dialog.showModal());
+      }
+      dialog.addEventListener('close', () => {
+        const chosen = dialog.returnValue || 'dismissed';
+        dialog.returnValue = '';
+        if (chosen === 'confirm') {
+          dialogResult.textContent = `Dialog confirmed: ${dialogNote.value.trim() || 'ok'}`;
+          dialogResult.hidden = false;
+        } else {
+          dialogResult.textContent = 'Dialog cancelled';
+          dialogResult.hidden = false;
+        }
+      });
+
+      // Accessible post-interaction ARIA error synchronization (:user-invalid + fallback).
+      const linkError = (el, shown) => {
+        const errorId = el.dataset.error;
+        if (!errorId) return;
+        const ids = (el.getAttribute('aria-describedby') || '')
+          .split(/\s+/)
+          .filter((id) => id && id !== errorId);
+        if (shown) ids.push(errorId);
+        if (ids.length) el.setAttribute('aria-describedby', ids.join(' '));
+        else el.removeAttribute('aria-describedby');
+      };
+
+      const announcer = document.createElement('div');
+      announcer.setAttribute('aria-live', 'polite');
+      announcer.classList.add('visually-hidden');
+      document.body.append(announcer);
+      let announceTimer;
+      const flagged = new WeakSet();
+      const announced = new WeakSet();
+      const supportsUserInvalid = CSS.supports('selector(:user-invalid)');
+      const dirtyMap = new WeakMap();
+
+      const syncAria = (el, announce = false) => {
+        if (!el.matches?.('input, select, textarea')) return;
+        let invalid = false;
+        if (supportsUserInvalid) {
+          invalid = el.matches(':user-invalid');
+        } else {
+          const st = dirtyMap.get(el);
+          invalid = Boolean(st?.hasBlurred && !el.validity.valid);
+          el.classList.toggle('user-invalid-fallback', invalid);
+          el.classList.toggle('user-valid-fallback', Boolean(st?.hasBlurred && el.validity.valid));
+        }
+        if (invalid) {
+          if (announce && !announced.has(el)) {
+            const err = document.getElementById(el.dataset.error);
+            if (err) {
+              clearTimeout(announceTimer);
+              announceTimer = setTimeout(() => { announcer.textContent = err.textContent.trim(); }, 300);
+            }
+            announced.add(el);
+          }
+          el.setAttribute('aria-invalid', 'true');
+          linkError(el, true);
+          flagged.add(el);
+        } else if (flagged.has(el) || el.getAttribute('aria-invalid') !== 'true') {
+          el.setAttribute('aria-invalid', 'false');
+          linkError(el, false);
+          flagged.delete(el);
+          announced.delete(el);
+        }
+      };
+
+      const form = document.getElementById('task-form');
+      const formResult = document.getElementById('form-result');
+      form.querySelectorAll('input, select, textarea').forEach((el) => syncAria(el));
+
+      form.addEventListener('blur', (e) => {
+        const st = dirtyMap.get(e.target) || { hasInteracted: false, hasBlurred: false };
+        st.hasBlurred = true;
+        dirtyMap.set(e.target, st);
+        syncAria(e.target, true);
+      }, true);
+
+      form.addEventListener('input', (e) => {
+        const st = dirtyMap.get(e.target) || { hasInteracted: false, hasBlurred: false };
+        st.hasInteracted = true;
+        dirtyMap.set(e.target, st);
+        syncAria(e.target, false);
+      });
+
+      form.addEventListener('submit', (e) => {
+        e.preventDefault();
+        let firstInvalid = null;
+        for (const el of form.querySelectorAll('input, select, textarea')) {
+          dirtyMap.set(el, { hasInteracted: true, hasBlurred: true });
+          const ok = el.checkValidity();
+          if (!ok && !firstInvalid) firstInvalid = el;
+          if (!supportsUserInvalid) {
+            el.classList.toggle('user-invalid-fallback', !ok);
+            el.classList.toggle('user-valid-fallback', ok);
+          }
+          el.setAttribute('aria-invalid', ok ? 'false' : 'true');
+          linkError(el, !ok);
+        }
+        if (firstInvalid) {
+          formResult.hidden = true;
+          firstInvalid.focus();
+          return;
+        }
+        const email = document.getElementById('agent-email').value.trim();
+        const code = document.getElementById('task-code').value.trim();
+        formResult.textContent = `Submitted ${code} for ${email}`;
+        formResult.hidden = false;
+      });
+
+      // Sortable + filterable table without destroying row nodes.
+      const table = document.getElementById('routes-table');
+      const tbody = document.getElementById('routes-tbody');
+      const tableStatus = document.getElementById('table-status');
+      const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+      let sortState = { col: null, dir: null };
+
+      table.querySelector('thead').addEventListener('click', (e) => {
+        const btn = e.target.closest('button[data-sort-col]');
+        if (!btn) return;
+        const th = btn.closest('th');
+        const col = Number(btn.dataset.sortCol);
+        const type = th.dataset.type || 'text';
+        const dir = sortState.col === col && sortState.dir === 'ascending' ? 'descending' : 'ascending';
+        sortState = { col, dir };
+
+        table.querySelectorAll('thead th').forEach((cell) => {
+          if (cell === th) cell.setAttribute('aria-sort', dir);
+          else cell.removeAttribute('aria-sort');
+        });
+
+        const rows = [...tbody.rows];
+        const factor = dir === 'ascending' ? 1 : -1;
+        const getVal = (r) => r.cells[col].dataset.value ?? r.cells[col].textContent.trim();
+        rows.sort((a, b) => factor * (
+          type === 'number' ? Number(getVal(a)) - Number(getVal(b)) : collator.compare(getVal(a), getVal(b))
+        ));
+        const reorder = () => {
+          for (const row of rows) {
+            if (typeof tbody.moveBefore === 'function') tbody.moveBefore(row, null);
+            else tbody.appendChild(row);
+          }
+        };
+        reorder();
+        btn.focus();
+        tableStatus.textContent = `Sorted by ${btn.textContent.trim()}, ${dir}, ${rows.length} rows`;
+      });
+
+      document.getElementById('table-filter').addEventListener('input', (e) => {
+        const q = e.target.value.trim().toLowerCase();
+        let visible = 0;
+        for (const row of tbody.rows) {
+          const match = !q || row.textContent.toLowerCase().includes(q);
+          row.hidden = !match;
+          if (match) visible += 1;
+        }
+        tableStatus.textContent = `${visible} visible rows`;
+      });
+    })();
+  </script>
+</body>
+</html>

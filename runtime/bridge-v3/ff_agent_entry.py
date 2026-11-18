@@ -21,15 +21,15 @@ SCHEMA = "ff-agent-entry-v1"
 BASE_OPS = {"capabilities", "route_plan", "session_open", "session_status",
             "session_heartbeat", "request_status", "task_cancel", "audit_read"}
 SCOPES = {
-    "private_browser": {"private_browser"},
+    "private_browser": {"private_browser", "managed_browser"},
     "private_app": {"app_discover", "app_open", "app_windows", "app_observe",
                     "app_find", "app_act", "app_capture", "app_document", "app_close"},
     "locks": {"resource_claim", "resource_list", "resource_release"},
     "artifacts": {"task_file"},
 }
 BROWSER_COMMANDS = ("open", "info", "close", "tabs", "tab_open", "tab_close", "navigate",
-                    "observe", "read", "act", "upload", "download_prepare", "download_read", "screenshot")
-READ_ONLY = {"info", "tabs", "observe", "read", "download_read", "screenshot"}
+                    "observe", "snapshot", "read", "act", "upload", "download_prepare", "download_read", "screenshot")
+READ_ONLY = {"info", "tabs", "observe", "snapshot", "read", "download_read", "screenshot"}
 MUTATIONS = {"task_cancel", "resource_claim", "resource_release", "app_open", "app_act", "app_close"}
 SAFE_APPS = DEFAULT_SAFE_APPS
 LOCK_KINDS = {"custom", "file", "directory"}
@@ -316,28 +316,16 @@ class EntryAuthority:
                 raise
 
 
-def route_plan(scope: dict, surface: str = "browser") -> dict:
-    private_browser = surface == "browser" and "private_browser" in scope["scopes"]
-    private_app = surface == "app" and "private_app" in scope["scopes"]
-    if surface not in ("browser", "app"):
-        raise HubError("ENTRY_SURFACE_INVALID", execution_started=False)
-    routes = [
-        {"route": "api_cli_sdk_com", "state": "UNMANAGED",
-         "reason": "provider must participate in the broker to supply managed task receipts"},
-        {"route": "native_agent_extension", "state": "UNMANAGED",
-         "reason": "no verified broker ownership or persistent platform approval"},
-        {"route": "owner_chrome_extension", "state": "UNAVAILABLE",
-         "reason": "the scoped entry cannot attach to the owner's Chrome"},
-        {"route": "private_cdp", "state": "ELIGIBLE" if private_browser else "UNAVAILABLE",
-         "reason": "requires an installed Chrome and local app_launch policy",
-         "authorization": "managed private profile, no owner Chrome grant"},
-        {"route": "persistent_playwright", "state": "UNAVAILABLE",
-         "reason": "no managed Playwright adapter registered at this entry"},
-        {"route": "private_uia", "state": "ELIGIBLE" if private_app else "UNAVAILABLE",
-         "reason": "requires a scoped app, local app_launch policy and a supported private launch"},
-    ]
-    return {"surface": surface, "selected": "private_cdp" if private_browser else "private_uia" if private_app else None,
-            "routes": routes, "health_probed": False, "foreground_fallback": False}
+def route_plan(
+    scope: dict,
+    surface: str = "browser",
+    *,
+    hub: object | None = None,
+    capability: str = "dom",
+    prefer: str | None = None,
+) -> dict:
+    from ff_browser_routes import route_plan as live_route_plan
+    return live_route_plan(scope, surface=surface, hub=hub, capability=capability, prefer=prefer)
 
 
 class EntryArtifacts:
@@ -424,13 +412,21 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
         raise HubError("ENTRY_SCOPE_DENIED", execution_started=False)
     if op == "capabilities":
         return {"schema": SCHEMA, "http_path": ENTRY_PATH, "mcp_transport": "stdio",
-                "operations": sorted(operations), "browser_commands": list(BROWSER_COMMANDS) if "private_browser" in operations else [],
+                "operations": sorted(operations),
+                "browser_commands": list(BROWSER_COMMANDS) if "private_browser" in operations else [],
+                "managed_browser_commands": list(BROWSER_COMMANDS) if "managed_browser" in operations else [],
                 "file_commands": ["list", "put", "read"] if "task_file" in operations else [],
                 "apps": sorted(scope["apps"]), "client_id": scope["client_id"], "agent_id": scope["agent_id"],
                 "task_id": scope["task_id"], "expires_at": scope["expires_at"],
                 "foreground_fallback": False, "automatic_mutation_replay": False}
     if op == "route_plan":
-        return route_plan(scope, args.get("surface", "browser"))
+        return route_plan(
+            scope,
+            args.get("surface", "browser"),
+            hub=hub,
+            capability=args.get("capability", "dom"),
+            prefer=args.get("prefer"),
+        )
     if op == "session_open":
         if args:
             raise HubError("ENTRY_IDENTITY_FIXED", execution_started=False)
@@ -438,7 +434,8 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op == "audit_read":
         args = {**args, "task_id": scope["task_id"]}
     command = args.get("command")
-    if op == "private_browser" and (command not in BROWSER_COMMANDS or {"route", "foreground"} & args.keys()):
+    if op in {"private_browser", "managed_browser"} and (
+            command not in BROWSER_COMMANDS or {"route", "foreground"} & args.keys()):
         raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)
     if op == "app_discover":
         cid = authority.catalog.canonical_id(args.get("app")) if set(args) == {"app"} else None
@@ -454,7 +451,7 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op in {"resource_claim", "resource_release"} and args.get("kind") not in sorted(LOCK_KINDS):
         raise HubError("ENTRY_LOCK_KIND_DENIED", execution_started=False)
     if (op in MUTATIONS
-            or (op == "private_browser" and command not in READ_ONLY)
+            or (op in {"private_browser", "managed_browser"} and command not in READ_ONLY)
             or (op == "task_file" and command == "put")
             or (op == "app_document" and command != "read")):
         key = request.get("request_key")
