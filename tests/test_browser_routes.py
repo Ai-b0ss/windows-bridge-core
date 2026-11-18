@@ -190,6 +190,132 @@ class BrowserRoutesTests(unittest.TestCase):
                 if isinstance(obj, sqlite3.Connection):
                     obj.close()
 
+    def test_managed_browser_does_not_block_private_browser_or_app_close(self) -> None:
+        shared_seq = [5000]
+
+        class _FakeHiddenMultiRoute:
+            def __init__(self) -> None:
+                self.closed = False
+                self.close_calls = 0
+                self.browser_launched = False
+                self.job_cleanup_verified = True
+                self.browser_profile_cleanup: list[dict] = []
+                self.editor_profile_cleanup: list[dict] = []
+                self._windows: list[dict] = []
+
+            def request(self, payload: dict, timeout_s: float = 30) -> dict:
+                cmd = payload.get("command")
+                if cmd == "browser.launch":
+                    if self.browser_launched:
+                        raise HubError("HIDDEN_CHROME_ALREADY_LAUNCHED")
+                    self.browser_launched = True
+                    shared_seq[0] += 1
+                    pid = shared_seq[0]
+                    return {"pid": pid, "hwnd": pid + 100, "create_time": 9000 + pid,
+                            "desktop": "FFBridge-Agent-test"}
+                if cmd == "browser.rpc":
+                    return {"ok": True}
+                if cmd in {"launch_app", "launch_exe"}:
+                    shared_seq[0] += 1
+                    pid = shared_seq[0]
+                    win = {"pid": pid, "hwnd": pid + 100, "create_time": 9000 + pid, "class_name": "TestWnd"}
+                    self._windows.append(win)
+                    return {**win, "desktop": "FFBridge-Agent-test", "route": "HIDDEN_TEST"}
+                if cmd == "describe_owned_windows":
+                    return {"windows": list(self._windows)}
+                if cmd == "close_app":
+                    return {"closed": True}
+                return {"ok": True}
+
+            def close(self) -> None:
+                self.closed = True
+                self.close_calls += 1
+                self.browser_launched = False
+
+        managed = _FakeManagedBrowser()
+        created: list[_FakeHiddenMultiRoute] = []
+
+        def make_hidden() -> _FakeHiddenMultiRoute:
+            inst = _FakeHiddenMultiRoute()
+            created.append(inst)
+            return inst
+
+        pol = Policy(self.state_dir / "policy.json")
+        pol.add_grant(["browser_own_tabs", "read_diagnose"], hosts=["127.0.0.1"], agents=["a-multi"], ttl_seconds=600)
+        pol.add_grant(["app_launch", "read_diagnose", "own_resources"], apps=["chrome", "chrome.exe", "charmap", "charmap.exe"], agents=["a-multi"], ttl_seconds=600)
+        hub = Hub(self.state_dir, managed_browser=managed, hidden_factory=make_hidden)
+        try:
+            auth = EntryAuthority(self.state_dir)
+            _, token = auth.issue(
+                client_id="c-multi", agent_id="a-multi", task_id="t-multi",
+                scopes=["private_browser", "private_app"], apps=["charmap"], ttl=600,
+            )
+            bearer = "Bearer " + token
+            sess = entry_call(hub, auth, bearer, {"op": "session_open"})["session_id"]
+
+            pw = entry_call(hub, auth, bearer, {
+                "op": "managed_browser", "session_id": sess, "request_key": "req-mr-pw-open",
+                "args": {"command": "open", "url": "http://127.0.0.1:8080/"},
+            })
+            self.assertEqual(pw["browser_id"], "pw-test-1")
+
+            # Passing managed_browser id into app_observe must be rejected cleanly with APP_NOT_OWNED
+            with self.assertRaises(HubError) as actx:
+                entry_call(hub, auth, bearer, {"op": "app_observe", "session_id": sess, "args": {"app_id": pw["browser_id"]}})
+            self.assertEqual(actx.exception.code, "APP_NOT_OWNED")
+
+            # Open and close private_browser while managed_browser remains open -> _close_hidden tears down desktop
+            pb1 = entry_call(hub, auth, bearer, {
+                "op": "private_browser", "session_id": sess, "request_key": "req-mr-pb1-open",
+                "args": {"command": "open"},
+            })
+            cls1 = entry_call(hub, auth, bearer, {
+                "op": "private_browser", "session_id": sess, "request_key": "req-mr-pb1-close",
+                "args": {"command": "close", "browser_id": pb1["browser_id"]},
+            })
+            self.assertTrue(cls1["closed"])
+            self.assertEqual(len(created), 1)
+            self.assertTrue(created[0].closed)
+
+            # Re-opening private_browser in the SAME session succeeds with fresh private desktop (no HIDDEN_CHROME_ALREADY_LAUNCHED)
+            pb2 = entry_call(hub, auth, bearer, {
+                "op": "private_browser", "session_id": sess, "request_key": "req-mr-pb2-open",
+                "args": {"command": "open"},
+            })
+            self.assertEqual(len(created), 2)
+            self.assertNotEqual(pb2["browser_id"], pb1["browser_id"])
+            entry_call(hub, auth, bearer, {
+                "op": "private_browser", "session_id": sess, "request_key": "req-mr-pb2-close",
+                "args": {"command": "close", "browser_id": pb2["browser_id"]},
+            })
+            self.assertTrue(created[1].closed)
+
+            # Open and close a GUI app while managed_browser stays open -> _close_hidden runs on app_close
+            with mock.patch("ff_hub_apps.resolve", return_value={
+                "found": True, "query": "charmap", "name": "charmap.exe", "executable": r"C:\Windows\System32\charmap.exe",
+                "kind": "win32", "known": "charmap", "running_instances": 0,
+            }), mock.patch.object(hub.app_catalog, "get", return_value={"app_id": "charmap", "executable": r"C:\Windows\System32\charmap.exe"}):
+                ap = entry_call(hub, auth, bearer, {
+                    "op": "app_open", "session_id": sess, "request_key": "req-mr-app-open",
+                    "args": {"app": "charmap"},
+                })
+                entry_call(hub, auth, bearer, {
+                    "op": "app_close", "session_id": sess, "request_key": "req-mr-app-close",
+                    "args": {"app_id": ap["app_id"]},
+                })
+            self.assertEqual(len(created), 3)
+            self.assertTrue(created[2].closed)
+
+            cancelled = entry_call(hub, auth, bearer, {
+                "op": "task_cancel", "session_id": sess, "request_key": "req-mr-cancel",
+            })
+            self.assertTrue(cancelled["cleanup_verified"])
+        finally:
+            hub.shutdown()
+            for obj in vars(hub.store).values():
+                if isinstance(obj, sqlite3.Connection):
+                    obj.close()
+
 
 if __name__ == "__main__":
     unittest.main()

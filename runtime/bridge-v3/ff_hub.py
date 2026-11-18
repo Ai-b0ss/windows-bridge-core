@@ -554,7 +554,7 @@ class Hub:
         if not resource['meta'].get('private_browser'):raise HubError('PRIVATE_BROWSER_NOT_OWNED',execution_started=False)
         hidden=self._hidden_session(session,create=False)
         if command=='close':
-            others=[r for r in self.store.resources(session_id=session['session_id'],kind='app_session') if r['key']!=resource['key']]
+            others=[r for r in self.store.resources(session_id=session['session_id'],kind='app_session') if r['key']!=resource['key'] and not r['meta'].get('managed_browser')]
             if others:raise HubError('PRIVATE_DESKTOP_HAS_OTHER_APPS','close apps first, or session_close to cancel the whole task',execution_started=False)
             closed=self._close_hidden(self._owner(session))
             if not closed:raise HubError('PRIVATE_BROWSER_CLEANUP_FAILED',outcome_unknown=True,retry_safe=False)
@@ -715,6 +715,8 @@ class Hub:
                     "route_status": hidden_route["status"], "route_note": hidden_route.get("note"),
                     "visible_to_owner": False}
         resource = self.store.require_owned(session, "app_session", str(args.get("app_id") or ""))
+        if resource["meta"].get("managed_browser") or resource["meta"].get("private_browser"):
+            raise HubError("APP_NOT_OWNED", execution_started=False)
         hidden = self._hidden_session(session, create=False)
         hwnd, pid = resource["meta"]["hwnd"], resource["meta"]["pid"]
         # An app_id is authority over one process incarnation, never every window on its
@@ -779,7 +781,7 @@ class Hub:
             result = self._hidden_request(hidden, {"command": "close_app", "pid": pid,
                                                    "create_time": resource["meta"].get("create_time")})
             self.store.release(session, resource_id=resource["resource_id"])
-            if not self.store.resources(session_id=session["session_id"], kind="app_session"):
+            if not [r for r in self.store.resources(session_id=session["session_id"], kind="app_session") if not r["meta"].get("managed_browser")]:
                 self._close_hidden(self._owner(session))
             return result
         raise HubError("OP_UNSUPPORTED", op=op)
