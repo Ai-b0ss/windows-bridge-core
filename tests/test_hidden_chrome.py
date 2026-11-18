@@ -106,6 +106,24 @@ class HiddenChromeContracts(unittest.TestCase):
             self.launch()
         self.proc.kill.assert_called_once_with()
 
+    def test_version_timeout_during_launch_rechecks_the_same_owned_listener(self):
+        self.version.side_effect = [TimeoutError("fixture readiness timeout"), self.version.return_value]
+        result = self.launch()["result"]
+        self.assertEqual(result["pid"], self.proc.pid)
+        self.popen.assert_called_once()
+        self.assertEqual(self.listeners.call_count, 2)
+        self.assertEqual(self.version.call_count, 2)
+        self.proc.kill.assert_not_called()
+
+    def test_version_timeout_does_not_follow_changed_listener_ownership(self):
+        self.listeners.side_effect = [self.listeners.return_value, [{"pid": 999, "port": 12345, "address": "127.0.0.1"}]]
+        self.version.side_effect = TimeoutError("fixture readiness timeout")
+        with self.assertRaisesRegex(chrome.HiddenChromeError, "HIDDEN_CHROME_LISTENER_NOT_OWNED"):
+            self.launch()
+        self.popen.assert_called_once()
+        self.version.assert_called_once()
+        self.proc.kill.assert_called_once_with()
+
     def test_info_rechecks_process_window_profile_endpoint_and_desktop(self):
         ctx = self.launch()
         self.creation.return_value = 988

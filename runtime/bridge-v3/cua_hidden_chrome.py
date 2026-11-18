@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import subprocess
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -111,7 +112,12 @@ def chrome_info(context, *, owns, window_info, desktop, retained_socket=False):
         if (not listeners or any(x.get("address") not in {"127.0.0.1", "::1"}
                                  or x.get("pid") != proc.pid for x in listeners)):
             raise HiddenChromeError("HIDDEN_CHROME_LISTENER_NOT_OWNED")
-        version = _version(port)
+        try:
+            version = _version(port)
+        except (TimeoutError, ConnectionError, urllib.error.URLError) as exc:
+            if not isinstance(getattr(exc, "reason", exc), (TimeoutError, ConnectionError)):
+                raise
+            raise HiddenChromeError("HIDDEN_CHROME_VERSION_PROBE_UNAVAILABLE") from exc
         endpoint = urllib.parse.urlsplit(str(version.get("webSocketDebuggerUrl") or ""))
         if (endpoint.scheme != "ws" or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
                 or endpoint.port != port or endpoint.path != path or endpoint.username
@@ -165,6 +171,7 @@ def launch_chrome(root, args, *, register, windows, owns, window_info, desktop, 
         if type(token) is not int or token <= 0:
             raise HiddenChromeError("HIDDEN_CHROME_PROCESS_IDENTITY_UNAVAILABLE")
         deadline = time.monotonic() + timeout_s
+        context = None
         while time.monotonic() < deadline:
             if proc.poll() is not None:
                 raise HiddenChromeError("HIDDEN_CHROME_EXITED_BEFORE_READY")
@@ -179,18 +186,29 @@ def launch_chrome(root, args, *, register, windows, owns, window_info, desktop, 
                         and rect.get("bottom", 0) > rect.get("top", 0)):
                     candidates.append(hwnd)
             if len(candidates) == 1 and (profile / "DevToolsActivePort").is_file():
-                port, path = _active_port(profile)
-                result = {"app": "chrome", "pid": proc.pid, "create_time": token,
-                    "hwnd": candidates[0], "desktop": desktop, "profile_path": str(profile),
-                    "cdp_port": port, "cdp_endpoint": f"http://127.0.0.1:{port}",
-                    "browser_ws_path": path, "browser_ws_endpoint": f"ws://127.0.0.1:{port}{path}",
-                    "route": "HIDDEN_DESKTOP_CHROME_CDP", "physical_input_used": False,
-                    "headless": False, "owner_desktop_access_allowed": False}
-                context = {"proc": proc, "root": root, "owner": owner, "result": result,
-                           "window_info": window_info}
-                chrome_info(context, owns=owns, window_info=window_info, desktop=desktop)
-                return context
+                if context is None:
+                    port, path = _active_port(profile)
+                    result = {"app": "chrome", "pid": proc.pid, "create_time": token,
+                        "hwnd": candidates[0], "desktop": desktop, "profile_path": str(profile),
+                        "cdp_port": port, "cdp_endpoint": f"http://127.0.0.1:{port}",
+                        "browser_ws_path": path, "browser_ws_endpoint": f"ws://127.0.0.1:{port}{path}",
+                        "route": "HIDDEN_DESKTOP_CHROME_CDP", "physical_input_used": False,
+                        "headless": False, "owner_desktop_access_allowed": False}
+                    context = {"proc": proc, "root": root, "owner": owner, "result": result,
+                               "window_info": window_info}
+                # Chrome can publish the marker before /json/version responds.
+                # Recheck the same process, window, profile and listener on each
+                # read-only probe. Never start another process on this path.
+                try:
+                    chrome_info(context, owns=owns, window_info=window_info, desktop=desktop)
+                except HiddenChromeError as exc:
+                    if exc.code != "HIDDEN_CHROME_VERSION_PROBE_UNAVAILABLE":
+                        raise
+                else:
+                    return context
             time.sleep(.1)
+        if context is not None:
+            raise HiddenChromeError("HIDDEN_CHROME_VERSION_PROBE_UNAVAILABLE")
         raise HiddenChromeError("HIDDEN_CHROME_WINDOW_OR_ENDPOINT_UNAVAILABLE")
     except Exception as exc:
         if proc is not None:
