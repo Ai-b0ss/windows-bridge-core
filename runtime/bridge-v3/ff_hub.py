@@ -215,6 +215,7 @@ class Hub:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or HubStore(self.state_dir / "hub.db")
         self.entry_authority = EntryAuthority(self.state_dir)
+        self.app_catalog = self.entry_authority.catalog
         self.entry_artifacts = EntryArtifacts(self.state_dir)
         self.policy = Policy(self.state_dir / "policy.json")
         self.vault = Vault(self.state_dir / "vault")
@@ -448,40 +449,93 @@ class Hub:
 
     def _app(self, session: dict, op: str, args: dict) -> dict:
         if op == "app_discover":
-            return apps.plan(str(args.get("app") or ""))
+            return apps.plan(str(args.get("app") or ""), catalog=self.app_catalog)
         if op == "app_open":
-            plan = apps.plan(str(args.get("app") or ""))
+            query = str(args.get("app") or "")
+            plan = apps.plan(query, catalog=self.app_catalog)
             app = plan["app"]
             if not app.get("found"):
                 raise HubError("APP_NOT_FOUND", None, **{key: app.get(key) for key in ("query", "reason", "hint")})
-            hidden_route = next((item for item in plan["routes"] if item["route"] == "hidden_desktop_uia"), None)
-            if hidden_route is None or not hidden_route.get("launch_allowed", True) or hidden_route["status"] == "unsupported":
+            entry = self.app_catalog.get(query, verify_integrity=True)
+            hidden_route = next(
+                (item for item in plan["routes"]
+                 if item["route"] in {"hidden_desktop_msix_alias", "hidden_desktop_electron_isolated", "hidden_desktop_uia"}
+                 and item.get("launch_allowed", True) and item["status"] != "unsupported"),
+                None,
+            )
+            if hidden_route is None:
                 raise HubError("APP_BACKGROUND_ROUTE_UNSUPPORTED", "this program cannot run on a private desktop",
                                app=app["name"], kind=app["kind"], routes=plan["routes"])
-            self._permit(session, "app_launch", {"app": app["executable"]}, action="app_open")
-            hidden = self._hidden_session(session, create=True)
+            self._permit(session, "app_launch",
+                         {"app": app["executable"], "aliases": [entry["app_id"]] if entry else []},
+                         action="app_open")
             if app["kind"] == "office":
-                if any(key in args for key in ("arguments", "working_directory", "window_timeout_s")):
-                    raise HubError("APP_LAUNCH_OPTIONS_UNSUPPORTED", "Office uses the fixed isolated launch route",
-                                   execution_started=False)
-                payload = {"command": "launch_app", "app": {"excel.exe": "excel", "winword.exe": "word",
-                                                            "powerpnt.exe": "powerpoint"}[app["name"].lower()]}
+                mode = "office"
+            elif app["kind"] == "msix_fulltrust_electron":
+                mode = "msix_fulltrust_electron"
+            elif hidden_route["route"] == "hidden_desktop_electron_isolated":
+                mode = "editor_native" if app["kind"] == "electron_editor" and "document_path" in args else "electron_isolated"
+            else:
+                mode = "uia"
+            disallowed = {
+                "office": ("arguments", "working_directory", "window_timeout_s", "code_link"),
+                "msix_fulltrust_electron": ("arguments", "working_directory", "document_path"),
+                "editor_native": ("arguments", "working_directory", "code_link"),
+                "electron_isolated": ("working_directory", "document_path", "code_link"),
+                "uia": ("code_link", "document_path"),
+            }[mode]
+            if any(key in args for key in disallowed):
+                raise HubError("APP_LAUNCH_OPTIONS_UNSUPPORTED", f"{mode} uses a fixed isolated launch route",
+                               execution_started=False)
+            editor_app = (entry.get("editor_app") if entry else None) or app.get("known")
+            if mode == "office":
+                office_app = {"excel.exe": "excel", "winword.exe": "word", "powerpnt.exe": "powerpoint"}[app["name"].lower()]
+                payload = {"command": "launch_app", "app": office_app}
                 if "document_path" in args:
                     payload["document_path"] = args["document_path"]
+            elif mode == "msix_fulltrust_electron":
+                payload = {"command": "launch_app", "app": "claude"}
+                if "code_link" in args:
+                    payload["code_link"] = args["code_link"]
+            elif mode == "editor_native":
+                payload = {"command": "editor.launch", "app": editor_app, "document_path": args["document_path"]}
+            elif mode == "electron_isolated":
+                payload = {"command": "launch_electron_isolated", "app": editor_app, "executable": app["executable"]}
+                if entry and entry.get("sha256"):
+                    payload["expected_executable_sha256"] = entry["sha256"]
+                for key in ("arguments", "window_timeout_s"):
+                    if key in args:
+                        payload[key] = args[key]
             else:
                 payload = {"command": "launch_exe", "executable": app["executable"]}
                 for key in ("arguments", "working_directory", "window_timeout_s"):
                     if key in args:
                         payload[key] = args[key]
-            window = self._hidden_request(hidden, payload, timeout=min(float(args.get("window_timeout_s", 15)) + 10, 60))
+            hidden = self._hidden_session(session, create=True)
+            timeout_arg = args.get("window_timeout_s", 25 if mode != "uia" else 15)
+            request_timeout = min(max(float(timeout_arg) if isinstance(timeout_arg, (int, float)) else 25.0, 1.0) + 10, 70)
+            window = self._hidden_request(hidden, payload, timeout=request_timeout)
             if type(window.get("create_time")) is not int or window["create_time"] <= 0:
                 raise HubError("APP_IDENTITY_UNAVAILABLE", "the private worker did not return process creation identity",
                                attempted=True, retry_safe=False)
             app_id = f"app-{window['pid']}-{window['create_time']}-{window['hwnd']}"
-            self.store.claim(session, "app_session", app_id, meta={"pid": window["pid"], "hwnd": window["hwnd"],
-                                                                    "create_time": window["create_time"], "executable": app["executable"],
-                                                                    "document_path":args.get('document_path')})
-            return {**window, "app_id": app_id, "route_status": hidden_route["status"], "route_note": hidden_route.get("note"),
+            self.store.claim(
+                session,
+                "app_session",
+                app_id,
+                meta={
+                    "pid": window["pid"],
+                    "hwnd": window["hwnd"],
+                    "create_time": window["create_time"],
+                    "executable": app["executable"],
+                    "document_path": args.get("document_path"),
+                    "editor_native": mode == "editor_native",
+                    "catalog_app_id": entry["app_id"] if entry else app.get("known"),
+                    "route": hidden_route["route"],
+                },
+            )
+            return {**window, "app_id": app_id, "control_route": hidden_route["route"],
+                    "route_status": hidden_route["status"], "route_note": hidden_route.get("note"),
                     "visible_to_owner": False}
         resource = self.store.require_owned(session, "app_session", str(args.get("app_id") or ""))
         hidden = self._hidden_session(session, create=False)
@@ -512,13 +566,38 @@ class Hub:
             self._permit(session, "read_diagnose", action=op)
             return self._hidden_request(hidden, {"command": "capture_window", "hwnd": args.get("hwnd", hwnd)})
         if op == 'app_document':
-            self._permit(session,'own_resources',action=op)
-            action=args.get('command')
-            if action not in {'read','replace','save'}:raise HubError('APP_DOCUMENT_COMMAND_INVALID',execution_started=False)
-            document=resource['meta'].get('document_path')
-            if not document:raise HubError('APP_DOCUMENT_NOT_BOUND',execution_started=False)
-            return self._hidden_request(hidden,{'command':'document.'+action,'hwnd':target_hwnd,'document_path':document,
-                **{k:args[k] for k in ('expected_text','replacement_text','slide_id','shape_id','shape_name') if k in args}},timeout=60)
+            self._permit(session, 'own_resources', action=op)
+            action = args.get('command')
+            if action not in {'read', 'replace', 'save'}:
+                raise HubError('APP_DOCUMENT_COMMAND_INVALID', execution_started=False)
+            document = resource['meta'].get('document_path')
+            if not document:
+                raise HubError('APP_DOCUMENT_NOT_BOUND', execution_started=False)
+            if resource['meta'].get('editor_native'):
+                if action == 'read':
+                    return self._hidden_request(hidden, {'command': 'editor.observe', 'hwnd': target_hwnd}, timeout=60)
+                if action == 'replace':
+                    return self._hidden_request(
+                        hidden,
+                        {
+                            'command': 'editor.replace_save',
+                            'hwnd': target_hwnd,
+                            **{k: args[k] for k in ('generation', 'ref', 'expected_text', 'replacement_text') if k in args},
+                        },
+                        timeout=60,
+                    )
+                raise HubError('APP_DOCUMENT_COMMAND_INVALID', 'editor.replace_save persists edits atomically',
+                               execution_started=False)
+            return self._hidden_request(
+                hidden,
+                {
+                    'command': 'document.' + action,
+                    'hwnd': target_hwnd,
+                    'document_path': document,
+                    **{k: args[k] for k in ('expected_text', 'replacement_text', 'slide_id', 'shape_id', 'shape_name') if k in args},
+                },
+                timeout=60,
+            )
         if op == "app_close":
             result = self._hidden_request(hidden, {"command": "close_app", "pid": pid,
                                                    "create_time": resource["meta"].get("create_time")})
@@ -1243,6 +1322,16 @@ def main(argv: list[str] | None = None) -> int:
     put.add_argument("--windows-credential", default=None)
     put.add_argument("--note", default="")
     secret.add_parser("revoke").add_argument("name")
+    catalog = commands.add_parser("catalog").add_subparsers(dest="catalog_command", required=True)
+    catalog.add_parser("list")
+    cat_enroll = catalog.add_parser("enroll")
+    cat_enroll.add_argument("--app-id", required=True)
+    cat_enroll.add_argument("--exe", required=True)
+    cat_enroll.add_argument("--aumid", default=None)
+    cat_enroll.add_argument("--allow-electron", action="store_true")
+    cat_enroll.add_argument("--require-signed", action="store_true")
+    cat_enroll.add_argument("--note", default="")
+    catalog.add_parser("revoke").add_argument("--app-id", required=True)
     options = parser.parse_args(argv)
     state_dir = getattr(options, "serve_state_dir", None) or options.state_dir or default_state_dir()
     split = lambda text: [item.strip() for item in text.split(",") if item.strip()]
@@ -1298,6 +1387,22 @@ def main(argv: list[str] | None = None) -> int:
                                note=options.note))
             else:
                 show({"revoked": vault.revoke(options.name)})
+        elif options.command == "catalog":
+            from ff_app_catalog import AppCatalog
+            cat = AppCatalog(state_dir)
+            if options.catalog_command == "list":
+                show(cat.list_apps())
+            elif options.catalog_command == "enroll":
+                show(cat.enroll(
+                    app_id=options.app_id,
+                    executable=options.exe,
+                    aumid=options.aumid,
+                    allow_electron=options.allow_electron,
+                    require_signed=options.require_signed,
+                    note=options.note,
+                ))
+            else:
+                show({"revoked": cat.revoke(options.app_id)})
     except (HubError, PermissionError_, SecretError) as exc:
         show({"error": exc.code, **getattr(exc, "details", {})})
         return 1

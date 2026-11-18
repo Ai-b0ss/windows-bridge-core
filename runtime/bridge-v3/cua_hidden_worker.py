@@ -104,7 +104,17 @@ def handle(args):
         ctx=launch_editor(args['__owned_editor_root'],args.get('app'),args.get('document_path'),register,
             executable=args.get('executable'),expected_executable_sha256=args.get('expected_executable_sha256'))
         hwnd=ctx['discovery']['window']['hwnd'];editors[hwnd]=ctx;ctx['generation']=0;ctx['ref']=None
-        return {'app':args['app'],'hwnd':hwnd,'pid':ctx['proc'].pid,'desktop':desktop,'route':'NATIVE_EDITOR_API','physical_input_used':False}
+        return {'app':args['app'],'hwnd':hwnd,'pid':ctx['proc'].pid,'create_time':app_tokens[ctx['proc'].pid],'desktop':desktop,'route':'NATIVE_EDITOR_API','physical_input_used':False}
+    if command=='launch_electron_isolated':
+        from cua_owned_editor_launch import launch_electron_isolated
+        ctx=launch_electron_isolated(args['__owned_editor_root'],args.get('app'),register_app,
+            executable=args.get('executable'),expected_executable_sha256=args.get('expected_executable_sha256'),
+            arguments=args.get('arguments'),window_timeout_s=args.get('window_timeout_s',25))
+        window=ctx['window'];hwnd=window['hwnd']
+        if not owns(hwnd):raise HiddenLaunchError('HIDDEN_APP_IDENTITY_CHANGED')
+        return {'app':args.get('app') or Path(ctx['executable']).name,'executable':ctx['executable'],
+                'pid':ctx['proc'].pid,'create_time':app_tokens[ctx['proc'].pid],'hwnd':hwnd,'desktop':desktop,
+                'class_name':window.get('class_name'),'route':'HIDDEN_DESKTOP_ELECTRON_ISOLATED','physical_input_used':False}
     if command in {'editor.observe','editor.replace_save'}:
         from cua_vscode_native import host_request
         import uuid

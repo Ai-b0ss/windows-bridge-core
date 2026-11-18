@@ -33,6 +33,7 @@ KNOWN: dict[str, dict[str, Any]] = {
     "powerpoint": {"exe": "POWERPNT.EXE", "kind": "office", "progid": "PowerPoint.Application"},
     "cursor":     {"exe": "Cursor.exe", "kind": "electron_editor", "cli": ["cursor", "cursor-agent"]},
     "vscode":     {"exe": "Code.exe", "kind": "electron_editor", "cli": ["code"]},
+    "antigravity":{"exe": "Antigravity.exe", "kind": "electron", "isolated_electron": True, "cli": ["agy"]},
     "notepad":    {"exe": "notepad.exe", "kind": "win32"},
     "wordpad":    {"exe": "wordpad.exe", "kind": "win32"},
     "paint":      {"exe": "mspaint.exe", "kind": "win32"},
@@ -42,7 +43,7 @@ KNOWN: dict[str, dict[str, Any]] = {
 }
 ALIASES = {"google chrome": "chrome", "edge": "msedge", "code": "vscode", "visual studio code": "vscode",
            "ms excel": "excel", "ms word": "word", "gh": "github", "mspaint": "paint",
-           "claude": "claude-desktop", "claude desktop": "claude-desktop"}
+           "agy": "antigravity", "claude": "claude-desktop", "claude desktop": "claude-desktop"}
 # Hidden-desktop UIA is proven only for what the integration tests really drove.
 PROVEN_HIDDEN = {"notepad.exe", "wordpad.exe", "mspaint.exe", "excel.exe", "winword.exe", "powerpnt.exe", "charmap.exe"}
 
@@ -82,15 +83,23 @@ def _candidates(executable: str) -> list[Path]:
     return [root / executable for root in roots if str(root)]
 
 
-def resolve(query: str) -> dict:
+def resolve(query: str, *, catalog: Any = None) -> dict:
     """Where the application is and what kind of program it is. No process is started."""
     if not isinstance(query, str) or not query.strip() or len(query) > 400:
         return {"found": False, "query": query, "reason": "APP_QUERY_INVALID"}
     text = query.strip().strip('"')
     key = ALIASES.get(text.lower(), text.lower())
     known = KNOWN.get(key) or KNOWN.get(Path(text).stem.lower())
+    enrolled_entry = None
+    if catalog is not None and not known:
+        enrolled_entry = catalog.get(text, verify_integrity=False)
+        if enrolled_entry and enrolled_entry.get("source") != "enrolled":
+            enrolled_entry = None
     path: str | None = None
-    if os.path.isabs(text):
+    if enrolled_entry and enrolled_entry.get("executable"):
+        candidate = str(enrolled_entry["executable"])
+        path = candidate if os.path.isfile(candidate) else None
+    elif os.path.isabs(text):
         path = text if os.path.isfile(text) else None
     else:
         executable = known["exe"] if known else (text if text.lower().endswith(".exe") else text + ".exe")
@@ -104,7 +113,9 @@ def resolve(query: str) -> dict:
     name = os.path.basename(path)
     known = known or next((spec for spec in KNOWN.values() if spec["exe"].lower() == name.lower()), None)
     directory = Path(path).parent
-    if known and known.get("kind")=="msix_fulltrust_electron":
+    if enrolled_entry:
+        kind = enrolled_entry.get("kind") or "win32"
+    elif known and known.get("kind")=="msix_fulltrust_electron":
         kind="msix_fulltrust_electron"
     elif "\\windowsapps\\" in path.lower():
         kind = "packaged_uwp"
@@ -116,8 +127,12 @@ def resolve(query: str) -> dict:
         kind = "chromium_embedded"
     else:
         kind = "win32"
-    return {"found": True, "query": query, "name": name, "executable": path, "kind": kind,
-            "known": key if key in KNOWN else None, "running_instances": count_processes(name)}
+    result = {"found": True, "query": query, "name": name, "executable": path, "kind": kind,
+              "known": key if key in KNOWN else None, "running_instances": count_processes(name)}
+    if enrolled_entry:
+        result["enrolled_app_id"] = enrolled_entry["app_id"]
+        result["catalog_route"] = enrolled_entry["route"]
+    return result
 
 
 class _ProcessEntry(ctypes.Structure):
@@ -178,6 +193,15 @@ def routes(app: dict) -> list[dict]:
                       "use": "Bridge computer_use hidden_request editor.launch/editor.observe/editor.replace_save",
                       "note": "an own private-profile instance; edits one text file through the editor's API. "
                               "It does not drive the editor's AI assistant and does not carry the owner's sign-in"})
+        found.append({"route": "hidden_desktop_electron_isolated", "background": True, "status": "expected",
+                      "launch_allowed": True,
+                      "use": "hub ops app_open/app_observe/app_act/app_capture/app_close",
+                      "note": "isolated user-data-dir and extensions-dir on the private desktop; UIA3 accessibility enabled"})
+    elif known.get("isolated_electron") or app.get("catalog_route") == "hidden_desktop_electron_isolated":
+        found.append({"route": "hidden_desktop_electron_isolated", "background": True, "status": "expected",
+                      "launch_allowed": True,
+                      "use": "hub ops app_open/app_observe/app_act/app_capture/app_close",
+                      "note": "isolated user-data-dir and extensions-dir on private desktop"})
     if kind == "cli_tool":
         return found or [{"route": "cli", "background": True, "status": "expected", "evidence": app["executable"],
                           "use": "Bridge start_process"}]
@@ -213,8 +237,8 @@ def routes(app: dict) -> list[dict]:
     return found
 
 
-def plan(query: str) -> dict:
-    app = resolve(query)
+def plan(query: str, *, catalog: Any = None) -> dict:
+    app = resolve(query, catalog=catalog)
     options = routes(app)
     usable = [item for item in options if item["status"] in {"proven", "expected", "partial"} and item["background"]
               and item.get("launch_allowed", True)]

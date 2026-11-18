@@ -223,7 +223,7 @@ class HiddenDesktopSession:
                     state=Path(os.environ.get('FF_BRIDGE_ROOT') or Path(os.environ['LOCALAPPDATA'])/'FF-Windows-Bridge')/'state/hidden-chrome'
                     self._chrome_profile=ManagedBrowserProfiles(state)
                     payload={**payload,'__owned_browser_root':str(self._chrome_profile.path)}
-                if payload.get('command')=='editor.launch':
+                if payload.get('command') in ('editor.launch', 'launch_electron_isolated'):
                     from cua_browser_profiles import ManagedBrowserProfiles
                     state=Path(os.environ.get('FF_BRIDGE_ROOT') or Path(os.environ['LOCALAPPDATA'])/'FFWindowsBridge')/'state/owned-editor'
                     profiles=ManagedBrowserProfiles(state)

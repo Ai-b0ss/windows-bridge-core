@@ -10,7 +10,8 @@ import urllib.error
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "runtime" / "bridge-v3"))
-from ff_agent_entry import ENTRY_PATH, SAFE_APPS, SCOPES, EntryAuthority, TOKEN
+from ff_app_catalog import AppCatalog
+from ff_agent_entry import ENTRY_PATH, SCOPES, EntryAuthority, TOKEN
 from ff_hub_store import HubError
 
 MCP_VERSIONS = ("2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05")
@@ -166,11 +167,25 @@ def main() -> int:
         command.add_argument("--task", required=True)
         command.add_argument("--ttl", type=int, required=True)
         command.add_argument("--scope", action="append", choices=sorted(SCOPES), default=None)
-        command.add_argument("--app", action="append", choices=sorted(SAFE_APPS), default=None)
+        command.add_argument("--app", action="append", default=None)
     issue.add_argument("--overwrite", action="store_true",
                        help="atomically replace an existing credential file after reissue")
     renew.add_argument("--grant-id", default=None)
     revoke.add_argument("--grant-id", required=True)
+    catalog = commands.add_parser("catalog", help="owner only: manage policy-controlled app catalog")
+    catalog_sub = catalog.add_subparsers(dest="catalog_action", required=True)
+    cat_list = catalog_sub.add_parser("list")
+    cat_enroll = catalog_sub.add_parser("enroll")
+    cat_enroll.add_argument("--app-id", required=True)
+    cat_enroll.add_argument("--exe", required=True)
+    cat_enroll.add_argument("--aumid", default=None)
+    cat_enroll.add_argument("--allow-electron", action="store_true")
+    cat_enroll.add_argument("--require-signed", action="store_true")
+    cat_enroll.add_argument("--note", default="")
+    cat_revoke = catalog_sub.add_parser("revoke")
+    cat_revoke.add_argument("--app-id", required=True)
+    for command in (cat_list, cat_enroll, cat_revoke):
+        command.add_argument("--state-dir", type=Path, required=True)
     call = commands.add_parser("call")
     stdio = commands.add_parser("mcp")
     for command in (call, stdio):
@@ -198,6 +213,16 @@ def main() -> int:
             result = {"ok": True, "result": grant}
         elif args.action == "revoke":
             result = {"ok": True, "result": {"revoked": EntryAuthority(args.state_dir).revoke(args.grant_id)}}
+        elif args.action == "catalog":
+            cat = AppCatalog(args.state_dir)
+            if args.catalog_action == "list":
+                result = {"ok": True, "result": cat.list_apps()}
+            elif args.catalog_action == "enroll":
+                result = {"ok": True, "result": cat.enroll(
+                    app_id=args.app_id, executable=args.exe, aumid=args.aumid,
+                    allow_electron=args.allow_electron, require_signed=args.require_signed, note=args.note)}
+            else:
+                result = {"ok": True, "result": {"revoked": cat.revoke(args.app_id)}}
         else:
             client = AgentClient(args.credential_file, port=args.port, endpoint_file=args.endpoint_file)
             if args.action == "mcp":

@@ -217,6 +217,9 @@ class Policy:
             if grant.get("apps") or spec["scope"] == "apps":
                 app = str(target.get("app") or "").lower()
                 names = {app, os.path.basename(app), os.path.splitext(os.path.basename(app))[0]}
+                for alias in target.get("aliases") or []:
+                    if isinstance(alias, str) and alias:
+                        names.add(alias.lower())
                 if not names & set(grant.get("apps", [])):
                     near = "APP_NOT_GRANTED"
                     continue

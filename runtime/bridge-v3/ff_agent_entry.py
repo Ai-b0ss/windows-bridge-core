@@ -13,6 +13,7 @@ import threading
 import time
 import uuid
 
+from ff_app_catalog import AppCatalog, DEFAULT_SAFE_APPS
 from ff_hub_store import HubError, _ident
 
 ENTRY_PATH = "/agent/v1"
@@ -22,7 +23,7 @@ BASE_OPS = {"capabilities", "route_plan", "session_open", "session_status",
 SCOPES = {
     "private_browser": {"private_browser"},
     "private_app": {"app_discover", "app_open", "app_windows", "app_observe",
-                    "app_find", "app_act", "app_capture", "app_close"},
+                    "app_find", "app_act", "app_capture", "app_document", "app_close"},
     "locks": {"resource_claim", "resource_list", "resource_release"},
     "artifacts": {"task_file"},
 }
@@ -30,7 +31,7 @@ BROWSER_COMMANDS = ("open", "info", "close", "tabs", "tab_open", "tab_close", "n
                     "observe", "read", "act", "upload", "download_prepare", "download_read", "screenshot")
 READ_ONLY = {"info", "tabs", "observe", "read", "download_read", "screenshot"}
 MUTATIONS = {"task_cancel", "resource_claim", "resource_release", "app_open", "app_act", "app_close"}
-SAFE_APPS = {"charmap", "word", "excel", "powerpoint"}
+SAFE_APPS = DEFAULT_SAFE_APPS
 LOCK_KINDS = {"custom", "file", "directory"}
 GRANT_ID = re.compile(r"eg-[0-9a-f]{32}\Z", re.ASCII)
 TOKEN = re.compile(r"(eg-[0-9a-f]{32})\.([A-Za-z0-9_-]{43})\Z", re.ASCII)
@@ -47,7 +48,9 @@ def _digest(value: str) -> str:
 
 class EntryAuthority:
     def __init__(self, state_dir: Path, *, clock=time.time):
-        self.path = Path(state_dir) / "entry-grants.sqlite3"
+        self.state_dir = Path(state_dir)
+        self.path = self.state_dir / "entry-grants.sqlite3"
+        self.catalog = AppCatalog(self.state_dir)
         self.clock = clock
         self._lock = threading.RLock()
 
@@ -125,9 +128,10 @@ class EntryAuthority:
                                         (("client_id", client_id), ("agent_id", agent_id), ("task_id", task_id)))
         if type(ttl) is not int or not 1 <= ttl <= 86400:
             raise HubError("ENTRY_TTL_INVALID")
-        if not set(scopes) <= SCOPES.keys() or not set(apps) <= SAFE_APPS:
+        if not set(scopes) <= SCOPES.keys():
             raise HubError("ENTRY_SCOPE_INVALID")
-        if ("private_app" in scopes) != bool(apps):
+        normalized_apps = self.catalog.validate_entry_apps(apps)
+        if ("private_app" in scopes) != bool(normalized_apps):
             raise HubError("ENTRY_APPS_REQUIRED_FOR_SCOPE")
         grant_id = "eg-" + secrets.token_hex(16)
         token = f"{grant_id}.{secrets.token_urlsafe(32)}"
@@ -153,7 +157,7 @@ class EntryAuthority:
                     previous_grant_id = existing["grant_id"]
                     db.execute("UPDATE grants SET superseded_by=? WHERE grant_id=?", (grant_id, previous_grant_id))
                 scopes_csv = ",".join(sorted(set(scopes)))
-                apps_csv = ",".join(sorted(set(apps)))
+                apps_csv = ",".join(sorted(set(normalized_apps)))
                 db.execute(
                     "INSERT INTO grants(grant_id,digest,session_seed,client_id,agent_id,task_id,"
                     "scopes,apps,issued_at,expires_at,renewed_at,revision,revoked,superseded_by)"
@@ -172,7 +176,7 @@ class EntryAuthority:
         view = {
             "grant_id": grant_id, "client_id": client_id, "agent_id": agent_id, "task_id": task_id,
             "issued_at": now, "expires_at": expires_at, "renewed_at": None, "revision": 1,
-            "scopes": sorted(set(scopes)), "apps": sorted(set(apps)),
+            "scopes": sorted(set(scopes)), "apps": sorted(set(normalized_apps)),
             "reissued": reissued, "previous_grant_id": previous_grant_id, "receipt_id": receipt_id,
         }
         return view, token
@@ -212,8 +216,8 @@ class EntryAuthority:
                 cur_scopes = set(filter(None, row["scopes"].split(",")))
                 cur_apps = set(filter(None, row["apps"].split(",")))
                 next_scopes = cur_scopes if scopes is None else set(scopes)
-                next_apps = cur_apps if apps is None else set(apps)
-                if not next_scopes <= set(SCOPES.keys()) or not next_apps <= SAFE_APPS:
+                next_apps = cur_apps if apps is None else set(self.catalog.validate_entry_apps(apps))
+                if not next_scopes <= set(SCOPES.keys()):
                     raise HubError("ENTRY_SCOPE_INVALID")
                 if not next_scopes <= cur_scopes or not next_apps <= cur_apps:
                     raise HubError("ENTRY_SCOPE_ESCALATION_DENIED", execution_started=False)
@@ -436,11 +440,23 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     command = args.get("command")
     if op == "private_browser" and (command not in BROWSER_COMMANDS or {"route", "foreground"} & args.keys()):
         raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)
-    if op in {"app_open", "app_discover"} and (set(args) != {"app"} or args["app"] not in sorted(scope["apps"])):
-        raise HubError("ENTRY_APP_DENIED", execution_started=False)
+    if op == "app_discover":
+        cid = authority.catalog.canonical_id(args.get("app")) if set(args) == {"app"} else None
+        if cid is None or cid not in scope["apps"]:
+            raise HubError("ENTRY_APP_DENIED", execution_started=False)
+        args = {"app": cid}
+    if op == "app_open":
+        allowed_open = {"app", "document_path", "arguments", "working_directory", "window_timeout_s", "code_link"}
+        cid = authority.catalog.canonical_id(args.get("app")) if "app" in args and not (set(args) - allowed_open) else None
+        if cid is None or cid not in scope["apps"]:
+            raise HubError("ENTRY_APP_DENIED", execution_started=False)
+        args = {**args, "app": cid}
     if op in {"resource_claim", "resource_release"} and args.get("kind") not in sorted(LOCK_KINDS):
         raise HubError("ENTRY_LOCK_KIND_DENIED", execution_started=False)
-    if op in MUTATIONS or (op == "private_browser" and command not in READ_ONLY) or (op == "task_file" and command == "put"):
+    if (op in MUTATIONS
+            or (op == "private_browser" and command not in READ_ONLY)
+            or (op == "task_file" and command == "put")
+            or (op == "app_document" and command != "read")):
         key = request.get("request_key")
         if not isinstance(key, str) or not key:
             raise HubError("REQUEST_KEY_REQUIRED", execution_started=False)
