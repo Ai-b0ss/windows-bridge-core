@@ -31,12 +31,11 @@ $verify = @'
 const path = require('node:path');
 const { createRequire } = require('node:module');
 const localRequire = createRequire(path.join(process.argv[1], 'package.json'));
-const expected = {
-  '@playwright/cli': '0.1.19',
-  'playwright': '1.63.0-alpha-2026-08-31',
-  'playwright-core': '1.63.0-alpha-2026-08-31',
-};
-for (const [name, version] of Object.entries(expected)) {
+const { dependencies } = localRequire('./package.json');
+for (const name of ['@playwright/cli', 'playwright', 'playwright-core']) {
+  const version = dependencies?.[name];
+  if (!/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/.test(version || ''))
+    throw new Error(`BROWSER_RUNTIME_VERSION_NOT_PINNED_${name}`);
   const actual = localRequire(name + '/package.json').version;
   if (actual !== version)
     throw new Error(`BROWSER_RUNTIME_VERSION_MISMATCH_${name}_${actual}`);

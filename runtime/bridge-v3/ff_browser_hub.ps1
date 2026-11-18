@@ -8,8 +8,8 @@ param(
     [string] $TokenPath = (Join-Path $env:LOCALAPPDATA 'FFWindowsBridge\secrets\playwright-extension-token.dpapi')
 )
 # Starts the FF Browser Session Manager with the owner's Playwright extension token.
-# The token is unsealed with DPAPI (current user) into this process tree only; it is never
-# written to disk, logged or passed on a command line.
+# The launcher passes the DPAPI-unsealed token to Node through its environment.
+# The official Playwright relay supplies it to Chrome through its extension connect URL.
 
 $ErrorActionPreference = 'Stop'
 if (-not $env:FF_BROWSER_HUB_KEY) { throw 'FF_BROWSER_HUB_KEY_REQUIRED' }
@@ -23,15 +23,17 @@ if (-not (Test-Path -LiteralPath $hub -PathType Leaf)) { throw 'BROWSER_HUB_NOT_
 # page can take the foreground. Do not launch Chrome or silently fall back to that path.
 $preflightSource = @'
 import {pathToFileURL} from 'node:url';
+import path from 'node:path';
 try {
   const {backgroundChromePreflight} = await import(pathToFileURL(process.argv[2]).href);
-  await backgroundChromePreflight({profileDirName: process.argv[3] || undefined});
+  await backgroundChromePreflight({profileBindingFile: path.join(process.argv[3], 'owner-profile-binding.json'),
+    profileDirName: process.argv[4] || undefined});
 } catch (error) {
   process.stderr.write((error.code || 'BACKGROUND_PREFLIGHT_UNAVAILABLE') + '\n');
   process.exit(3);
 }
 '@
-& $node --input-type=module -e $preflightSource -- ff-background-preflight $hub $ProfileDirName
+& $node --input-type=module -e $preflightSource -- ff-background-preflight $hub $StateDir $ProfileDirName
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Add-Type -AssemblyName System.Security

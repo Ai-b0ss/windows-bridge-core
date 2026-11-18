@@ -85,8 +85,8 @@ def _version(port):
     return json.loads(raw)
 
 
-def chrome_info(context, *, owns, window_info, desktop):
-    """Revalidate process, native desktop/window, profile and CDP endpoint on every use."""
+def chrome_info(context, *, owns, window_info, desktop, retained_socket=False):
+    """Revalidate native identity. Check listener owner before opening a new socket."""
     proc, result = context["proc"], context["result"]
     token = result["create_time"]
     if proc.poll() is not None or process_creation_token(proc.pid) != token:
@@ -104,26 +104,30 @@ def chrome_info(context, *, owns, window_info, desktop):
     port, path = _active_port(profile)
     if (port != result["cdp_port"] or path != result["browser_ws_path"]):
         raise HiddenChromeError("HIDDEN_CHROME_ENDPOINT_CHANGED")
-    listeners = [x for x in owned_tcp_listeners(proc.pid) if x.get("port") == port]
-    if (not listeners or any(x.get("address") not in {"127.0.0.1", "::1"}
-                             or x.get("pid") != proc.pid for x in listeners)):
-        raise HiddenChromeError("HIDDEN_CHROME_LISTENER_NOT_OWNED")
-    version = _version(port)
-    endpoint = urllib.parse.urlsplit(str(version.get("webSocketDebuggerUrl") or ""))
-    if (endpoint.scheme != "ws" or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
-            or endpoint.port != port or endpoint.path != path or endpoint.username
-            or endpoint.password or endpoint.query or endpoint.fragment
-            or not re.match(r"^(?:Chrome|Chromium)/", str(version.get("Browser") or ""))):
-        raise HiddenChromeError("HIDDEN_CHROME_ENDPOINT_INVALID")
+    # The verified, connected TCP socket cannot be redirected by reassigning a listener.
+    # Public discovery and every new connection still check the actual loopback listener.
+    if not retained_socket:
+        listeners = [x for x in owned_tcp_listeners(proc.pid) if x.get("port") == port]
+        if (not listeners or any(x.get("address") not in {"127.0.0.1", "::1"}
+                                 or x.get("pid") != proc.pid for x in listeners)):
+            raise HiddenChromeError("HIDDEN_CHROME_LISTENER_NOT_OWNED")
+        version = _version(port)
+        endpoint = urllib.parse.urlsplit(str(version.get("webSocketDebuggerUrl") or ""))
+        if (endpoint.scheme != "ws" or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or endpoint.port != port or endpoint.path != path or endpoint.username
+                or endpoint.password or endpoint.query or endpoint.fragment
+                or not re.match(r"^(?:Chrome|Chromium)/", str(version.get("Browser") or ""))):
+            raise HiddenChromeError("HIDDEN_CHROME_ENDPOINT_INVALID")
     if process_creation_token(proc.pid) != token or not owns(hwnd):
         raise HiddenChromeError("HIDDEN_CHROME_PROCESS_CHANGED")
     _private(desktop, hwnd)
     return dict(result)
 
 
-def verify_chrome(context, *, owns, desktop):
+def verify_chrome(context, *, owns, desktop, retained_socket=False):
     """Worker's browser.info entry point; no cached endpoint is authority by itself."""
-    return chrome_info(context, owns=owns, window_info=context["window_info"], desktop=desktop)
+    return chrome_info(context, owns=owns, window_info=context["window_info"], desktop=desktop,
+                       retained_socket=retained_socket)
 
 
 def launch_chrome(root, args, *, register, windows, owns, window_info, desktop, timeout_s=25):

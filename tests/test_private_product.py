@@ -2,14 +2,14 @@ import sys,tempfile,unittest,json
 from pathlib import Path
 from unittest.mock import Mock,patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'runtime/bridge-v3'))
-from cua_private_browser import PrivateBrowser,PrivateBrowserError,safe_name,valid_url,READ_COMMANDS
+from cua_private_browser import MAX_TABS,PrivateBrowser,PrivateBrowserError,_BrowserConnection,safe_name,valid_url,READ_COMMANDS
 from ff_hub import Hub,HubError
 
 class BrokerContracts(unittest.TestCase):
     def test_external_paths_and_unsafe_urls_fail_before_io(self):
-        for value in ('../secret','C:/secret','a\\b','..','a..b','',None):
+        for value in ('../secret','C:/secret','a\\b','..','a..b','NUL.txt','com1','file.','',None):
             with self.subTest(value=value),self.assertRaises(PrivateBrowserError):safe_name(value)
-        for value in ('file:///C:/secret','javascript:alert(1)','http://user:pass@example.com',None):
+        for value in ('file:///C:/secret','javascript:alert(1)','http://user:pass@example.com','http://[invalid',None):
             with self.subTest(value=value),self.assertRaises(PrivateBrowserError):valid_url(value)
         self.assertEqual(valid_url('https://example.com/path'),'https://example.com/path')
     def test_postcondition_and_stale_ref_denied_before_effect(self):
@@ -21,14 +21,65 @@ class BrokerContracts(unittest.TestCase):
         b.send.assert_not_called();b.evaluate.assert_not_called()
     def test_mutations_never_classified_as_reads(self):
         for command in ('act','upload','evaluate','navigate','tab_open','tab_close','download_prepare'):self.assertNotIn(command,READ_COMMANDS)
-    def test_upload_cdp_object_stays_on_its_originating_connection(self):
+    def browser_with_connection(self):
+        broker=PrivateBrowser.__new__(PrivateBrowser)
+        broker.verified_chrome=Mock(return_value={'cdp_port':1234,'browser_ws_endpoint':'ws://127.0.0.1:1234/devtools/browser/a'})
+        broker.tabs={'tab'}
+        broker.cdp=_BrowserConnection()
+        return broker
+
+    def test_target_session_and_upload_object_stay_on_the_same_socket(self):
         import cua_private_browser as module
-        broker=PrivateBrowser.__new__(PrivateBrowser);broker.info=Mock(return_value={'cdp_port':1234,'browser_ws_endpoint':'ws://127.0.0.1:1234/devtools/browser/a'})
-        broker.page=Mock(return_value={'webSocketDebuggerUrl':'ws://127.0.0.1:1234/devtools/page/b'})
-        socket=Mock();socket.recv.side_effect=[json.dumps({'id':1,'result':{'result':{'objectId':'connection-local-object'}}}),json.dumps({'id':2,'result':{}})]
+        broker=self.browser_with_connection()
+        socket=Mock()
+        socket.recv.side_effect=[json.dumps(reply) for reply in (
+            {'id':1,'result':{'sessionId':'attached-tab'}},
+            {'id':2,'sessionId':'attached-tab','result':{'result':{'objectId':'connection-local-object'}}},
+            {'id':3,'sessionId':'attached-tab','result':{}},
+            {'id':4,'sessionId':'attached-tab','result':{'result':{'value':42}}})]
         with patch.object(module,'_LocalWebSocket',return_value=socket) as constructor:
             broker.send('Runtime.evaluate',{},'tab',followup=lambda result:('DOM.setFileInputFiles',{'objectId':result['result']['objectId'],'files':['owned-fixture']}))
-        self.assertEqual(constructor.call_count,1);self.assertEqual(socket.send.call_count,2);socket.close.assert_called_once()
+            self.assertEqual(broker.evaluate('tab','42'),42)
+        self.assertEqual(constructor.call_count,1)
+        requests=[json.loads(call.args[0]) for call in socket.send.call_args_list]
+        self.assertEqual(requests[0]['params'],{'targetId':'tab','flatten':True})
+        self.assertEqual([request['sessionId'] for request in requests[1:]],['attached-tab']*3)
+        self.assertEqual(requests[2]['params']['objectId'],'connection-local-object')
+        socket.close.assert_not_called()
+
+    def test_partial_send_is_unknown_and_only_the_next_command_reattaches(self):
+        import cua_private_browser as module
+        broker=self.browser_with_connection()
+        first, second=Mock(),Mock()
+        first.recv.return_value=json.dumps({'id':1,'result':{'sessionId':'first-session'}})
+        first.send.side_effect=[None,TimeoutError('partial send')]
+        second.recv.side_effect=[json.dumps(reply) for reply in (
+            {'id':3,'result':{'sessionId':'second-session'}},
+            {'id':4,'sessionId':'second-session','result':{'result':{'value':'still owned'}}})]
+        with patch.object(module,'_LocalWebSocket',side_effect=[first,second]) as constructor:
+            with self.assertRaisesRegex(PrivateBrowserError,'PRIVATE_CDP_OUTCOME_UNKNOWN') as failure:
+                broker.evaluate('tab','effect()')
+            self.assertTrue(failure.exception.details['outcome_unknown'])
+            self.assertEqual(constructor.call_count,1)
+            self.assertEqual(broker.evaluate('tab','read()'),'still owned')
+        first.close.assert_called_once()
+        self.assertEqual(json.loads(second.send.call_args_list[0].args[0])['params']['targetId'],'tab')
+        self.assertEqual(json.loads(second.send.call_args_list[1].args[0])['params']['expression'],'read()')
+
+    def test_new_targets_cannot_exceed_limit_or_retry_an_unknown_creation(self):
+        broker=self.browser_with_connection()
+        broker.unknown_tab_open=False
+        broker.pages=Mock(return_value=[{'targetId':str(i)} for i in range(MAX_TABS)])
+        broker.send=Mock(side_effect=PrivateBrowserError('PRIVATE_CDP_OUTCOME_UNKNOWN',outcome_unknown=True))
+        with self.assertRaisesRegex(PrivateBrowserError,'PRIVATE_TAB_LIMIT'):
+            broker.dispatch({'command':'tab_open'})
+        broker.send.assert_not_called()
+        broker.pages.return_value=[]
+        with self.assertRaisesRegex(PrivateBrowserError,'PRIVATE_CDP_OUTCOME_UNKNOWN'):
+            broker.dispatch({'command':'tab_open'})
+        with self.assertRaisesRegex(PrivateBrowserError,'PRIVATE_TAB_OPEN_RECONCILIATION_REQUIRED'):
+            broker.dispatch({'command':'tab_open'})
+        broker.send.assert_called_once()
 
 class DurableProductContracts(unittest.TestCase):
     def setUp(self):

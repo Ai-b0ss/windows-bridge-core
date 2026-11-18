@@ -35,14 +35,16 @@ function findChromium(playwright) {
   const cache = process.env.PLAYWRIGHT_BROWSERS_PATH || (process.platform === 'win32'
     ? path.join(process.env.LOCALAPPDATA || '', 'ms-playwright') : path.join(os.homedir(), '.cache', 'ms-playwright'));
   try {
-    const builds = fs.readdirSync(cache).filter(name => /^chromium(_headless_shell)?-\d+$/.test(name)).sort().reverse();
-    for (const entry of [...builds.filter(name => name.includes('headless')), ...builds.filter(name => !name.includes('headless'))])
+    // Full Chromium writes the DevToolsActivePort marker for this test's profile.
+    const builds = fs.readdirSync(cache).filter(name => /^chromium-\d+$/.test(name)).sort().reverse();
+    for (const entry of builds)
       for (const inner of fs.readdirSync(path.join(cache, entry)))
-        for (const name of ['chrome-headless-shell.exe', 'headless_shell.exe', 'chrome.exe', 'chrome-headless-shell', 'headless_shell', 'chrome'])
+        for (const name of ['chrome.exe', 'chrome'])
           candidates.push(path.join(cache, entry, inner, name));
   } catch {}
   try { candidates.push(playwright.chromium.executablePath()); } catch {}
-  // Only a bundled test browser is acceptable; an installed Chrome is never selected here.
+  // Auto-discovery stays in the bundled test cache. FF_TEST_CHROMIUM can explicitly
+  // point to a known executable, which still runs headless with the disposable profile.
   return candidates.find(file => file && fs.existsSync(file) && fs.statSync(file).isFile()) || null;
 }
 
@@ -88,6 +90,7 @@ async function main() {
   if (!executable) return notRun('BUNDLED_HEADLESS_CHROMIUM_UNAVAILABLE');
 
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-hub-reattach-'));
+  if (path.dirname(path.resolve(work)) !== path.resolve(os.tmpdir())) throw new Error('TEST_WORKSPACE_OUTSIDE_TEMP');
   const children = [];
   const site = http.createServer((request, response) => {
     response.writeHead(200, {'content-type': 'text/html'});
@@ -95,11 +98,18 @@ async function main() {
   });
   await new Promise(resolve => site.listen(0, '127.0.0.1', resolve));
   const url = `http://127.0.0.1:${site.address().port}/page`;
+  let outcome;
   try {
     const profile = path.join(work, 'profile');
-    const chromium = spawn(executable, ['--headless', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
-      '--no-first-run', '--no-default-browser-check', '--disable-gpu', 'about:blank'],
-      {stdio: ['ignore', 'ignore', fs.openSync(path.join(work, 'chromium.log'), 'w')], windowsHide: true});
+    const log = fs.openSync(path.join(work, 'chromium.log'), 'w');
+    let chromium;
+    try {
+      chromium = spawn(executable, ['--headless', '--remote-debugging-port=0', `--user-data-dir=${profile}`,
+        '--no-first-run', '--no-default-browser-check', '--disable-gpu', 'about:blank'],
+        {stdio: ['ignore', 'ignore', log], windowsHide: true});
+    } finally {
+      fs.closeSync(log);
+    }
     children.push(chromium);
     let cdpPort;
     try { cdpPort = Number((await waitFile(path.join(profile, 'DevToolsActivePort'), () => chromium.exitCode === null)).split('\n')[0]); }
@@ -180,9 +190,9 @@ async function main() {
     const remaining = (await pages()).map(target => target.id).sort();
     assert.deepEqual(remaining, [...baseline, foreign.id].sort(), 'only pages the hub never owned remain, untouched');
     assert.deepEqual(JSON.parse(fs.readFileSync(ledger, 'utf8')).tabs, []);
-    finish('PASS', {real_manager_hard_kill: true, real_chromium_page_handles: true, transport: 'cdp-isolated-test-browser',
+    outcome = {real_manager_hard_kill: true, real_chromium_page_handles: true, transport: 'cdp-isolated-test-browser',
       owner_chrome_used: false, reattached_by_target_id: 2, js_state_preserved: true, foreign_same_url_page_untouched: true,
-      missing_tab_not_reopened: true, closure_proven_by_target_absence: true, ledger_empty_after_cleanup: true});
+      missing_tab_not_reopened: true, closure_proven_by_target_absence: true, ledger_empty_after_cleanup: true};
   } finally {
     for (const child of children)
       if (child.exitCode === null && child.signalCode === null) {
@@ -192,7 +202,9 @@ async function main() {
     site.close();
     site.closeAllConnections?.();
     for (let i = 0; i < 20; i++) { try { fs.rmSync(work, {recursive: true, force: true}); break; } catch { await sleep(200); } }
+    if (fs.existsSync(work)) throw new Error('TEST_WORKSPACE_CLEANUP_FAILED');
   }
+  finish('PASS', {...outcome, test_workspace_removed: true});
 }
 
 const watchdog = setTimeout(() => { finish('FAIL', {error: 'SMOKE_WATCHDOG_TIMEOUT'}, 1); process.exit(1); }, 150000);

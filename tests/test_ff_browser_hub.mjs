@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import {BrowserHub, HubError, backgroundCapability, backgroundExtensionPreflight, requireBackgroundChrome, serve} from '../runtime/bridge-v3/ff_browser_hub.mjs';
+import {BrowserHub, HubError, backgroundCapability, backgroundExtensionPreflight, extensionConnector, requireBackgroundChrome, serve} from '../runtime/bridge-v3/ff_browser_hub.mjs';
 
 test('capability probe reports a blocker without disclosing profile data or claiming live acceptance', async () => {
   const blocked = await backgroundCapability(async () => { throw new HubError('BACKGROUND_CONNECT_UNSAFE'); });
@@ -65,6 +65,45 @@ test('extension preflight selects the same profile and rejects older or unverifi
     fs.rmSync(root, {recursive: true, force: true});
   }
 });
+
+test('the official connector keeps its verified profile across relay restarts', () => withLedger(async bindingFile => {
+  const originalToken = process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+  process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = 'synthetic-unit-fixture-only';
+  const calls = [];
+  const attached = [];
+  let lastUsed = 'Profile 3';
+  let profileRoot = path.dirname(bindingFile);
+  const options = {
+    profileBindingFile: bindingFile,
+    async preflight({profileDirName}) {
+      calls.push(profileDirName);
+      return {profile_dir_name: profileDirName || lastUsed, user_data_dir: profileRoot};
+    },
+    runtimeLoader: () => ({version: '1.65.1', backgroundSupported: true, tools: {
+      async createBrowserWithInfo(_config, _client, cliOptions) {
+        attached.push(cliOptions.profileDirName);
+        return {browser: {contexts: () => [{}]}};
+      },
+    }}),
+  };
+  try {
+    const first = extensionConnector(options);
+    await first.connect();
+    lastUsed = 'Profile 9';
+    const restarted = extensionConnector(options);
+    await restarted.connect();
+    assert.deepEqual(calls, [undefined, 'Profile 3']);
+    assert.deepEqual(attached, ['Profile 3', 'Profile 3']);
+    assert.equal(restarted.describe().profile_pinned, true);
+    profileRoot = path.join(profileRoot, 'another-profile-root');
+    await assert.rejects(restarted.connect(), code('OWNER_CHROME_PROFILE_CHANGED'));
+    assert.equal(attached.length, 2);
+    assert.equal(fs.readFileSync(bindingFile, 'utf8').includes(path.dirname(bindingFile)), false);
+  } finally {
+    if (originalToken === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+    else process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = originalToken;
+  }
+}));
 
 class FakePage extends EventEmitter {
   constructor(url = 'about:blank') {
@@ -237,6 +276,24 @@ test('failed close retains ownership and reports that the page remains open', as
   assert.equal(page.isClosed(), false);
   page.closeError = null;
   assert.equal((await f.hub.tabClose({owner: 'a', tab_id: tab.tab_id})).page_closed_in_browser, true);
+  await f.hub.shutdown();
+});
+
+test('owner cleanup continues after a failed page close and preserves a foreign page', async () => {
+  const f = fixture();
+  const first = await f.hub.tabOpen({owner: 'a'});
+  const second = await f.hub.tabOpen({owner: 'a'});
+  const other = await f.hub.tabOpen({owner: 'b'});
+  const [failed, cleaned, foreign] = f.connections[0].context.created;
+  failed.closeError = new Error('refused');
+  const result = await f.hub.tabCloseOwner({owner: 'a', forget_unconfirmed: true});
+  assert.deepEqual(result.unconfirmed, [first.tab_id]);
+  assert.equal(result.closed, 1);
+  assert.equal(result.tabs.find(tab => tab.tab_id === second.tab_id).page_closed_in_browser, true);
+  assert.equal(cleaned.isClosed(), true);
+  assert.equal(foreign.isClosed(), false);
+  assert.equal(f.hub.tabList({owner: 'b'}).tabs[0].tab_id, other.tab_id);
+  failed.closeError = null;
   await f.hub.shutdown();
 });
 
@@ -561,6 +618,29 @@ test('a recorded tab that is not found is neither adopted by address nor reopene
   assert.equal(sweep.closed, 0);
   assert.equal(second.hub.tabList({owner: 'a'}).tabs.length, 0);
   assert.deepEqual(JSON.parse(fs.readFileSync(ledger, 'utf8')).tabs, []);
+}));
+
+test('a lost create reply leaves a durable unknown record and never opens a replacement', () => withLedger(async ledger => {
+  const first = fixture({ledgerFile: ledger});
+  await first.hub.connect();
+  let physicalOpens = 0;
+  first.connections[0].context.newPage = async () => {
+    physicalOpens++;
+    assert.equal(JSON.parse(fs.readFileSync(ledger, 'utf8')).tabs[0].open_uncertain, true);
+    throw new Error('relay reply lost after create');
+  };
+  await assert.rejects(first.hub.tabOpen({owner: 'a'}), error =>
+    code('TAB_OPEN_OUTCOME_UNKNOWN')(error) && error.details.outcome_unknown && error.details.cleanup_failed);
+  await assert.rejects(first.hub.tabOpen({owner: 'a'}), code('TAB_OPEN_RECONCILIATION_REQUIRED'));
+  assert.equal(physicalOpens, 1);
+  const tab = first.hub.tabList({owner: 'a'}).tabs[0];
+  const restarted = fixture({ledgerFile: ledger});
+  assert.equal(restarted.hub.tabList({owner: 'a'}).tabs[0].tab_id, tab.tab_id);
+  await assert.rejects(restarted.hub.tabOpen({owner: 'a'}), code('TAB_OPEN_RECONCILIATION_REQUIRED'));
+  const sweep = await restarted.hub.tabCloseOwner({owner: 'a', forget_unconfirmed: true});
+  assert.deepEqual(sweep.unconfirmed, [tab.tab_id]);
+  assert.equal(sweep.tabs[0].record_dropped, false);
+  assert.equal(restarted.connects, 0);
 }));
 
 test('closure is confirmed by absence only when the transport lists every browser target', () => withLedger(async ledger => {

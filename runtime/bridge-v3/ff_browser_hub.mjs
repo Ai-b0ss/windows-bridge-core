@@ -95,17 +95,47 @@ export function backgroundExtensionPreflight({userDataDir, profileDirName} = {})
   throw new HubError('BACKGROUND_EXTENSION_UNVERIFIED', 'no verified Playwright extension in the selected profile');
 }
 
-export async function backgroundChromePreflight({profileDirName} = {}) {
+function readProfileBinding(file) {
+  if (!file) return null;
+  try {
+    const saved = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (saved?.version !== 1 || !/^(Default|Profile [0-9]+)$/.test(saved.profile) || !/^[a-f0-9]{64}$/.test(saved.root_hash))
+      throw new Error('invalid binding');
+    return saved;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    throw new HubError('OWNER_CHROME_PROFILE_BINDING_INVALID', 'the stored authorized profile cannot be verified');
+  }
+}
+
+function verifiedProfileBinding(verified, requested, previous) {
+  if (!/^(Default|Profile [0-9]+)$/.test(verified?.profile_dir_name) || typeof verified?.user_data_dir !== 'string')
+    throw new HubError('BACKGROUND_EXTENSION_UNVERIFIED');
+  const root = path.resolve(verified.user_data_dir);
+  const rootHash = crypto.createHash('sha256').update(process.platform === 'win32' ? root.toLowerCase() : root).digest('hex');
+  if ((requested && verified.profile_dir_name !== requested) ||
+      (previous && (previous.profile !== verified.profile_dir_name || previous.root_hash !== rootHash)))
+    throw new HubError('OWNER_CHROME_PROFILE_CHANGED', 'the verified Chrome profile differs from the persistent binding');
+  return {version: 1, profile: verified.profile_dir_name, root_hash: rootHash};
+}
+
+export async function backgroundChromePreflight({profileDirName, profileBindingFile} = {}) {
   if (process.platform !== 'win32') throw new HubError('BACKGROUND_PREFLIGHT_UNAVAILABLE');
-  let versions;
+  let browsers;
   try {
     const {stdout} = await execFileAsync('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-Command',
-      "$ErrorActionPreference='Stop'; $versions = @(Get-Process chrome -ErrorAction SilentlyContinue | ForEach-Object { try { $_.MainModule.FileVersionInfo.ProductVersion } catch {} } | Where-Object { $_ } | Sort-Object -Unique); ConvertTo-Json -Compress -InputObject $versions"],
+      "$ErrorActionPreference='Stop'; $browsers = @(Get-Process chrome -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } | ForEach-Object { try { $img = $_.MainModule; if ($img.FileName) { [pscustomobject]@{ version=$img.FileVersionInfo.ProductVersion; executable=$img.FileName } } } catch {} }); ConvertTo-Json -Compress -InputObject $browsers"],
     {windowsHide: true, timeout: 10000, maxBuffer: 65536});
-    versions = JSON.parse(stdout);
+    browsers = JSON.parse(stdout);
+    if (!Array.isArray(browsers)) throw new Error('invalid Chrome inventory');
   } catch { throw new HubError('BACKGROUND_PREFLIGHT_UNAVAILABLE', 'cannot verify a background-safe existing Chrome'); }
-  const chrome = requireBackgroundChrome(versions);
-  return {...chrome, ...backgroundExtensionPreflight({profileDirName})};
+  const chrome = requireBackgroundChrome([...new Set(browsers.map(item => item.version))]);
+  const executables = new Set(browsers.map(item => path.resolve(item.executable).toLowerCase()));
+  if (executables.size !== 1) throw new HubError('BACKGROUND_CHROME_EXECUTABLE_AMBIGUOUS');
+  const binding = readProfileBinding(profileBindingFile);
+  const profile = backgroundExtensionPreflight({profileDirName: binding?.profile || profileDirName});
+  verifiedProfileBinding(profile, profileDirName, binding);
+  return {...chrome, ...profile, executable_path: browsers[0].executable};
 }
 
 // Public capability probe: no connection, token read, profile path or profile content
@@ -143,21 +173,40 @@ export function loadPlaywright(root) {
 
 // The default connector: the official extension transport. Tests inject their own.
 export function extensionConnector({playwrightRoot, profileDirName, clientName = 'FF Bridge agents', background = true,
-  preflight = backgroundChromePreflight}) {
-  const runtime = loadPlaywright(playwrightRoot);
+  preflight = backgroundChromePreflight, runtimeLoader = loadPlaywright, profileBindingFile = null}) {
+  const runtime = runtimeLoader(playwrightRoot);
   if (background && !runtime.backgroundSupported)
     throw new HubError('BACKGROUND_MODE_UNSUPPORTED', 'this Playwright cannot keep owner Chrome tabs in the background',
       {playwright: runtime.version, required: MIN_BACKGROUND_PLAYWRIGHT.join('.')});
+  let binding = null;
   return {
     describe: () => ({transport: 'playwright-extension', playwright: runtime.version, background,
-      owner_profile: profileDirName || 'last-used', isolated_profile: false}),
+      owner_profile: binding?.profile || profileDirName || 'last-used', profile_pinned: Boolean(binding), isolated_profile: false}),
     async connect() {
       if (!process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN)
         throw new HubError('EXTENSION_TOKEN_UNAVAILABLE', 'the protected extension token was not injected into this process');
-      const verified = background ? await preflight({profileDirName}) : null;
+      let verified = null;
+      if (background) {
+        binding ??= readProfileBinding(profileBindingFile);
+        const requested = binding?.profile || profileDirName;
+        verified = await preflight({profileDirName: requested});
+        const chosen = verifiedProfileBinding(verified, profileDirName || requested, binding);
+        if (!binding) {
+          if (profileBindingFile) {
+            try {
+              fs.writeFileSync(`${profileBindingFile}.tmp`, JSON.stringify(chosen));
+              fs.renameSync(`${profileBindingFile}.tmp`, profileBindingFile);
+            } catch {
+              throw new HubError('OWNER_CHROME_PROFILE_BINDING_WRITE_FAILED', 'failed to keep the verified Chrome profile binding');
+            }
+          }
+          binding = chosen;
+        }
+      }
       const config = {extension: true, background, tabGroup: true,
         browser: {browserName: 'chromium', launchOptions: {channel: 'chrome'}, contextOptions: {}}};
       const cliOptions = {extension: true, browser: 'chrome'};
+      if (verified?.executable_path) cliOptions.executablePath = verified.executable_path;
       if (verified?.user_data_dir) config.browser.userDataDir = verified.user_data_dir;
       if (verified?.profile_dir_name || profileDirName) cliOptions.profileDirName = verified?.profile_dir_name || profileDirName;
       const info = await runtime.tools.createBrowserWithInfo(config, {cwd: process.cwd(), clientName},
@@ -265,7 +314,7 @@ export class BrowserHub {
         url: typeof item.url === 'string' ? item.url : 'about:blank', title: '', created_at: Number(item.created_at) || 0,
         last_used_at: Number(item.created_at) || 0, opened_by: typeof item.opened_by === 'string' ? item.opened_by : null,
         target_id: typeof item.target_id === 'string' && /^[0-9A-Za-z-]{8,64}$/.test(item.target_id) ? item.target_id : null,
-        orphaned: true, lost_at: this.clock(), lane: Promise.resolve()});
+        open_uncertain: item.open_uncertain === true, orphaned: true, lost_at: this.clock(), lane: Promise.resolve()});
     }
   }
 
@@ -278,7 +327,8 @@ export class BrowserHub {
   _persist() {
     if (!this.ledgerFile) return;
     const tabs = this._heldTabs().map(tab => ({tab_id: tab.id, owner: tab.owner, target_id: tab.target_id ?? null,
-      url: tab.url, created_at: tab.created_at, opened_by: tab.opened_by}));
+      url: tab.url, created_at: tab.created_at, opened_by: tab.opened_by,
+      ...(tab.open_uncertain ? {open_uncertain: true} : {})}));
     const body = JSON.stringify({version: 1, tabs});
     if (body === this._ledgerBody) return;
     try {
@@ -369,7 +419,7 @@ export class BrowserHub {
           t.id === wantedId && t.type === 'page' && Number.isSafeInteger(t.tabId));
         if (matches.length !== 1 || matches[0].attached) return false;
         const source = await chrome.tabs.get(matches[0].tabId);
-        if (source.windowId !== seedTab.windowId || source.id === seedTab.id ||
+        if (source.windowId !== seedTab.windowId || source.id === seedTab.id || source.active !== false ||
             source.groupId === seedTab.groupId ||
             !/^(https?:|about:blank)/.test(source.url || ''))
           return false;
@@ -490,6 +540,7 @@ export class BrowserHub {
       tab.lost_at = this.clock();
       tab.page = null;
     }
+    this._persist();
   }
 
   _onUnclaimedPage(connection, page) {
@@ -520,7 +571,7 @@ export class BrowserHub {
     return {tab_id: tab.id, owner: tab.owner, state: tab.state, url: tab.url, title: tab.title,
       created_at: tab.created_at, last_used_at: tab.last_used_at, opened_by: tab.opened_by,
       restored_from: tab.restored_from ?? null, connection_generation: tab.generation,
-      durable_identity: Boolean(tab.target_id), orphaned: tab.orphaned === true};
+      durable_identity: Boolean(tab.target_id), orphaned: tab.orphaned === true, open_uncertain: tab.open_uncertain === true};
   }
 
   _wire(tab, page) {
@@ -543,8 +594,12 @@ export class BrowserHub {
   }
 
   _register(owner, generation, extra = {}) {
+    const at = this.clock();
+    for (const [id, previous] of this.tabs) {
+      if (previous.state === 'closed' && at - (previous.closed_by_browser_at || 0) >= 5000) this.tabs.delete(id);
+    }
     const tab = {id: newId('tab'), owner, generation, state: 'opening', url: 'about:blank', title: '',
-      created_at: this.clock(), last_used_at: this.clock(), opened_by: null, lane: Promise.resolve(), ...extra};
+      created_at: at, last_used_at: at, opened_by: null, lane: Promise.resolve(), ...extra};
     this.tabs.set(tab.id, tab);
     return tab;
   }
@@ -555,6 +610,9 @@ export class BrowserHub {
     if (this.stopping) throw new HubError('HUB_SHUTDOWN');
     if (typeof owner !== 'string' || !owner) throw new HubError('OWNER_REQUIRED');
     if (url) BrowserHub.checkUrl(url);
+    if (this._ownerTabs(owner).some(tab => tab.state === 'lost' && tab.open_uncertain))
+      throw new HubError('TAB_OPEN_RECONCILIATION_REQUIRED', 'the outcome of an earlier tab open is unknown',
+        {attempted: false, retry_safe: false, automatic_replay: false});
     if (this._ownerTabs(owner).filter(tab => tab !== replaces).length >= this.limits.maxTabsPerOwner)
       throw new HubError('TAB_LIMIT_OWNER', 'this agent already holds the maximum number of tabs', {limit: this.limits.maxTabsPerOwner});
     if (this._heldTabs().filter(tab => tab !== replaces).length >= this.limits.maxTabs)
@@ -562,25 +620,42 @@ export class BrowserHub {
     // Reserve capacity synchronously, before connect/newPage can yield to another agent.
     const tab = this._register(owner, 0, extra);
     const opening = (async () => {
+      let dispatched = false;
       try {
         const connection = await this._ensureConnected();
         if (this.stopping) throw new HubError('HUB_SHUTDOWN');
         tab.generation = connection.generation;
+        tab.open_uncertain = true;
+        this._persist();
+        if (this.ledgerError) throw new HubError('TAB_LEDGER_WRITE_FAILED', 'tab creation was withheld', {attempted: false});
+        dispatched = true;
         const page = await connection.context.newPage();
         this._wire(tab, page);
         await this._identify(tab, connection, page);
         if (this.connection !== connection || !connection.browser.isConnected())
           throw new HubError('TAB_LOST', 'browser connection dropped while opening the tab', {tab_id: tab.id, retry_safe: false});
+        tab.open_uncertain = false;
+        this._persist();
+        if (this.ledgerError) throw new HubError('TAB_LEDGER_WRITE_FAILED', 'tab identity was not committed', {attempted: true});
         if (this.stopping) throw new HubError('HUB_SHUTDOWN');
         if (url) await this._goto(tab, url, 30000);
         return tab;
       } catch (error) {
+        if (dispatched && !tab.page && tab.state !== 'closed') {
+          tab.state = 'lost';
+          tab.lost_at = this.clock();
+          tab.open_uncertain = true;
+          this._persist();
+          throw new HubError('TAB_OPEN_OUTCOME_UNKNOWN', 'a tab may have opened without returning its handle',
+            {tab_id: tab.id, attempted: true, outcome_unknown: true, cleanup_failed: true, retry_safe: false});
+        }
         if (tab.page && !tab.page.isClosed()) await tab.page.close().catch(() => {});
         if (tab.page && !tab.page.isClosed())
           throw new HubError(error.code || 'TAB_OPEN_FAILED', brief(error),
             {...(error.details || {}), tab_id: tab.id, cleanup_failed: true, retry_safe: false});
         tab.state = 'closed';
         tab.page = null;
+        this.tabs.delete(tab.id);
         this._persist();
         throw error;
       }
@@ -719,14 +794,16 @@ export class BrowserHub {
       if (!page) {
         if (await this._targetGone(tab)) {
           tab.state = 'closed';
+          this.tabs.delete(tab.id);
           this._persist();
           return {tab_id: tab.id, closed: true, page_closed_in_browser: true, was_lost: true, evidence: 'target_absent_in_browser'};
         }
         // The owning session is ending: its record is dropped so a tab that can no longer be
         // reached does not hold quota forever. The caller reports and audits it as unconfirmed.
-        if (forget_unconfirmed === true) { tab.state = 'closed'; this._persist(); }
+        const canForget = forget_unconfirmed === true && !tab.open_uncertain;
+        if (canForget) { tab.state = 'closed'; this.tabs.delete(tab.id); this._persist(); }
         return {tab_id: tab.id, closed: false, page_closed_in_browser: false, was_lost: true,
-          record_dropped: forget_unconfirmed === true, reason: 'TAB_CLEANUP_UNCONFIRMED'};
+          record_dropped: canForget, reason: 'TAB_CLEANUP_UNCONFIRMED'};
       }
       if (page && !page.isClosed()) {
         try { await page.close(); }
@@ -738,6 +815,7 @@ export class BrowserHub {
       }
       tab.state = 'closed';
       tab.page = null;
+      this.tabs.delete(tab.id);
       this._persist();
       return {tab_id: tab.id, closed: true, page_closed_in_browser: Boolean(page?.isClosed()), was_lost: !page,
         ...(reattached ? {reattached: true, evidence: 'cdp_target_id'} : {})};
@@ -746,7 +824,13 @@ export class BrowserHub {
 
   async tabCloseOwner({owner, forget_unconfirmed}) {
     const results = [];
-    for (const tab of this._ownerTabs(owner)) results.push(await this.tabClose({owner, tab_id: tab.id, forget_unconfirmed}));
+    for (const tab of this._ownerTabs(owner)) {
+      try {
+        results.push(await this.tabClose({owner, tab_id: tab.id, forget_unconfirmed}));
+      } catch (error) {
+        results.push({tab_id: tab.id, closed: false, page_closed_in_browser: false, reason: error?.code || 'TAB_CLOSE_FAILED'});
+      }
+    }
     return {closed: results.filter(tab => tab.page_closed_in_browser).length, tabs: results,
       unconfirmed: results.filter(tab => !tab.page_closed_in_browser).map(tab => tab.tab_id)};
   }
@@ -995,16 +1079,21 @@ function option(name, fallback = null) {
 }
 
 async function main() {
+  const stateDir = path.resolve(option('state-dir', path.join(here, 'state', 'browser-hub')));
+  const profileDirName = option('profile', null);
+  const profileBindingFile = path.join(stateDir, 'owner-profile-binding.json');
+  const playwrightRoot = option('playwright-root', process.env.FF_PLAYWRIGHT_ROOT || here);
   if (process.argv.includes('--preflight')) {
-    process.stdout.write(JSON.stringify(await backgroundCapability()) + '\n');
+    const capability = await backgroundCapability(() => backgroundChromePreflight({profileDirName, profileBindingFile}),
+      () => loadPlaywright(playwrightRoot));
+    process.stdout.write(JSON.stringify(capability) + '\n');
     return;
   }
   const key = process.env.FF_BROWSER_HUB_KEY || '';
   delete process.env.FF_BROWSER_HUB_KEY;
-  const stateDir = path.resolve(option('state-dir', path.join(here, 'state', 'browser-hub')));
   fs.mkdirSync(stateDir, {recursive: true});
-  const connector = extensionConnector({playwrightRoot: option('playwright-root', here),
-    profileDirName: option('profile', null), background: option('background', 'true') !== 'false'});
+  const connector = extensionConnector({playwrightRoot, profileDirName, profileBindingFile,
+    background: option('background', 'true') !== 'false'});
   const hub = new BrowserHub(connector, {artifactDir: path.join(stateDir, 'screenshots'), ledgerFile: path.join(stateDir, 'tab-ledger.json'),
     maxTabsPerOwner: Number(option('max-tabs-per-owner', 8)), maxTabs: Number(option('max-tabs', 32))});
   const endpointFile = option('endpoint-file', path.join(stateDir, 'endpoint.json'));

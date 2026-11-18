@@ -25,8 +25,28 @@ class _LocalWebSocket:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
             raise RuntimeError("LOCAL_WS_URL_REQUIRED")
+        self._deadline = time.monotonic() + timeout
+        self._buffer = bytearray()
         self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        try:
+            self._handshake(parsed)
+        except BaseException:
+            self.close()
+            raise
+        self.set_deadline(None)
         self.sock.settimeout(timeout)
+
+    def set_deadline(self, deadline: float | None) -> None:
+        self._deadline = deadline
+
+    def _apply_deadline(self) -> None:
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("WS_DEADLINE_EXCEEDED")
+            self.sock.settimeout(remaining)
+
+    def _handshake(self, parsed) -> None:
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         path = parsed.path or "/"
         if parsed.query:
@@ -36,25 +56,30 @@ class _LocalWebSocket:
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )
+        self._apply_deadline()
         self.sock.sendall(request.encode("ascii"))
         header = bytearray()
         while b"\r\n\r\n" not in header and len(header) < 16384:
+            self._apply_deadline()
             chunk = self.sock.recv(4096)
             if not chunk:
                 break
             header.extend(chunk)
-        text = header.decode("latin1", "replace")
-        if not text.startswith("HTTP/1.1 101"):
-            self.sock.close()
+        headers, separator, rest = header.partition(b"\r\n\r\n")
+        text = headers.decode("latin1", "replace")
+        if not separator or len(headers) >= 16384 or not text.startswith("HTTP/1.1 101 "):
             raise RuntimeError("WS_HANDSHAKE_FAILED")
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
-        if f"sec-websocket-accept: {expected}".lower() not in text.lower():
-            self.sock.close()
+        fields = dict(line.split(":", 1) for line in text.split("\r\n")[1:] if ":" in line)
+        if not any(name.casefold() == "sec-websocket-accept" and value.strip() == expected for name, value in fields.items()):
             raise RuntimeError("WS_ACCEPT_MISMATCH")
+        self._buffer.extend(rest)
 
     def _recv_exact(self, n: int) -> bytes:
-        out = bytearray()
+        out = self._buffer[:n]
+        del self._buffer[:n]
         while len(out) < n:
+            self._apply_deadline()
             chunk = self.sock.recv(n - len(out))
             if not chunk:
                 raise EOFError("WS_EOF")
@@ -75,6 +100,7 @@ class _LocalWebSocket:
             head.append(0x80 | 127)
             head.extend(struct.pack("!Q", n))
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self._apply_deadline()
         self.sock.sendall(bytes(head) + mask + masked)
 
     def recv(self) -> str:
@@ -105,6 +131,7 @@ class _LocalWebSocket:
     def _send_control(self, opcode: int, payload: bytes) -> None:
         mask = os.urandom(4)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self._apply_deadline()
         self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + masked)
 
     def close(self) -> None:
