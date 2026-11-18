@@ -130,20 +130,46 @@ def _mcp_reply(request_id, *, result=None, error=None) -> None:
     sys.stdout.buffer.flush()
 
 
+def _write_credential_file(path: Path, token: str, *, overwrite: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not overwrite:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as credential:
+            credential.write(token + "\n")
+            credential.flush()
+            os.fsync(credential.fileno())
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="ascii", newline="\n") as credential:
+            credential.write(token + "\n")
+            credential.flush()
+            os.fsync(credential.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="action", required=True)
     issue = commands.add_parser("issue", help="owner only: create a task-scoped bearer")
+    renew = commands.add_parser("renew", help="owner only: rotate/extend a task-scoped bearer without changing task_id")
     revoke = commands.add_parser("revoke", help="owner only: end a grant")
-    for command in (issue, revoke):
+    for command in (issue, renew, revoke):
         command.add_argument("--state-dir", type=Path, required=True)
-    issue.add_argument("--credential-file", type=Path, required=True)
-    issue.add_argument("--client", required=True)
-    issue.add_argument("--agent", required=True)
-    issue.add_argument("--task", required=True)
-    issue.add_argument("--ttl", type=int, required=True)
-    issue.add_argument("--scope", action="append", choices=sorted(SCOPES), default=[])
-    issue.add_argument("--app", action="append", choices=sorted(SAFE_APPS), default=[])
+    for command in (issue, renew):
+        command.add_argument("--credential-file", type=Path, required=True)
+        command.add_argument("--client", required=True)
+        command.add_argument("--agent", required=True)
+        command.add_argument("--task", required=True)
+        command.add_argument("--ttl", type=int, required=True)
+        command.add_argument("--scope", action="append", choices=sorted(SCOPES), default=None)
+        command.add_argument("--app", action="append", choices=sorted(SAFE_APPS), default=None)
+    issue.add_argument("--overwrite", action="store_true",
+                       help="atomically replace an existing credential file after reissue")
+    renew.add_argument("--grant-id", default=None)
     revoke.add_argument("--grant-id", required=True)
     call = commands.add_parser("call")
     stdio = commands.add_parser("mcp")
@@ -159,14 +185,16 @@ def main() -> int:
     args = parser.parse_args()
     try:
         if args.action == "issue":
-            fd = os.open(args.credential_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "w", encoding="ascii") as credential:
-                grant, token = EntryAuthority(args.state_dir).issue(
-                    client_id=args.client, agent_id=args.agent, task_id=args.task,
-                    scopes=args.scope, apps=args.app, ttl=args.ttl)
-                credential.write(token + "\n")
-                credential.flush()
-                os.fsync(credential.fileno())
+            grant, token = EntryAuthority(args.state_dir).issue(
+                client_id=args.client, agent_id=args.agent, task_id=args.task,
+                scopes=args.scope or [], apps=args.app or [], ttl=args.ttl)
+            _write_credential_file(args.credential_file, token, overwrite=args.overwrite)
+            result = {"ok": True, "result": grant}
+        elif args.action == "renew":
+            grant, token = EntryAuthority(args.state_dir).renew(
+                client_id=args.client, agent_id=args.agent, task_id=args.task,
+                ttl=args.ttl, grant_id=args.grant_id, scopes=args.scope, apps=args.app)
+            _write_credential_file(args.credential_file, token, overwrite=True)
             result = {"ok": True, "result": grant}
         elif args.action == "revoke":
             result = {"ok": True, "result": {"revoked": EntryAuthority(args.state_dir).revoke(args.grant_id)}}

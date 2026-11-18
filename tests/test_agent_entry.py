@@ -164,3 +164,131 @@ class AgentEntryTest(unittest.TestCase):
             with self.assertRaisesRegex(HubError, "ENTRY_UNAUTHORIZED"):
                 queued.result(timeout=3)
         self.assertEqual(self.hub.store.resources(session_id=other), [])
+
+    def test_qa003_grant_renewal_preserves_identity_and_session_and_rejects_escalation(self):
+        # Active grant: claim a lock, then renew and rotate token without changing task_id or session_id.
+        sid = self.call("session_open")["session_id"]
+        self.call("resource_claim", session=sid, args={"kind": "custom", "key": "steady-lock"}, key="lock-0001")
+        self.clock += 20
+        renewed, rotated_token = self.authority.renew(
+            client_id="client-one", agent_id="shared-agent", task_id="one", ttl=60
+        )
+        self.assertEqual(renewed["grant_id"], self.grant["grant_id"])
+        self.assertEqual(renewed["revision"], 2)
+        self.assertEqual(renewed["expires_at"], self.clock + 60)
+        self.assertNotEqual(rotated_token, self.token)
+        # Old token must be rejected immediately; rotated token keeps the live session and held lock.
+        self.expect("ENTRY_UNAUTHORIZED", "session_status", token=self.token, session=sid)
+        reused = self.call("session_open", token=rotated_token)
+        self.assertTrue(reused["reused"])
+        self.assertEqual(reused["session_id"], sid)
+        resources = self.call("resource_list", token=rotated_token, session=sid)["resources"]
+        self.assertEqual([r["key"] for r in resources], ["steady-lock"])
+        # Scope escalation via renew is forbidden; narrowing scopes succeeds.
+        with self.assertRaisesRegex(HubError, "ENTRY_SCOPE_ESCALATION_DENIED"):
+            self.authority.renew(client_id="client-one", agent_id="shared-agent", task_id="one",
+                                 ttl=60, scopes=["locks", "artifacts"])
+        with self.assertRaisesRegex(HubError, "ENTRY_GRANT_OWNER_MISMATCH"):
+            self.authority.renew(client_id="other-client", agent_id="shared-agent", task_id="one", ttl=60)
+        # Expired grant (both before and after Hub.maintain cleanup) can be renewed with same agent_id/task_id.
+        self.clock += 61
+        self.expect("ENTRY_UNAUTHORIZED", "session_status", token=rotated_token, session=sid)
+        renewed_after_exp, token3 = self.authority.renew(
+            client_id="client-one", agent_id="shared-agent", task_id="one", ttl=120
+        )
+        self.assertEqual(renewed_after_exp["grant_id"], self.grant["grant_id"])
+        self.assertEqual(renewed_after_exp["revision"], 3)
+        self.assertEqual(self.call("session_open", token=token3)["session_id"], sid)
+        # Expire again and let maintain() clean up; renew still allows opening fresh active session.
+        self.clock += 121
+        self.assertEqual(self.hub.maintain()["expired_sessions"], 1)
+        self.assertEqual(self.hub.store.resources(session_id=sid), [])
+        _, token4 = self.authority.renew(client_id="client-one", agent_id="shared-agent", task_id="one", ttl=90)
+        sid_after_maintain = self.call("session_open", token=token4)["session_id"]
+        self.assertNotEqual(sid_after_maintain, sid)
+        # Revoked grant CANNOT be renewed, but CAN be re-issued with the same agent_id/task_id and a new grant_id.
+        self.assertTrue(self.authority.revoke(self.grant["grant_id"]))
+        with self.assertRaisesRegex(HubError, "ENTRY_GRANT_REVOKED"):
+            self.authority.renew(client_id="client-one", agent_id="shared-agent", task_id="one", ttl=60)
+        reissued, token5 = self.enroll("one")
+        self.assertTrue(reissued["reissued"])
+        self.assertEqual(reissued["previous_grant_id"], self.grant["grant_id"])
+        self.assertNotEqual(reissued["grant_id"], self.grant["grant_id"])
+        self.expect("ENTRY_UNAUTHORIZED", "session_status", token=token4, session=sid_after_maintain)
+        sid_reissued = self.call("session_open", token=token5)["session_id"]
+        self.assertNotEqual(sid_reissued, sid_after_maintain)
+        self.assertEqual(self.call("session_status", token=token5, session=sid_reissued)["task_id"], "one")
+        actions = [row["action"] for row in self.authority.receipts(agent_id="shared-agent", task_id="one")]
+        self.assertEqual(actions, ["issue", "renew", "renew", "renew", "revoke", "reissue"])
+
+    def test_qa003_concurrent_renew_and_authorize_is_atomic(self):
+        from concurrent.futures import as_completed
+        tokens = [self.token]
+        lock = __import__("threading").Lock()
+
+        def rotate(_idx):
+            _, tok = self.authority.renew(client_id="client-one", agent_id="shared-agent", task_id="one", ttl=60)
+            with lock:
+                tokens.append(tok)
+            return tok
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futs = [pool.submit(rotate, i) for i in range(12)]
+            for f in as_completed(futs):
+                f.result()
+        valid_count = 0
+        for tok in tokens:
+            try:
+                self.authority.authorize(f"Bearer {tok}")
+                valid_count += 1
+            except HubError as exc:
+                self.assertEqual(exc.code, "ENTRY_UNAUTHORIZED")
+        self.assertEqual(valid_count, 1)
+
+    def test_qa003_legacy_unique_table_migrates_cleanly(self):
+        legacy_dir = Path(self.temp.name) / "legacy-db"
+        legacy_dir.mkdir()
+        db_path = legacy_dir / "entry-grants.sqlite3"
+        with closing(sqlite3.connect(db_path)) as db, db:
+            db.execute("""CREATE TABLE grants (
+                grant_id TEXT PRIMARY KEY, digest TEXT NOT NULL, client_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL, task_id TEXT NOT NULL, scopes TEXT NOT NULL, apps TEXT NOT NULL,
+                expires_at REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, UNIQUE(agent_id, task_id))""")
+            db.execute("INSERT INTO grants VALUES ('eg-00000000000000000000000000000001', 'deadbeef', 'c', 'a', 't', 'locks', '', 500.0, 0)")
+        from ff_agent_entry import EntryAuthority
+        auth = EntryAuthority(legacy_dir, clock=lambda: 1000.0)
+        reissued, token = auth.issue(client_id="c", agent_id="a", task_id="t", scopes=["locks"], apps=[], ttl=60)
+        self.assertTrue(reissued["reissued"])
+        self.assertEqual(auth.authorize(f"Bearer {token}")["task_id"], "t")
+
+    def test_qa003_cli_renew_and_reissue_overwrite(self):
+        import json, subprocess
+        cli = Path(__file__).resolve().parents[1] / "tools" / "agent_entry.py"
+        state = Path(self.temp.name) / "cli-state"
+        cred = Path(self.temp.name) / "cli.credential"
+        base = [sys.executable, str(cli)]
+        out1 = json.loads(subprocess.check_output(
+            [*base, "issue", "--state-dir", str(state), "--credential-file", str(cred),
+             "--client", "cli-c", "--agent", "cli-a", "--task", "cli-t", "--ttl", "60", "--scope", "locks"],
+            text=True))
+        self.assertTrue(out1["ok"])
+        tok1 = cred.read_text(encoding="ascii").strip()
+        out2 = json.loads(subprocess.check_output(
+            [*base, "renew", "--state-dir", str(state), "--credential-file", str(cred),
+             "--client", "cli-c", "--agent", "cli-a", "--task", "cli-t", "--ttl", "120"],
+            text=True))
+        self.assertTrue(out2["ok"])
+        self.assertEqual(out2["result"]["grant_id"], out1["result"]["grant_id"])
+        self.assertEqual(out2["result"]["revision"], 2)
+        tok2 = cred.read_text(encoding="ascii").strip()
+        self.assertNotEqual(tok2, tok1)
+        revoked = json.loads(subprocess.check_output(
+            [*base, "revoke", "--state-dir", str(state), "--grant-id", out1["result"]["grant_id"]],
+            text=True))
+        self.assertTrue(revoked["result"]["revoked"])
+        out3 = json.loads(subprocess.check_output(
+            [*base, "issue", "--state-dir", str(state), "--credential-file", str(cred),
+             "--client", "cli-c", "--agent", "cli-a", "--task", "cli-t", "--ttl", "60", "--scope", "locks", "--overwrite"],
+            text=True))
+        self.assertTrue(out3["ok"] and out3["result"]["reissued"])
+        self.assertNotEqual(out3["result"]["grant_id"], out1["result"]["grant_id"])

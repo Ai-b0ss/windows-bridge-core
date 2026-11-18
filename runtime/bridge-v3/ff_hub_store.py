@@ -122,7 +122,7 @@ class HubStore:
 
     def open_session(self, agent_id: str, task_id: str, *, resume_token: str | None = None,
                      note: str | None = None, entry_grant_id: str | None = None,
-                     entry_secret: str | None = None) -> dict:
+                     entry_secret: str | None = None, supersede_inactive_entry: bool = False) -> dict:
         """Open a session, or take over this agent's earlier session for the same task.
 
         Taking over an earlier session always needs its resume token. An idle timeout is not
@@ -132,15 +132,23 @@ class HubStore:
         now = self.clock()
         with self._lock:
             previous = self._db.execute(
-                "SELECT * FROM sessions WHERE agent_id=? AND task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                "SELECT * FROM sessions WHERE agent_id=? AND task_id=? AND state!='superseded' "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (agent_id, task_id)).fetchall()
+            adopt_previous = True
             for row in previous:
                 if entry_grant_id and row["entry_grant_id"] == entry_grant_id and secrets.compare_digest(
                         row["secret_hash"], _hash(entry_secret)):
+                    if row["state"] == "expired":
+                        adopt_previous = False
+                        continue
                     if row["state"] == "active":
                         self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (now, row["session_id"]))
                     return {"session_id": row["session_id"], "state": row["state"], "reused": True,
                             "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
+                if supersede_inactive_entry and entry_grant_id and row["entry_grant_id"] and row["state"] != "active":
+                    adopt_previous = False
+                    continue
                 token_ok = (not entry_grant_id and not row["entry_grant_id"] and isinstance(resume_token, str)
                             and secrets.compare_digest(row["resume_hash"], _hash(resume_token)))
                 if not token_ok:
@@ -158,9 +166,10 @@ class HubStore:
                     (session_id, agent_id, task_id, _hash(secret), _hash(resume), now, now, (note or "")[:500], entry_grant_id))
                 adopted = 0
                 for row in previous:
-                    adopted += self._db.execute(
-                        "UPDATE resources SET session_id=? WHERE session_id=? AND state='held'",
-                        (session_id, row["session_id"])).rowcount
+                    if adopt_previous:
+                        adopted += self._db.execute(
+                            "UPDATE resources SET session_id=? WHERE session_id=? AND state='held'",
+                            (session_id, row["session_id"])).rowcount
                     self._db.execute("UPDATE sessions SET state='superseded', closed_at=? WHERE session_id=?",
                                      (now, row["session_id"]))
                 self._db.execute("COMMIT")
@@ -189,15 +198,15 @@ class HubStore:
             if row['state']=='active':self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
         return {"session_id": session_id, "agent_id": row["agent_id"], "task_id": row["task_id"]}
 
-    def close_session(self, session_id: str) -> list[dict]:
+    def close_session(self, session_id: str, *, state: str = "closed") -> list[dict]:
         """End a session and return the resources it still held, for the caller to clean up."""
         with self._lock:
             held = self.resources(session_id=session_id)
             now = self.clock()
             self._db.execute("UPDATE resources SET state='released', released_at=? WHERE session_id=? AND state='held'",
                              (now, session_id))
-            self._db.execute("UPDATE sessions SET state='closed', closed_at=? WHERE session_id=? AND state='active'",
-                             (now, session_id))
+            self._db.execute("UPDATE sessions SET state=?, closed_at=? WHERE session_id=? AND state='active'",
+                             (state, now, session_id))
         return held
 
     def sessions(self, *, include_closed: bool = False) -> list[dict]:

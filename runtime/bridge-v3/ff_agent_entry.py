@@ -9,7 +9,9 @@ from pathlib import Path
 import re
 import secrets
 import sqlite3
+import threading
 import time
+import uuid
 
 from ff_hub_store import HubError, _ident
 
@@ -47,6 +49,75 @@ class EntryAuthority:
     def __init__(self, state_dir: Path, *, clock=time.time):
         self.path = Path(state_dir) / "entry-grants.sqlite3"
         self.clock = clock
+        self._lock = threading.RLock()
+
+    def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:
+        if readonly:
+            db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+            db.row_factory = sqlite3.Row
+            return db
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(self.path, isolation_level=None, timeout=10)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=FULL")
+        return db
+
+    def _ensure_schema(self, db: sqlite3.Connection) -> None:
+        cols = {row["name"] for row in db.execute("PRAGMA table_info(grants)").fetchall()}
+        if not cols:
+            db.execute("""CREATE TABLE IF NOT EXISTS grants (
+                grant_id TEXT PRIMARY KEY, digest TEXT NOT NULL, session_seed TEXT NOT NULL,
+                client_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                scopes TEXT NOT NULL, apps TEXT NOT NULL, issued_at REAL NOT NULL,
+                expires_at REAL NOT NULL, renewed_at REAL, revision INTEGER NOT NULL DEFAULT 1,
+                revoked INTEGER NOT NULL DEFAULT 0, superseded_by TEXT)""")
+        elif "session_seed" not in cols:
+            # Migrate legacy UNIQUE(agent_id, task_id) table without losing existing grants.
+            db.execute("""CREATE TABLE grants_v2 (
+                grant_id TEXT PRIMARY KEY, digest TEXT NOT NULL, session_seed TEXT NOT NULL,
+                client_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                scopes TEXT NOT NULL, apps TEXT NOT NULL, issued_at REAL NOT NULL,
+                expires_at REAL NOT NULL, renewed_at REAL, revision INTEGER NOT NULL DEFAULT 1,
+                revoked INTEGER NOT NULL DEFAULT 0, superseded_by TEXT)""")
+            db.execute("""INSERT INTO grants_v2
+                SELECT grant_id, digest, '', client_id, agent_id, task_id, scopes, apps,
+                       expires_at, expires_at, NULL, 1, revoked, NULL FROM grants""")
+            db.execute("DROP TABLE grants")
+            db.execute("ALTER TABLE grants_v2 RENAME TO grants")
+        db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS grants_active_identity
+            ON grants(agent_id, task_id) WHERE superseded_by IS NULL""")
+        db.execute("""CREATE TABLE IF NOT EXISTS grant_receipts (
+            receipt_id TEXT PRIMARY KEY, grant_id TEXT NOT NULL, action TEXT NOT NULL,
+            client_id TEXT NOT NULL, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
+            revision INTEGER NOT NULL, expires_at REAL NOT NULL, at REAL NOT NULL)""")
+
+    def _record_receipt(self, db: sqlite3.Connection, *, grant_id: str, action: str,
+                        client_id: str, agent_id: str, task_id: str, revision: int,
+                        expires_at: float, at: float) -> str:
+        receipt_id = "egr-" + uuid.uuid4().hex
+        db.execute("INSERT INTO grant_receipts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                   (receipt_id, grant_id, action, client_id, agent_id, task_id, revision, expires_at, at))
+        return receipt_id
+
+    @staticmethod
+    def _grant_view(row: sqlite3.Row | dict, **extra) -> dict:
+        scopes = sorted(filter(None, row["scopes"].split(","))) if isinstance(row["scopes"], str) else list(row["scopes"])
+        apps = sorted(filter(None, row["apps"].split(","))) if isinstance(row["apps"], str) else list(row["apps"])
+        data = {
+            "grant_id": row["grant_id"],
+            "client_id": row["client_id"],
+            "agent_id": row["agent_id"],
+            "task_id": row["task_id"],
+            "expires_at": row["expires_at"],
+            "issued_at": row["issued_at"],
+            "renewed_at": row["renewed_at"],
+            "revision": row["revision"],
+            "scopes": scopes,
+            "apps": apps,
+        }
+        data.update(extra)
+        return data
 
     def issue(self, *, client_id: str, agent_id: str, task_id: str, scopes: list[str],
               apps: list[str], ttl: int) -> tuple[dict, str]:
@@ -60,28 +131,139 @@ class EntryAuthority:
             raise HubError("ENTRY_APPS_REQUIRED_FOR_SCOPE")
         grant_id = "eg-" + secrets.token_hex(16)
         token = f"{grant_id}.{secrets.token_urlsafe(32)}"
-        expires_at = self.clock() + ttl
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        try:
-            with closing(sqlite3.connect(self.path)) as db, db:
-                db.execute("""CREATE TABLE IF NOT EXISTS grants (
-                    grant_id TEXT PRIMARY KEY, digest TEXT NOT NULL, client_id TEXT NOT NULL,
-                    agent_id TEXT NOT NULL, task_id TEXT NOT NULL, scopes TEXT NOT NULL, apps TEXT NOT NULL,
-                    expires_at REAL NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, UNIQUE(agent_id, task_id))""")
-                db.execute("INSERT INTO grants VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                           (grant_id, _digest(token), client_id, agent_id, task_id, ",".join(scopes),
-                            ",".join(apps), expires_at))
-        except sqlite3.IntegrityError:
-            raise HubError("ENTRY_TASK_ALREADY_ENROLLED") from None
-        return {"grant_id": grant_id, "client_id": client_id, "agent_id": agent_id,
-                "task_id": task_id, "expires_at": expires_at, "scopes": scopes, "apps": apps}, token
+        session_seed = secrets.token_urlsafe(32)
+        with self._lock, closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_schema(db)
+                now = self.clock()
+                expires_at = now + ttl
+                existing = db.execute(
+                    "SELECT * FROM grants WHERE agent_id=? AND task_id=? AND superseded_by IS NULL",
+                    (agent_id, task_id)).fetchone()
+                reissued = False
+                previous_grant_id = None
+                if existing is not None:
+                    if not existing["revoked"] and existing["expires_at"] > now:
+                        raise HubError("ENTRY_TASK_ALREADY_ENROLLED",
+                                       grant_id=existing["grant_id"],
+                                       expires_at=existing["expires_at"],
+                                       hint="active grant exists; use renew to extend or rotate")
+                    reissued = True
+                    previous_grant_id = existing["grant_id"]
+                    db.execute("UPDATE grants SET superseded_by=? WHERE grant_id=?", (grant_id, previous_grant_id))
+                scopes_csv = ",".join(sorted(set(scopes)))
+                apps_csv = ",".join(sorted(set(apps)))
+                db.execute(
+                    "INSERT INTO grants(grant_id,digest,session_seed,client_id,agent_id,task_id,"
+                    "scopes,apps,issued_at,expires_at,renewed_at,revision,revoked,superseded_by)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,NULL,1,0,NULL)",
+                    (grant_id, _digest(token), session_seed, client_id, agent_id, task_id,
+                     scopes_csv, apps_csv, now, expires_at))
+                receipt_id = self._record_receipt(
+                    db, grant_id=grant_id, action="reissue" if reissued else "issue",
+                    client_id=client_id, agent_id=agent_id, task_id=task_id,
+                    revision=1, expires_at=expires_at, at=now)
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        view = {
+            "grant_id": grant_id, "client_id": client_id, "agent_id": agent_id, "task_id": task_id,
+            "issued_at": now, "expires_at": expires_at, "renewed_at": None, "revision": 1,
+            "scopes": sorted(set(scopes)), "apps": sorted(set(apps)),
+            "reissued": reissued, "previous_grant_id": previous_grant_id, "receipt_id": receipt_id,
+        }
+        return view, token
+
+    def renew(self, *, client_id: str, agent_id: str, task_id: str, ttl: int,
+              grant_id: str | None = None, scopes: list[str] | None = None,
+              apps: list[str] | None = None) -> tuple[dict, str]:
+        client_id, agent_id, task_id = (_ident(value, key) for key, value in
+                                        (("client_id", client_id), ("agent_id", agent_id), ("task_id", task_id)))
+        if type(ttl) is not int or not 1 <= ttl <= 86400:
+            raise HubError("ENTRY_TTL_INVALID")
+        if grant_id is not None and not GRANT_ID.fullmatch(grant_id):
+            raise HubError("ENTRY_GRANT_INVALID")
+        if not self.path.is_file():
+            raise HubError("ENTRY_GRANT_NOT_FOUND")
+        with self._lock, closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_schema(db)
+                if grant_id is not None:
+                    row = db.execute("SELECT * FROM grants WHERE grant_id=?", (grant_id,)).fetchone()
+                else:
+                    row = db.execute(
+                        "SELECT * FROM grants WHERE agent_id=? AND task_id=? AND superseded_by IS NULL",
+                        (agent_id, task_id)).fetchone()
+                if row is None:
+                    raise HubError("ENTRY_GRANT_NOT_FOUND")
+                if row["superseded_by"] is not None:
+                    raise HubError("ENTRY_GRANT_SUPERSEDED", superseded_by=row["superseded_by"])
+                if (row["client_id"], row["agent_id"], row["task_id"]) != (client_id, agent_id, task_id):
+                    raise HubError("ENTRY_GRANT_OWNER_MISMATCH")
+                if row["revoked"]:
+                    raise HubError("ENTRY_GRANT_REVOKED", grant_id=row["grant_id"],
+                                   hint="revoked grants cannot be renewed; issue a new grant")
+                if not row["session_seed"]:
+                    raise HubError("ENTRY_LEGACY_GRANT_REISSUE_REQUIRED", grant_id=row["grant_id"])
+                cur_scopes = set(filter(None, row["scopes"].split(",")))
+                cur_apps = set(filter(None, row["apps"].split(",")))
+                next_scopes = cur_scopes if scopes is None else set(scopes)
+                next_apps = cur_apps if apps is None else set(apps)
+                if not next_scopes <= set(SCOPES.keys()) or not next_apps <= SAFE_APPS:
+                    raise HubError("ENTRY_SCOPE_INVALID")
+                if not next_scopes <= cur_scopes or not next_apps <= cur_apps:
+                    raise HubError("ENTRY_SCOPE_ESCALATION_DENIED", execution_started=False)
+                if ("private_app" in next_scopes) != bool(next_apps):
+                    raise HubError("ENTRY_APPS_REQUIRED_FOR_SCOPE")
+                now = self.clock()
+                expires_at = now + ttl
+                revision = int(row["revision"]) + 1
+                token = f"{row['grant_id']}.{secrets.token_urlsafe(32)}"
+                scopes_csv = ",".join(sorted(next_scopes))
+                apps_csv = ",".join(sorted(next_apps))
+                db.execute(
+                    "UPDATE grants SET digest=?, scopes=?, apps=?, expires_at=?, renewed_at=?, revision=? "
+                    "WHERE grant_id=?",
+                    (_digest(token), scopes_csv, apps_csv, expires_at, now, revision, row["grant_id"]))
+                receipt_id = self._record_receipt(
+                    db, grant_id=row["grant_id"], action="renew", client_id=client_id,
+                    agent_id=agent_id, task_id=task_id, revision=revision, expires_at=expires_at, at=now)
+                updated = db.execute("SELECT * FROM grants WHERE grant_id=?", (row["grant_id"],)).fetchone()
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        return self._grant_view(updated, receipt_id=receipt_id), token
 
     def _row(self, grant_id: str) -> sqlite3.Row | None:
         if not self.path.is_file():
             return None
-        with closing(sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-            db.row_factory = sqlite3.Row
+        with closing(self._connect(readonly=True)) as db:
             return db.execute("SELECT * FROM grants WHERE grant_id=?", (grant_id,)).fetchone()
+
+    def receipts(self, *, agent_id: str | None = None, task_id: str | None = None,
+                 grant_id: str | None = None) -> list[dict]:
+        if not self.path.is_file():
+            return []
+        with closing(self._connect(readonly=True)) as db:
+            tables = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+            if "grant_receipts" not in tables:
+                return []
+            clauses, params = [], []
+            for col, val in (("agent_id", agent_id), ("task_id", task_id), ("grant_id", grant_id)):
+                if val is not None:
+                    clauses.append(f"{col}=?")
+                    params.append(val)
+            query = "SELECT * FROM grant_receipts"
+            if clauses:
+                query += " WHERE " + " AND ".join(clauses)
+            rows = db.execute(query + " ORDER BY rowid", params).fetchall()
+            return [dict(row) for row in rows]
 
     def authorize(self, authorization: str) -> dict:
         match = TOKEN.fullmatch(authorization.removeprefix("Bearer ")) if authorization.startswith("Bearer ") else None
@@ -90,23 +272,44 @@ class EntryAuthority:
         row = self._row(match[1])
         token = match[0]
         if (row is None or not secrets.compare_digest(row["digest"], _digest(token))
-                or row["revoked"] or row["expires_at"] <= self.clock()):
+                or row["revoked"] or row["superseded_by"] is not None or row["expires_at"] <= self.clock()):
             raise HubError("ENTRY_UNAUTHORIZED", execution_started=False)
+        seed = row["session_seed"] if "session_seed" in row.keys() and row["session_seed"] else token
         return {**{key: row[key] for key in ("grant_id", "client_id", "agent_id", "task_id", "expires_at")},
+                "revision": row["revision"] if "revision" in row.keys() else 1,
                 "scopes": set(filter(None, row["scopes"].split(","))),
                 "apps": set(filter(None, row["apps"].split(","))),
-                "entry_secret": _digest("ff-agent-entry-session-v1:" + token)}
+                "entry_secret": _digest("ff-agent-entry-session-v1:" + seed)}
 
     def active(self, grant_id: str) -> bool:
         row = self._row(grant_id)
-        return bool(row and not row["revoked"] and row["expires_at"] > self.clock())
+        if not row:
+            return False
+        superseded = row["superseded_by"] if "superseded_by" in row.keys() else None
+        return bool(not row["revoked"] and superseded is None and row["expires_at"] > self.clock())
 
     def revoke(self, grant_id: str) -> bool:
         if not GRANT_ID.fullmatch(grant_id) or not self.path.is_file():
             return False
-        with closing(sqlite3.connect(self.path)) as db, db:
-            result = db.execute("UPDATE grants SET revoked=1 WHERE grant_id=? AND revoked=0", (grant_id,))
-            return bool(result.rowcount)
+        with self._lock, closing(self._connect()) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                self._ensure_schema(db)
+                row = db.execute("SELECT * FROM grants WHERE grant_id=?", (grant_id,)).fetchone()
+                if row is None or row["revoked"]:
+                    db.execute("ROLLBACK")
+                    return False
+                db.execute("UPDATE grants SET revoked=1 WHERE grant_id=? AND revoked=0", (grant_id,))
+                self._record_receipt(
+                    db, grant_id=grant_id, action="revoke", client_id=row["client_id"],
+                    agent_id=row["agent_id"], task_id=row["task_id"],
+                    revision=int(row["revision"]), expires_at=row["expires_at"], at=self.clock())
+                db.execute("COMMIT")
+                return True
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
 
 
 def route_plan(scope: dict, surface: str = "browser") -> dict:

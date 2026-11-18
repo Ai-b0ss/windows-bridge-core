@@ -600,7 +600,7 @@ class Hub:
             with self._owner_gate(self._owner(session)):
                 if not self.store.is_active_entry_session(session["session_id"]):
                     continue
-                held = self.store.close_session(session["session_id"])
+                held = self.store.close_session(session["session_id"], state="expired")
                 cleanup = self._cleanup(session, held)
                 self.store.audit("entry_grant_ended", agent_id=session["agent_id"], task_id=session["task_id"],
                                  session_id=session["session_id"], **cleanup)
@@ -747,8 +747,25 @@ class Hub:
                 raise HubError("HUB_STOPPING", execution_started=False)
             if not self.entry_authority.active(scope["grant_id"]):
                 raise HubError("ENTRY_UNAUTHORIZED", execution_started=False)
+            supersede = False
+            for existing in self.store.active_entry_sessions():
+                if (existing["agent_id"], existing["task_id"]) != (scope["agent_id"], scope["task_id"]):
+                    continue
+                if existing["entry_grant_id"] == scope["grant_id"]:
+                    break
+                if self.entry_authority.active(existing["entry_grant_id"]):
+                    raise HubError("SESSION_ACTIVE_ELSEWHERE", session_id=existing["session_id"], retry_safe=False)
+                held = self.store.close_session(existing["session_id"])
+                cleanup = self._cleanup(existing, held)
+                self.store.audit("entry_grant_superseded", agent_id=existing["agent_id"], task_id=existing["task_id"],
+                                 session_id=existing["session_id"], old_grant_id=existing["entry_grant_id"],
+                                 new_grant_id=scope["grant_id"], **cleanup)
+                supersede = True
+            else:
+                supersede = True
             session = self.store.open_session(scope["agent_id"], scope["task_id"],
-                                              entry_grant_id=scope["grant_id"], entry_secret=scope["entry_secret"])
+                                              entry_grant_id=scope["grant_id"], entry_secret=scope["entry_secret"],
+                                              supersede_inactive_entry=supersede)
             return {**session, **{key: scope[key] for key in ("client_id", "agent_id", "task_id", "expires_at")}}
 
     def dispatch(self, request: dict, *, check_access: Callable | None = None) -> dict:
