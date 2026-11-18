@@ -93,6 +93,29 @@ class BrowserManager:
         self._failures = 0
         self.starts = 0
 
+    def _wait_for_prior_manager(self, timeout: float = 10.0) -> None:
+        # After a parent Hub crash the old Node process drains its accepted
+        # work, preserves pages and releases the relay on stdin EOF. Do not
+        # race that ledger writer or replace its endpoint while it retires.
+        endpoint = self.state_dir / "endpoint.json"
+        try:
+            previous = json.loads(endpoint.read_text(encoding="utf-8"))
+            pid, token = previous["pid"], previous.get("create_time")
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if type(pid) is not int or pid <= 0:
+            raise HubError("BROWSER_MANAGER_ENDPOINT_INVALID", execution_started=False)
+        deadline = time.monotonic() + timeout
+        while endpoint.exists():
+            alive = (process_identity_matches(pid, token) if os.name == "nt" and type(token) is int
+                     else _pid_alive(pid))
+            if not alive:
+                return
+            if time.monotonic() >= deadline:
+                raise HubError("BROWSER_MANAGER_RETIRING", "previous manager has not released the relay yet",
+                               execution_started=False, retry_safe=True, retry_after_ms=1000)
+            time.sleep(.05)
+
     def _start(self) -> None:
         now = time.monotonic()
         if now < self._next_start:
@@ -100,6 +123,7 @@ class BrowserManager:
                            retry_after_ms=int((self._next_start - now) * 1000), retry_safe=True)
         powershell = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
         self.state_dir.mkdir(parents=True, exist_ok=True)
+        self._wait_for_prior_manager()
         endpoint_file = self.state_dir / "endpoint.json"
         endpoint_file.unlink(missing_ok=True)
         key = _secrets.token_urlsafe(48)
@@ -121,6 +145,9 @@ class BrowserManager:
             if endpoint_file.is_file():
                 try:
                     self._endpoint = json.loads(endpoint_file.read_text(encoding="utf-8"))
+                    self._endpoint["create_time"] = process_creation_token(self._endpoint["pid"])
+                    from ff_hub_io import atomic_json
+                    atomic_json(endpoint_file, self._endpoint)
                     self._process, self._key, self._failures = process, key, 0
                     self.starts += 1
                     return
@@ -199,6 +226,8 @@ class Hub:
         self._hidden_lock = threading.RLock()
         self._gates_lock = threading.Lock()
         self._gates: dict[str, list[Any]] = {}
+        from ff_hub_io import HubIO
+        self.io = HubIO(self)
         self.started_at = time.time()
         self._stop = threading.Event()
         self._stopping=False
@@ -518,6 +547,7 @@ class Hub:
     def _cleanup(self, session: dict, held: list[dict]) -> dict:
         owner = self._owner(session)
         report = {"browser_tabs_closed": 0, "app_sessions_closed": 0, "locks_released": 0, "errors": []}
+        report["errors"].extend(self.io.cleanup(held))
         if getattr(self.browser, "running", lambda: True)():
             try:
                 known = {tab["tab_id"] for tab in self.browser.call("tab_list", {"owner": owner})["tabs"]}
@@ -632,6 +662,15 @@ class Hub:
                 "resource_claim": {"mutating": True, "args": {"kind": sorted(__import__("ff_hub_store").RESOURCE_KINDS),
                                                               "key": "str", "mode": "exclusive|shared", "wait_seconds": "0..60"}},
                 "resource_release": {"mutating": True}, "resource_list": {},
+                "files": {"mutating": "write", "commands": ["read", "stat", "write"],
+                          "args": {"path": "absolute path", "text": "UTF-8 string for write",
+                                   "expected_sha256": "current hash or null to create"},
+                          "locks": "exclusive canonical file lock until release/session_close; cooperative"},
+                "terminal": {"mutating": "start/cancel", "commands": ["start", "status", "list", "cancel"],
+                             "risk_class": "terminal_execute", "args": {"argv": "string[]; shell=false",
+                             "cwd": "absolute directory", "timeout_seconds": "0.1..300", "terminal_id": "exact saved ID"},
+                             "recovery": "supervisor survives Hub restart; poll exact ID, never relaunch",
+                             "scope": "current user, no sandbox; argv/cwd grants do not confine interpreter effects"},
                 "permission_check": {"args": {"risk_class": sorted(RISK_CLASSES), "target": "{path|app|host|secret}"}},
                 "permission_describe": {},
                 "secret_list": {}, "secret_use": {"mutating": True, "risk_class": "secret_use",
@@ -661,7 +700,7 @@ class Hub:
                                               "read-only probe: node ff_browser_hub.mjs --preflight; never falls back to foreground",
                 "browser_manager_crash": "a durable ledger keeps owner and exact CDP target id of every agent tab; after a manager crash "
                                          "restore/close reattach the same physical tab only on an exact target-id match "
-                                         "(proven on an isolated CDP browser; not yet proven through the owner extension relay). "
+                                         "through the pinned extension relay; occupied foreign targets are never taken over. "
                                          "Without a match: TAB_RECOVERY_UNAVAILABLE / TAB_CLEANUP_UNCONFIRMED, no URL adoption, "
                                          "no duplicate reopening",
                 "background_browser_input": "actions are DOM-level (untrusted events); sites that demand real pointer/keyboard "
@@ -681,7 +720,9 @@ class Hub:
                 "sessions": self.store.sessions(), "private_desktops": len(self._hidden),
                 "browser_manager": {"running": getattr(self.browser, "running", lambda: None)(),
                                     "starts": getattr(self.browser, "starts", None)},
-                "pending_owner_requests": len(self.store.permission_requests())}
+                "pending_owner_requests": len(self.store.permission_requests()),
+                "resources": self.store.resources(),
+                "recovery": "resume saved session token; request_status by exact key; terminal status by exact ID"}
 
     # ---- dispatch ------------------------------------------------------------------------
     @contextmanager
@@ -771,21 +812,24 @@ class Hub:
         if op == "session_status":
             return {**session, "resources": self.store.resources(session_id=session["session_id"])}
         if op == "session_close":
-            held = self.store.close_session(session["session_id"])
-            report = self._cleanup(session, held)
-            self.store.audit("session_close", agent_id=session["agent_id"], task_id=session["task_id"],
-                             session_id=session["session_id"], **report)
-            return {"closed": True, "cleanup_verified": not report["errors"], **report}
+            def close_op() -> dict:
+                held = self.store.close_session(session["session_id"])
+                report = self._cleanup(session, held)
+                retained = len(self.store.resources(session_id=session["session_id"]))
+                self.store.audit("session_close", agent_id=session["agent_id"], task_id=session["task_id"],
+                                 session_id=session["session_id"], resources_retained=retained, **report)
+                return {"closed": True, "cleanup_verified": not report["errors"], "resources_retained": retained, **report}
+            return journaled(close_op) if request_key else close_op()
         if op == "resource_claim":
-            if args.get("kind") in {"browser_tab", "app_session"}:
+            if args.get("kind") in {"browser_tab", "app_session", "terminal"}:
                 raise HubError("RESOURCE_KIND_MANAGED", "tabs and app sessions are claimed by opening them")
             if args.get("kind") in {"file", "directory"}:
-                args = {**args, "key": os.path.normcase(os.path.abspath(str(args.get("key") or "")))}
+                args = {**args, "key": os.path.normcase(os.path.realpath(os.path.abspath(str(args.get("key") or ""))))}
             return journaled(lambda: self.store.claim(session, args.get("kind"), args.get("key"), mode=args.get("mode", "exclusive"),
                                                       meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
                                                       wait_seconds=args.get("wait_seconds", 0), check_access=check_access))
         if op == "resource_release":
-            managed = {"browser_tab", "app_session"}
+            managed = {"browser_tab", "app_session", "terminal"}
             resource_id = args.get("resource_id")
             if args.get("kind") in managed or (resource_id and any(
                     item["resource_id"] == resource_id and item["kind"] in managed
@@ -793,7 +837,7 @@ class Hub:
                 raise HubError("RESOURCE_KIND_MANAGED", "close managed tabs/apps through their lifecycle operations")
             key = args.get("key")
             if args.get("kind") in {"file", "directory"} and key:
-                key = os.path.normcase(os.path.abspath(str(key)))
+                key = os.path.normcase(os.path.realpath(os.path.abspath(str(key))))
             def release() -> dict:
                 return self.store.release(session, resource_id=resource_id, kind=args.get("kind"), key=key)
             return journaled(release) if request_key else release()
@@ -837,6 +881,20 @@ class Hub:
             if args.get("command") in {"open", "navigate", "act", "evaluate", "restore", "close"}:
                 return journaled(lambda: self._browser(session, args))
             return self._browser(session, args)
+        if op == "files":
+            if args.get("command") == "write":
+                return journaled(lambda: self.io.files(session, args))
+            return self.io.files(session, args)
+        if op == "terminal":
+            if args.get("command") == "start":
+                # Only admission/launch is serialized, never job execution.
+                # Another owner must not see a resource before its initial
+                # durable status exists or race the global admission limit.
+                with self.io.launch_lock:
+                    return journaled(lambda: self.io.terminal(session, args, request_key))
+            if args.get("command") == "cancel":
+                return journaled(lambda: self.io.terminal(session, args, request_key))
+            return self.io.terminal(session, args)
         if op=='private_browser':
             from cua_private_browser import READ_COMMANDS
             if args.get('command') in READ_COMMANDS:return self._private_browser(session,args)

@@ -30,6 +30,8 @@ RISK_CLASSES: dict[str, dict[str, Any]] = {
                            "about": "run arbitrary JavaScript in the agent's own tab"},
     "project_write":      {"default": "ask",   "grantable": True,  "scope": "paths",
                            "about": "create or change files inside a named project folder"},
+    "terminal_execute":   {"default": "ask",   "grantable": True,  "scope": "paths",
+                           "about": "run an owner-authorized executable with a named cwd; not a filesystem sandbox"},
     "app_launch":         {"default": "ask",   "grantable": True,  "scope": "apps",
                            "about": "start a named application on the agent's private desktop"},
     "secret_use":         {"default": "ask",   "grantable": True,  "scope": "secrets",
@@ -122,6 +124,8 @@ class Policy:
             needed = spec["scope"]
             if needed and not {"paths": paths, "apps": apps, "hosts": hosts, "secrets": secrets}[needed]:
                 raise PermissionError_("GRANT_SCOPE_REQUIRED", risk_class=name, scope=needed)
+            if name == "terminal_execute" and not apps:
+                raise PermissionError_("GRANT_SCOPE_REQUIRED", risk_class=name, scope="apps")
         if ttl_seconds is not None and (type(ttl_seconds) not in (int, float) or ttl_seconds <= 0):
             raise PermissionError_("GRANT_TTL_INVALID")
         grant = {"grant_id": "grant-" + uuid.uuid4().hex[:12], "classes": list(classes),
@@ -192,6 +196,9 @@ class Policy:
         near = "NO_MATCHING_GRANT"
         for grant in data.get("grants", []):
             if grant.get("revoked") or risk_class not in grant.get("classes", []):
+                continue
+            if risk_class == "terminal_execute" and not grant.get("apps"):
+                near = "APP_NOT_GRANTED"
                 continue
             if grant.get("expires_at") is not None and grant["expires_at"] <= now:
                 near = "GRANT_EXPIRED"

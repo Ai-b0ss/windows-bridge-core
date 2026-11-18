@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import {BrowserHub, HubError, backgroundCapability, backgroundExtensionPreflight, extensionConnector, requireBackgroundChrome, serve} from '../runtime/bridge-v3/ff_browser_hub.mjs';
+import {BrowserHub, HubError, backgroundCapability, backgroundExtensionPreflight, extensionConnector, requireBackgroundChrome, serve, releaseAfterParentLoss} from '../runtime/bridge-v3/ff_browser_hub.mjs';
 
 test('capability probe reports a blocker without disclosing profile data or claiming live acceptance', async () => {
   const blocked = await backgroundCapability(async () => { throw new HubError('BACKGROUND_CONNECT_UNSAFE'); });
@@ -759,3 +759,29 @@ test('a lost tab can be reattached by exact id after an extension group handoff'
   assert.equal(tab.orphaned, false);
   assert.equal(pages.length, 2, 'no duplicate page opened during reattach');
 });
+
+test('parent EOF disconnects without closing owned pages and preserves the exact-target recovery ledger', async () => withLedger(async ledger => {
+  const first = cdpFixture(ledger);
+  const tab = await first.hub.tabOpen({owner: 'parent-crash-owner', url: 'https://owner.invalid/unfinished'});
+  const physical = first.world.pages[0];
+  const connection = first.hub.connection;
+  const disconnect = connection.browser.close.bind(connection.browser);
+  connection.browser.close = async () => {
+    // Real Playwright closes local Page handles before reporting disconnect;
+    // that does not mean Chrome's physical tab was closed.
+    physical.emit('close');
+    await disconnect();
+  };
+  const before = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+  const result = await releaseAfterParentLoss(first.hub);
+  assert.equal(result.closed_tabs, 0);
+  assert.equal(physical.isClosed(), false, 'transport EOF must not discard an unfinished page');
+  assert.equal(physical.closeCalls, 0);
+  assert.equal(JSON.parse(fs.readFileSync(ledger, 'utf8')).tabs[0].target_id, before.tabs[0].target_id);
+  const second = cdpFixture(ledger, first.world);
+  const restored = await second.hub.tabRestore({owner: 'parent-crash-owner', tab_id: tab.tab_id});
+  assert.equal(restored.reattached, true);
+  assert.equal(restored.evidence, 'cdp_target_id');
+  assert.equal(first.world.pages.length, 1, 'recovery must not open a replacement URL');
+  await second.hub.shutdown();
+}));
