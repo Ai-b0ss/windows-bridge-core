@@ -8,15 +8,19 @@ const safeName = value => {
 const clone = value => JSON.parse(JSON.stringify(value));
 
 export class DownloadOperationStore {
-  constructor({clock = () => Date.now(), maxOperations = 32} = {}) {
+  constructor({clock = () => Date.now(), maxOperations = 32, maxRecentOperations = 128} = {}) {
     this.clock = clock;
     this.maxOperations = maxOperations;
+    this.maxRecentOperations = maxRecentOperations;
     this.operations = new Map();
     this.byDownloadId = new Map();
   }
 
   _refresh(op) {
-    if (ACTIVE.has(op.state) && this.clock() > op.expires_at) op.state = 'TIMEOUT';
+    if (ACTIVE.has(op.state) && this.clock() >= op.expires_at) {
+      op.state = 'TIMEOUT';
+      op.terminal_reason = 'DOWNLOAD_TIMEOUT';
+    }
     return op;
   }
 
@@ -26,8 +30,17 @@ export class DownloadOperationStore {
     if (!/^[A-Za-z0-9._-]{8,96}$/.test(operationId)) throw new Error('OPERATION_ID_INVALID');
     if (!/^https?:\/\//.test(expectedUrl)) throw new Error('EXPECTED_URL_REQUIRED');
     if (this.operations.has(operationId)) throw new Error('OPERATION_EXISTS');
-    if (this.operations.size >= this.maxOperations) throw new Error('OPERATION_LIMIT');
-    const timeoutMs = Math.min(Math.max(Number(spec.timeout_ms || 10000), 250), 30000);
+    const duration = Number(spec.timeout_ms ?? 10000);
+    if (!Number.isFinite(duration)) throw new Error('TIMEOUT_INVALID');
+    const timeoutMs = Math.min(Math.max(duration, 250), 30000);
+    const retired = [...this.operations.values()].filter(op => {
+      this._refresh(op);
+      return op.cleanup_complete || (op.state === 'TIMEOUT' && !op.candidates.length);
+    });
+    if (this.operations.size - retired.length >= this.maxOperations) throw new Error('OPERATION_LIMIT');
+    for (const op of retired.slice(0, Math.max(0, retired.length - this.maxRecentOperations))) {
+      this.operations.delete(op.operation_id);
+    }
     const now = this.clock();
     const op = {
       operation_id: operationId,
@@ -35,12 +48,13 @@ export class DownloadOperationStore {
       expected_url: expectedUrl,
       expected_filename: spec.expected_filename ? safeName(spec.expected_filename) : null,
       expected_mime: spec.expected_mime ? String(spec.expected_mime) : null,
-      expected_size: Number.isFinite(Number(spec.expected_size)) ? Number(spec.expected_size) : null,
+      expected_size: spec.expected_size != null && Number.isFinite(Number(spec.expected_size)) ? Number(spec.expected_size) : null,
       created_at: now,
       expires_at: now + timeoutMs,
       candidates: [],
       matched_id: null,
       item: null,
+      filename_suggested: false,
       terminal_reason: null,
       cleanup_complete: false,
     };
@@ -62,6 +76,7 @@ export class DownloadOperationStore {
   onCreated(item) {
     const id = Number(item?.id);
     if (!Number.isInteger(id)) return null;
+    if (this.byDownloadId.has(id)) return null;
     const matches = [...this.operations.values()].filter(op => this._matches(op, item));
     if (matches.length === 0) return null;
     if (matches.length > 1) {
@@ -96,7 +111,14 @@ export class DownloadOperationStore {
     const op = this._refresh(this.operations.get(operationId));
     if (!op || op.state !== 'MATCHED' || op.matched_id !== id) return null;
     const filename = op.expected_filename || safeName(item?.filename);
+    op.filename_suggested = true;
     return {operation_id: operationId, filename: `FF-CUA/${operationId}/${filename}`};
+  }
+
+  ownsFilename(operationId, filename) {
+    const op = this.operations.get(String(operationId || ''));
+    const parts = String(filename || '').replaceAll('\\', '/').split('/');
+    return Boolean(op?.filename_suggested && parts.at(-3) === 'FF-CUA' && parts.at(-2) === op.operation_id && parts.at(-1));
   }
 
   onChanged(item) {
@@ -108,8 +130,14 @@ export class DownloadOperationStore {
     op.item = clone(item);
     const state = String(item?.state || '');
     if (state === 'complete') {
-      op.state = 'COMPLETE';
-      op.terminal_reason = null;
+      if (this.ownsFilename(operationId, item.filename)) {
+        op.state = 'COMPLETE';
+        op.terminal_reason = null;
+      } else {
+        op.state = 'FAILED';
+        op.terminal_reason = 'DOWNLOAD_FILENAME_OWNERSHIP_UNPROVEN';
+        op.item = null;
+      }
     } else if (state === 'interrupted') {
       op.state = 'INTERRUPTED';
       op.terminal_reason = String(item?.error || 'DOWNLOAD_INTERRUPTED');
