@@ -28,7 +28,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS sessions(
   session_id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, task_id TEXT NOT NULL,
   secret_hash TEXT NOT NULL, resume_hash TEXT NOT NULL, state TEXT NOT NULL,
-  created_at REAL NOT NULL, last_seen_at REAL NOT NULL, closed_at REAL, note TEXT);
+  created_at REAL NOT NULL, last_seen_at REAL NOT NULL, closed_at REAL, note TEXT, entry_grant_id TEXT);
 CREATE INDEX IF NOT EXISTS sessions_owner ON sessions(agent_id, task_id, state);
 CREATE TABLE IF NOT EXISTS resources(
   resource_id TEXT PRIMARY KEY, kind TEXT NOT NULL, key TEXT NOT NULL, mode TEXT NOT NULL,
@@ -85,6 +85,8 @@ class HubStore:
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.executescript(_SCHEMA)
+        if "entry_grant_id" not in {row[1] for row in self._db.execute("PRAGMA table_info(sessions)")}:
+            self._db.execute("ALTER TABLE sessions ADD COLUMN entry_grant_id TEXT")
 
     def close(self) -> None:
         with self._lock:
@@ -119,7 +121,8 @@ class HubStore:
         return row["state"] == "active" and self.clock() - row["last_seen_at"] > self.session_ttl
 
     def open_session(self, agent_id: str, task_id: str, *, resume_token: str | None = None,
-                     note: str | None = None) -> dict:
+                     note: str | None = None, entry_grant_id: str | None = None,
+                     entry_secret: str | None = None) -> dict:
         """Open a session, or take over this agent's earlier session for the same task.
 
         Taking over an earlier session always needs its resume token. An idle timeout is not
@@ -132,19 +135,27 @@ class HubStore:
                 "SELECT * FROM sessions WHERE agent_id=? AND task_id=? ORDER BY created_at DESC, rowid DESC LIMIT 1",
                 (agent_id, task_id)).fetchall()
             for row in previous:
-                token_ok = bool(resume_token) and secrets.compare_digest(row["resume_hash"], _hash(resume_token))
+                if entry_grant_id and row["entry_grant_id"] == entry_grant_id and secrets.compare_digest(
+                        row["secret_hash"], _hash(entry_secret)):
+                    if row["state"] == "active":
+                        self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (now, row["session_id"]))
+                    return {"session_id": row["session_id"], "state": row["state"], "reused": True,
+                            "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
+                token_ok = (not entry_grant_id and not row["entry_grant_id"] and isinstance(resume_token, str)
+                            and secrets.compare_digest(row["resume_hash"], _hash(resume_token)))
                 if not token_ok:
                     raise HubError("SESSION_ACTIVE_ELSEWHERE",
                                    "this agent/task was registered earlier; prove ownership with its latest resume_token",
                                    session_id=row["session_id"], idle_seconds=round(now - row["last_seen_at"], 1),
                                    resume_token_required=True, retry_safe=False)
-            session_id, secret, resume = "ses-" + uuid.uuid4().hex, secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            session_id = "ses-" + uuid.uuid4().hex
+            secret, resume = entry_secret or secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 self._db.execute(
-                    "INSERT INTO sessions(session_id,agent_id,task_id,secret_hash,resume_hash,state,created_at,last_seen_at,note)"
-                    " VALUES(?,?,?,?,?,'active',?,?,?)",
-                    (session_id, agent_id, task_id, _hash(secret), _hash(resume), now, now, (note or "")[:500]))
+                    "INSERT INTO sessions(session_id,agent_id,task_id,secret_hash,resume_hash,state,created_at,last_seen_at,note,entry_grant_id)"
+                    " VALUES(?,?,?,?,?,'active',?,?,?,?)",
+                    (session_id, agent_id, task_id, _hash(secret), _hash(resume), now, now, (note or "")[:500], entry_grant_id))
                 adopted = 0
                 for row in previous:
                     adopted += self._db.execute(
@@ -157,7 +168,11 @@ class HubStore:
                 self._db.execute("ROLLBACK")
                 raise
         self.audit("session_open", agent_id=agent_id, task_id=task_id, session_id=session_id,
-                   resumed_from=[row["session_id"] for row in previous], adopted_resources=adopted)
+                   resumed_from=[row["session_id"] for row in previous], adopted_resources=adopted,
+                   entry_grant_id=entry_grant_id)
+        if entry_grant_id:
+            return {"session_id": session_id, "state": "active", "reused": False,
+                    "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
         return {"session_id": session_id, "session_secret": secret, "resume_token": resume,
                 "agent_id": agent_id, "task_id": task_id, "resumed": bool(previous), "adopted_resources": adopted,
                 "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
@@ -169,7 +184,7 @@ class HubStore:
             row = self._session_row(session_id)
             if row is None or not secrets.compare_digest(row["secret_hash"], _hash(secret)):
                 raise HubError("SESSION_INVALID", "unknown session or wrong session secret")
-            if row["state"] != "active" and not allow_closed:
+            if row["state"] == "superseded" or (row["state"] != "active" and not allow_closed):
                 raise HubError("SESSION_CLOSED", "this session ended; open or resume one", state=row["state"])
             if row['state']=='active':self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
         return {"session_id": session_id, "agent_id": row["agent_id"], "task_id": row["task_id"]}
@@ -195,6 +210,18 @@ class HubStore:
                      "resources": self._db.execute(
                          "SELECT COUNT(*) FROM resources WHERE session_id=? AND state='held'",
                          (row["session_id"],)).fetchone()[0]} for row in rows]
+
+    def active_entry_sessions(self) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT session_id, agent_id, task_id, entry_grant_id FROM sessions "
+                "WHERE state='active' AND entry_grant_id IS NOT NULL").fetchall()
+            return [dict(row) for row in rows]
+
+    def is_active_entry_session(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._session_row(session_id)
+            return bool(row and row["entry_grant_id"] and row["state"] == "active")
 
     def expire_sessions(self, *, session_id: str | None = None) -> list[dict]:
         """Sessions silent for longer than the orphan window: close them, return what they held."""
@@ -226,7 +253,8 @@ class HubStore:
         return self._db.execute("SELECT * FROM resources WHERE kind=? AND key=? AND state='held'", (kind, key)).fetchall()
 
     def claim(self, session: dict, kind: str, key: str, *, mode: str = "exclusive",
-              meta: dict | None = None, wait_seconds: float = 0.0) -> dict:
+              meta: dict | None = None, wait_seconds: float = 0.0,
+              check_access: Callable | None = None) -> dict:
         if kind not in RESOURCE_KINDS:
             raise HubError("RESOURCE_KIND_INVALID", kinds=sorted(RESOURCE_KINDS))
         if mode not in {"exclusive", "shared"}:
@@ -238,6 +266,8 @@ class HubStore:
         deadline = time.monotonic() + wait_seconds
         while True:
             with self._lock:
+                if check_access:
+                    check_access()
                 self._db.execute("BEGIN IMMEDIATE")
                 try:
                     blockers = []
@@ -266,9 +296,10 @@ class HubStore:
                     raise
             if time.monotonic() >= deadline:
                 holder = blockers[0]
+                details = {} if check_access else {
+                    "held_by": {"agent_id": holder["agent_id"], "task_id": holder["task_id"], "mode": holder["mode"]}}
                 raise HubError("RESOURCE_BUSY", "another agent holds this resource", kind=kind, key=key,
-                               held_by={"agent_id": holder["agent_id"], "task_id": holder["task_id"], "mode": holder["mode"]},
-                               retry_safe=True, retry_after_ms=1000)
+                               retry_safe=True, retry_after_ms=1000, **details)
             time.sleep(0.05)
 
     def release(self, session: dict, *, resource_id: str | None = None, kind: str | None = None,

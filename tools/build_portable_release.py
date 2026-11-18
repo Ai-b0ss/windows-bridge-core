@@ -29,7 +29,7 @@ ROOT_FILES = {
     "CHATGPT-REMOTE-CONTROL.md",
 }
 TOOL_FILES = {"tools/bridge_remote_gh.py", "tools/optional_addons.py", "tools/cua_cold_rollback_bundle.py", "tools/cua_cold_recovery_watchdog.py",
-              "tools/private_desktop_client.py","tools/private_desktop_runtime.py"}
+              "tools/private_desktop_client.py","tools/private_desktop_runtime.py", "tools/agent_entry.py"}
 TEXT_EXTENSIONS = (".py", ".ps1", ".cmd", ".json", ".mjs", ".js", ".cs", ".md", ".txt")
 SECRET_PATTERNS = (
     rb"gh[pousr]_[A-Za-z0-9]{24,}", rb"github_pat_[A-Za-z0-9_]{30,}",
@@ -114,7 +114,7 @@ def refresh_source_manifest(repo: Path) -> dict:
              name not in ROOT_FILES | TOOL_FILES}
     files.update({name: sha(data) for name, data in contents.items()})
     manifest["files"] = dict(sorted(files.items()))
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
     return {"ok": True, "output": str(path), "source_files": len(contents)}
 
 

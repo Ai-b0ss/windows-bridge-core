@@ -21,6 +21,7 @@ import http.server
 import json
 import os
 import secrets as _secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -35,6 +36,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ff_hub_apps as apps
+from ff_agent_entry import ENTRY_PATH, SCHEMA as ENTRY_SCHEMA, EntryArtifacts, EntryAuthority, entry_call
 from ff_hub_permissions import RISK_CLASSES, PermissionError_, Policy
 from ff_hub_secrets import SecretError, Vault
 from ff_hub_store import HubError, HubStore
@@ -185,6 +187,8 @@ class Hub:
         self.state_dir = Path(state_dir)
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self.store = store or HubStore(self.state_dir / "hub.db")
+        self.entry_authority = EntryAuthority(self.state_dir)
+        self.entry_artifacts = EntryArtifacts(self.state_dir)
         self.policy = Policy(self.state_dir / "policy.json")
         self.vault = Vault(self.state_dir / "vault")
         config = self._config()
@@ -203,6 +207,13 @@ class Hub:
         for item in self.store.drop_resources("app_session"):
             self.store.audit("app_session_lost_on_hub_restart", agent_id=item["agent_id"], task_id=item["task_id"],
                              session_id=item["session_id"], app_id=item["key"])
+        for candidate in self.entry_artifacts.root.glob("ses-*"):
+            if self.store.is_active_entry_session(candidate.name):
+                continue
+            try:
+                self.entry_artifacts.close(candidate.name)
+            except (HubError, OSError):
+                self.store.audit("entry_artifact_recovery_failed", session_id=candidate.name)
 
     def _config(self) -> dict:
         try:
@@ -388,8 +399,10 @@ class Hub:
             hidden=self._hidden_session(session,create=True)
             window=self._hidden_request(hidden,{'command':'browser.launch'},timeout=60)
             browser_id=f"private-browser-{window['pid']}-{window['create_time']}"
-            self.store.claim(session,'app_session',browser_id,meta={**window,'private_browser':True})
-            return {'browser_id':browser_id,**{k:v for k,v in window.items() if k not in {'browser_ws_endpoint','cdp_endpoint','browser_ws_path'}}}
+            public_window = {key: value for key, value in window.items()
+                             if key not in {"browser_ws_endpoint", "cdp_endpoint", "browser_ws_path", "cdp_port"}}
+            self.store.claim(session, "app_session", browser_id, meta={**public_window, "private_browser": True})
+            return {"browser_id": browser_id, **public_window}
         resource=self.store.require_owned(session,'app_session',str(args.get('browser_id') or ''))
         if not resource['meta'].get('private_browser'):raise HubError('PRIVATE_BROWSER_NOT_OWNED',execution_started=False)
         hidden=self._hidden_session(session,create=False)
@@ -493,7 +506,8 @@ class Hub:
             try:
                 hidden.close()
                 cleanup=[*getattr(hidden,'browser_profile_cleanup',[]),*getattr(hidden,'editor_profile_cleanup',[])]
-                if any(item.get('removed') is not True for item in cleanup):return False
+                if not getattr(hidden, "job_cleanup_verified", True) or any(item.get('removed') is not True for item in cleanup):
+                    return False
             except Exception:
                 with self._hidden_lock:
                     self._hidden[owner] = hidden
@@ -524,15 +538,43 @@ class Hub:
         if owner in self._hidden:
             hidden=self._hidden[owner]
             if self._close_hidden(owner):
-                report["app_sessions_closed"] = sum(item["kind"] == "app_session" for item in held)
+                owned_apps = [item for item in held if item["kind"] == "app_session"]
+                identities = {(item["meta"].get("pid"), item["meta"].get("create_time")) for item in owned_apps}
+                deadline = time.monotonic() + 4
+                pending = {identity for identity in identities if process_identity_matches(*identity)}
+                while pending and time.monotonic() < deadline:
+                    time.sleep(.05)
+                    pending = {identity for identity in pending if process_identity_matches(*identity)}
+                report["app_sessions_closed"] = sum((item["meta"].get("pid"), item["meta"].get("create_time"))
+                                                    not in pending for item in owned_apps)
+                if pending:
+                    report["errors"].append({"kind": "app_session", "code": "OWNED_PROCESSES_STILL_RUNNING",
+                                             "pids": sorted(pid for pid, _ in pending)})
             else:
                 report["errors"].append({"kind": "app_session", "code": "HIDDEN_CLEANUP_FAILED"})
             report['profile_cleanup']=[*getattr(hidden,'browser_profile_cleanup',[]),*getattr(hidden,'editor_profile_cleanup',[])]
         report["locks_released"] = sum(item["kind"] not in {"browser_tab", "app_session"} for item in held)
+        try:
+            removed = self.entry_artifacts.close(session["session_id"])
+            if removed:
+                report["task_files_removed"] = removed
+        except (HubError, OSError):
+            report["errors"].append({"kind": "task_file", "code": "ENTRY_FILE_CLEANUP_FAILED"})
         return report
 
     def maintain(self) -> dict:
         report = {"expired_sessions": 0}
+        for session in self.store.active_entry_sessions():
+            if self.entry_authority.active(session["entry_grant_id"]):
+                continue
+            with self._owner_gate(self._owner(session)):
+                if not self.store.is_active_entry_session(session["session_id"]):
+                    continue
+                held = self.store.close_session(session["session_id"])
+                cleanup = self._cleanup(session, held)
+                self.store.audit("entry_grant_ended", agent_id=session["agent_id"], task_id=session["task_id"],
+                                 session_id=session["session_id"], **cleanup)
+                report["expired_sessions"] += 1
         for candidate in self.store.sessions():
             if candidate["idle_seconds"] <= self.store.session_ttl + self.store.orphan_ttl:
                 continue
@@ -565,6 +607,8 @@ class Hub:
     def capabilities(self) -> dict:
         return {
             "schema": "ff-agent-hub-capabilities-v1", "hub_version": HUB_VERSION, "pid": os.getpid(),
+            "agent_entry": {"schema": ENTRY_SCHEMA, "http_path": ENTRY_PATH, "bind": "loopback",
+                            "auth": "locally-issued task-scoped bearer", "mcp_transport": "stdio"},
             "purpose": "shared infrastructure for every agent on this PC: sessions, ownership, the owner's Chrome, "
                        "private desktops for GUI apps, permissions, brokered secrets, recovery",
             "quickstart": [
@@ -656,7 +700,17 @@ class Hub:
                 if not entry[1]:
                     self._gates.pop(owner, None)
 
-    def dispatch(self, request: dict) -> dict:
+    def open_entry_session(self, scope: dict) -> dict:
+        with self._owner_gate(self._owner(scope)), self._hidden_lock:
+            if self._stopping:
+                raise HubError("HUB_STOPPING", execution_started=False)
+            if not self.entry_authority.active(scope["grant_id"]):
+                raise HubError("ENTRY_UNAUTHORIZED", execution_started=False)
+            session = self.store.open_session(scope["agent_id"], scope["task_id"],
+                                              entry_grant_id=scope["grant_id"], entry_secret=scope["entry_secret"])
+            return {**session, **{key: scope[key] for key in ("client_id", "agent_id", "task_id", "expires_at")}}
+
+    def dispatch(self, request: dict, *, check_access: Callable | None = None) -> dict:
         if not isinstance(request, dict):
             raise HubError("REQUEST_INVALID")
         op, args = request.get("op"), request.get("args") or {}
@@ -664,6 +718,8 @@ class Hub:
             raise HubError("ARGS_INVALID")
         if op in {"capabilities", "hub_status", "hub_shutdown_idle", "request_status", "session_status", "session_heartbeat",
                   "resource_list", "permission_check", "permission_describe", "secret_list", "audit_read", "app_discover"}:
+            if check_access:
+                check_access()
             return self._dispatch(request)
         if op == "session_open":
             if not isinstance(args.get("agent_id"), str) or not isinstance(args.get("task_id"), str):
@@ -672,9 +728,11 @@ class Hub:
         else:
             owner = self._owner(self.store.authenticate(request.get("session_id"), request.get("session_secret"),allow_closed=op in {'task_cancel','request_status'}))
         with self._owner_gate(owner):
-            return self._dispatch(request)
+            if check_access:
+                check_access()
+            return self._dispatch(request, check_access=check_access)
 
-    def _dispatch(self, request: dict) -> dict:
+    def _dispatch(self, request: dict, *, check_access: Callable | None = None) -> dict:
         if not isinstance(request, dict):
             raise HubError("REQUEST_INVALID")
         op, args = str(request.get("op") or ""), request.get("args") or {}
@@ -725,7 +783,7 @@ class Hub:
                 args = {**args, "key": os.path.normcase(os.path.abspath(str(args.get("key") or "")))}
             return journaled(lambda: self.store.claim(session, args.get("kind"), args.get("key"), mode=args.get("mode", "exclusive"),
                                                       meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
-                                                      wait_seconds=args.get("wait_seconds", 0)))
+                                                      wait_seconds=args.get("wait_seconds", 0), check_access=check_access))
         if op == "resource_release":
             managed = {"browser_tab", "app_session"}
             resource_id = args.get("resource_id")
@@ -736,9 +794,17 @@ class Hub:
             key = args.get("key")
             if args.get("kind") in {"file", "directory"} and key:
                 key = os.path.normcase(os.path.abspath(str(key)))
-            return self.store.release(session, resource_id=args.get("resource_id"), kind=args.get("kind"), key=key)
+            def release() -> dict:
+                return self.store.release(session, resource_id=resource_id, kind=args.get("kind"), key=key)
+            return journaled(release) if request_key else release()
         if op == "resource_list":
             return {"resources": self.store.resources(session_id=session["session_id"], kind=args.get("kind"))}
+        if op == "task_file":
+            if not self.store.is_active_entry_session(session["session_id"]):
+                raise HubError("ENTRY_SESSION_REQUIRED", execution_started=False)
+            def artifact() -> dict:
+                return self.entry_artifacts.call(session["session_id"], args)
+            return journaled(artifact) if args.get("command") == "put" else artifact()
         if op == "permission_check":
             return self.policy.decide(session["agent_id"], str(args.get("risk_class") or ""),
                                       args.get("target") if isinstance(args.get("target"), dict) else None)
@@ -809,22 +875,49 @@ def make_handler(hub: Hub, key: str) -> type:
                 hub.store.audit('client_disconnected',reply_committed=True)
 
         def do_POST(self) -> None:
-            if not hmac.compare_digest(self.headers.get("X-FF-Hub-Key", ""), key):
+            external = self.path == ENTRY_PATH
+            if external and self.headers.get("Origin") is not None:
+                self.close_connection = True
+                return self._reply(403, {"ok": False, "error_code": "ENTRY_ORIGIN_DENIED"})
+            if external and self.headers.get("Host") not in {"127.0.0.1", f"127.0.0.1:{self.server.server_port}"}:
+                self.close_connection = True
+                return self._reply(403, {"ok": False, "error_code": "ENTRY_HOST_DENIED"})
+            if not external and not hmac.compare_digest(self.headers.get("X-FF-Hub-Key", "").encode("utf-8"), key.encode("utf-8")):
+                self.close_connection = True
                 return self._reply(401, {"ok": False, "error_code": "UNAUTHORIZED"})
-            if self.path != "/rpc":
+            if not external and self.path != "/rpc":
+                self.close_connection = True
                 return self._reply(404, {"ok": False, "error_code": "NOT_FOUND"})
+            if external:
+                self.connection.settimeout(15)
+                if self.headers.get_content_type() != "application/json" or self.headers.get("Transfer-Encoding"):
+                    self.close_connection = True
+                    return self._reply(415, {"ok": False, "error_code": "ENTRY_CONTENT_TYPE_INVALID"})
+                if not self.headers.get("Authorization", "").startswith("Bearer "):
+                    self.close_connection = True
+                    return self._reply(401, {"ok": False, "error_code": "ENTRY_UNAUTHORIZED"})
             try:
                 length = int(self.headers.get("Content-Length", "0"))
                 if not 0 < length <= MAX_REQUEST_BYTES:
                     raise ValueError
-                request = json.loads(self.rfile.read(length))
-            except ValueError:
+                data = self.rfile.read(length)
+                if len(data) != length:
+                    raise ValueError
+                request = json.loads(data)
+            except (ValueError, TimeoutError):
+                self.close_connection = True
                 return self._reply(400, {"ok": False, "error_code": "REQUEST_INVALID"})
             started = time.monotonic()
+            status = 200
             try:
-                result = hub.dispatch(request)
+                if external:
+                    result = entry_call(hub, hub.entry_authority, self.headers.get("Authorization", ""), request)
+                else:
+                    result = hub.dispatch(request)
                 body = {"ok": True, "result": result}
             except HubError as exc:
+                if exc.code == "ENTRY_UNAUTHORIZED":
+                    status = 401
                 body = {"ok": False, "error_code": exc.code, "message": exc.message, "details": exc.details}
             except PermissionError_ as exc:
                 body = {"ok": False, "error_code": exc.code, "message": exc.code, "details": exc.details}
@@ -835,7 +928,7 @@ def make_handler(hub: Hub, key: str) -> type:
                 body = {"ok": False, "error_code": "HUB_INTERNAL_ERROR", "message": type(exc).__name__,
                         "details": {"retry_safe": False}}
             body["duration_ms"] = int((time.monotonic() - started) * 1000)
-            self._reply(200, body)
+            self._reply(status, body)
 
     return Handler
 
@@ -957,7 +1050,7 @@ def _serve_locked(state_dir: Path, port: int) -> int:
         os.replace(temporary, key_file)
     key = key_file.read_text(encoding="ascii").strip()
     hub = Hub(state_dir)
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", port), make_handler(hub, key))
+    server = HubHTTPServer(("127.0.0.1", port), make_handler(hub, key))
     server.daemon_threads = True
     hub._shutdown_request=lambda:threading.Thread(target=server.shutdown,daemon=True).start()
     record = {"version": HUB_VERSION, "pid": os.getpid(), "create_time": process_creation_token(os.getpid()),
@@ -982,12 +1075,30 @@ def _serve_locked(state_dir: Path, port: int) -> int:
     return 0
 
 
+class HubHTTPServer(http.server.ThreadingHTTPServer):
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt":
+            # Winsock SO_REUSEADDR allows an unrelated Hub to share a live port.
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 def ensure_running(state_dir: Path | None = None, *, python: str | None = None, wait_seconds: float = 20.0) -> dict:
     """Start the Hub if it is not running. Safe to call from several Bridge instances at once."""
     state_dir = Path(state_dir) if state_dir else default_state_dir()
     client = HubClient(state_dir, timeout=5)
+
+    def ready():
+        endpoint = client.endpoint()
+        status = client.call("hub_status")
+        if status.get("pid") != endpoint["pid"]:
+            raise HubError("HUB_ENDPOINT_IDENTITY_MISMATCH")
+        return endpoint
+
     try:
-        return client.endpoint()
+        return ready()
     except HubError:
         pass
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -1006,7 +1117,7 @@ def ensure_running(state_dir: Path | None = None, *, python: str | None = None, 
     deadline = time.monotonic() + wait_seconds
     while time.monotonic() < deadline:
         try:
-            return client.endpoint()
+            return ready()
         except HubError:
             time.sleep(0.1)
     raise HubError("HUB_START_FAILED", "the Hub did not start", log=str(state_dir / "hub.log"), retry_safe=True)
