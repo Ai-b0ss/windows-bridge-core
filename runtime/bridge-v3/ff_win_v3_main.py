@@ -142,6 +142,18 @@ def _enforce_computer_use_background_policy(args: dict[str, Any]) -> bool:
 _HIDDEN_SESSIONS: dict[str, Any] = {}
 _HIDDEN_LOCK = __import__("threading").Lock()
 
+
+def _drain_without_owned_hidden_sessions(args: dict[str, Any]) -> dict[str, Any]:
+    # Worker/Desktop handles live in this process and cannot follow the listener.
+    # Keep admission serialized until the socket transfer commits or fails.
+    with _HIDDEN_LOCK:
+        if _HIDDEN_SESSIONS:
+            raise core.RPCError("DRAIN_HIDDEN_SESSIONS_ACTIVE", details={
+                "active_hidden_sessions": len(_HIDDEN_SESSIONS), "execution_started": False,
+            })
+        return core.op_drain(args)
+
+
 def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
     from cua_hidden_desktop import HiddenDesktopSession, HiddenDesktopError
     command = args.get("command")
@@ -151,6 +163,10 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
             if set(args)-{"command","worker_integrity","webview_debug"}:
                 raise core.RPCError("HIDDEN_START_OPTION_INVALID")
             with _HIDDEN_LOCK:
+                if core.STATE.drain_requested or core.STATE.draining:
+                    raise core.RPCError("HIDDEN_START_DRAINING", details={"execution_started": False})
+                if core.STATE.standby_waiting and not core.STATE.accept_ready.is_set():
+                    raise core.RPCError("HIDDEN_START_STANDBY", details={"execution_started": False})
                 if len(_HIDDEN_SESSIONS) >= 4:
                     raise core.RPCError("HIDDEN_SESSION_LIMIT")
                 session = HiddenDesktopSession(Path(__file__).resolve().parent,
@@ -163,13 +179,16 @@ def _hidden_computer_use(args: dict[str, Any]) -> dict[str, Any]:
         session_id = args.get("session_id")
         with _HIDDEN_LOCK:
             session = _HIDDEN_SESSIONS.get(session_id)
-            if command == "hidden_close":
-                session = _HIDDEN_SESSIONS.pop(session_id, None)
+            if session is not None and command == "hidden_close":
+                session.close()
+                _HIDDEN_SESSIONS.pop(session_id, None)
         if session is None:
             raise core.RPCError("HIDDEN_SESSION_NOT_FOUND")
         if command == "hidden_close":
-            session.close()
-            return {"closed": True, "session_id": session_id,'editor_profile_cleanup':session.editor_profile_cleanup,
+            profile_cleanup = [*session.editor_profile_cleanup, *session.browser_profile_cleanup]
+            return {"closed": True, "session_id": session_id,
+                    "cleanup_verified": session.job_cleanup_verified and all(item['removed'] for item in profile_cleanup),
+                    'editor_profile_cleanup':session.editor_profile_cleanup,
                     'browser_profile_cleanup':session.browser_profile_cleanup}
         payload = args.get("request")
         if not isinstance(payload, dict):
@@ -727,6 +746,10 @@ def _install_gui_guards() -> None:
         features["hidden_desktop_supported_apps"] = available_apps()
         features["hidden_uia_no_focus_msaa_invoke"] = True
         features["hidden_worker_integrity_modes"] = ["owner","medium"]
+        with _HIDDEN_LOCK:
+            features["hidden_desktop_handover_guard"] = {
+                "version": 1, "active_hidden_sessions": len(_HIDDEN_SESSIONS), "requires_idle": True,
+            }
         features['hidden_chrome_commands']=['browser.launch','browser.info']
         features['hidden_chrome_scope']='native window on private Desktop; fresh owned profile; verified loopback CDP; sandbox enabled'
         features["hidden_owned_panel_commands"] = ["panel.discover","panel.inspect","panel.type","panel.invoke","panel.verify"]
@@ -749,6 +772,7 @@ def _install_gui_guards() -> None:
         return result
 
     core.OPS["capabilities"] = capabilities
+    core.OPS["drain"] = _drain_without_owned_hidden_sessions
     core.OPS["set_desktop_mode"] = _set_desktop_mode
     core.OPS["chat_permission_status"] = lambda args: _CHAT_PERMISSION.status()
 

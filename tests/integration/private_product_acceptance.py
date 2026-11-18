@@ -11,7 +11,8 @@ from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'runtime/bridge-v3'))
 from ff_hub import HubClient,HubError
 from ff_hub_permissions import Policy
-from ff_win_process_identity import process_creation_token,process_identity_matches
+from cua_hidden_chrome import chrome_path
+from ff_win_process_identity import ProcessReference,process_creation_token,process_identity_matches
 from hidden_chrome_smoke import Gate,check,RUNTIME
 from private_observer import Observer
 
@@ -61,6 +62,28 @@ class ProductGate(Gate):
     def cancel(self,c):
         result=self.call(c,'task_cancel',key='task-cancel-'+c.session['session_id'])
         check(result['cleanup_verified'],'CANCEL_CLEANUP_FAILED');return result
+    def crash_browser_then_worker(self,item):
+        import psutil
+        client,browser,_,info=item
+        child=psutil.Process(info['pid'])
+        worker=child.parent()
+        check(process_identity_matches(child.pid,info['create_time']),'CHROME_CHANGED_BEFORE_TEST')
+        check(Path(child.exe()).resolve()==chrome_path(),'CHROME_IMAGE_CHANGED_BEFORE_TEST')
+        check('--user-data-dir='+info['profile_path'] in child.cmdline(),'CHROME_PROFILE_NOT_OWNED')
+        check(worker is not None and worker.ppid()==self.process.pid,'WORKER_NOT_OWNED')
+        worker_token=process_creation_token(worker.pid)
+        check(Path(worker.exe()).resolve()==Path(sys.executable).resolve(),'WORKER_IMAGE_CHANGED_BEFORE_TEST')
+        check(Path(worker.cmdline()[1]).resolve()==RUNTIME/'cua_hidden_worker.py','WORKER_COMMAND_CHANGED_BEFORE_TEST')
+        check(process_identity_matches(worker.pid,worker_token),'WORKER_CHANGED_BEFORE_TEST')
+        with_process=(ProcessReference(child.pid,info['create_time']), ProcessReference(worker.pid,worker_token))
+        try:
+            with_process[0].terminate()
+            self.call(client,'private_browser',{'browser_id':browser,'command':'info'},expect='HIDDEN_CHROME_PROCESS_CHANGED')
+            with_process[1].terminate()
+            self.call(client,'private_browser',{'browser_id':browser,'command':'info'},expect='HIDDEN_ACTION_OUTCOME_UNKNOWN')
+        finally:
+            for process in with_process:process.close()
+        self.cancel(client)
     def bridge_proxy(self):
         proc=subprocess.Popen([sys.executable,str(RUNTIME/'ff_win_v3_main.py'),'serve','--host','127.0.0.1','--port',str(self.port)],env={**os.environ,'FF_BRIDGE_ROOT':str(self.root)},stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,creationflags=subprocess.CREATE_NO_WINDOW)
         self.own(proc.pid);self.extra_processes.append(proc);deadline=time.monotonic()+20
@@ -123,6 +146,8 @@ def main():
             check('Product GUI saved 47' in '\n'.join(p.text for p in Document(document).paragraphs),'WORD_FILE_READBACK')
             g.results['P0']={'status':'PASS','apps':['Character Map Win32/UIA','Word native GUI/COM'],'independent_docx_readback':True,'unsupported_generic_chrome_denied':True}
             g.cancel(c)
+            check(not process_identity_matches(app['pid'],app['create_time']),'CHARMAP_ALIVE_AFTER_CANCEL_RECEIPT')
+            check(not process_identity_matches(word['pid'],word['create_time']),'WORD_ALIVE_AFTER_CANCEL_RECEIPT')
         if a.only!='p0':
             clients=[g.client(n) for n in ['one','two','three']];browsers=[]
             for index,client in enumerate(clients):
@@ -201,12 +226,7 @@ def main():
             check(sum(json.loads(e).get('customer')=='late-once' for e in g.events)==1,'UNKNOWN_REPLAYED')
             check(g.call(c,'request_status',{'request_key':'backend-timeout'})['state']=='unknown','UNKNOWN_RECEIPT')
             # Browser crash, then worker/Hub crash: only exact saved owned identities.
-            import psutil
-            crash_item=browsers[1];g.own_tree(g.process.pid);worker=psutil.Process(crash_item[3]['pid']).parent();worker_token=process_creation_token(worker.pid)
-            psutil.Process(crash_item[3]['pid']).terminate()
-            g.call(crash_item[0],'private_browser',{'browser_id':crash_item[1],'command':'info'},expect='HIDDEN_CHROME_PROCESS_CHANGED')
-            check(process_identity_matches(worker.pid,worker_token),'WORKER_CHANGED_BEFORE_TEST');worker.terminate()
-            g.call(crash_item[0],'private_browser',{'browser_id':crash_item[1],'command':'info'},expect='HIDDEN_ACTION_OUTCOME_UNKNOWN');g.cancel(crash_item[0])
+            g.own_tree(g.process.pid);g.crash_browser_then_worker(browsers[1])
             g.own_tree(g.process.pid);g.stop_bridge();time.sleep(.5);g.start()
             # Resume saved identity; journal survives, old native handles are deliberately lost.
             session=c.session;c.call('session_open',{'agent_id':'one','task_id':'product-acceptance','resume_token':session['resume_token']})

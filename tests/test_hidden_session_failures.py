@@ -6,12 +6,14 @@ the request/close and RPC error-handling bodies themselves are production code.
 from __future__ import annotations
 
 import ast
+import ctypes
 import json
 import os
 from pathlib import Path
 import queue
 import sys
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -25,13 +27,14 @@ def parent_classes():
     tree = ast.parse(path.read_text(encoding="utf-8"))
     nodes = []
     for node in tree.body:
-        if isinstance(node, ast.ClassDef) and node.name == "HiddenDesktopError":
+        if isinstance(node, ast.ClassDef) and node.name in {"HiddenDesktopError", "_JobAccounting"}:
             nodes.append(node)
         if isinstance(node, ast.ClassDef) and node.name == "HiddenDesktopSession":
             node.body = [method for method in node.body if isinstance(method, ast.FunctionDef)
-                         and method.name in {"request", "close", "closed"}]
+                         and method.name in {"request", "close", "closed", "_close_resources", "_stop_owned_processes"}]
             nodes.append(node)
-    namespace = {"Path": Path, "os": os, "queue": queue, "json": json, "uuid": uuid}
+    namespace = {"Path": Path, "os": os, "queue": queue, "json": json, "uuid": uuid,
+                 "ctypes": ctypes, "w": SimpleNamespace(DWORD=ctypes.c_uint32), "time": time}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec"), namespace)
     return namespace
 
@@ -43,7 +46,7 @@ class HiddenSessionFailureContracts(unittest.TestCase):
         self.session = self.namespace["HiddenDesktopSession"].__new__(self.namespace["HiddenDesktopSession"])
         s = self.session
         s.session_id = "owned-session"
-        s._lock = threading.Lock()
+        s._lock, s._close_lock = threading.Lock(), threading.Lock()
         s._closed = False
         s._job, s._process, s._desktop = "owned-job", "owned-worker", "owned-desktop"
         s._writer, s._stderr = Mock(), Mock()
@@ -53,7 +56,9 @@ class HiddenSessionFailureContracts(unittest.TestCase):
         self.events = []
         self.namespace["_close_windows_job_handle"] = lambda handle: self.events.append(("job", handle))
         s._k = SimpleNamespace(TerminateProcess=Mock(side_effect=lambda *a: self.events.append(("worker", a[0]))),
-                               WaitForSingleObject=Mock(), CloseHandle=Mock())
+                               TerminateJobObject=Mock(side_effect=lambda *a: self.events.append(("terminate-job", a[0])) or True),
+                               QueryInformationJobObject=Mock(side_effect=lambda *a: self.events.append(("query-job", a[0])) or True),
+                               WaitForSingleObject=Mock(return_value=0), CloseHandle=Mock())
         s._u = SimpleNamespace(CloseDesktop=Mock())
         self.profile = SimpleNamespace(path=Path("/owned-fixture/worker-profile"),
             close=Mock(side_effect=lambda: self.events.append(("profile", True)) or True))
@@ -77,7 +82,9 @@ class HiddenSessionFailureContracts(unittest.TestCase):
         self.assertEqual(raised.exception.code, "HIDDEN_CHROME_LISTENER_NOT_OWNED")
         self.assertEqual(raised.exception.details, {"attempted": True})
         self.assertTrue(self.session.closed)
-        self.assertEqual(self.events, [("job", "owned-job"), ("worker", "owned-worker"), ("profile", True)])
+        self.assertTrue(self.session.job_cleanup_verified)
+        self.assertEqual(self.events, [("terminate-job", "owned-job"), ("query-job", "owned-job"),
+                                       ("job", "owned-job"), ("profile", True)])
         self.profile.close.assert_called_once_with()
         self.assertEqual(self.session.browser_profile_cleanup,
                          [{"root": str(self.profile.path), "removed": True}])
@@ -107,7 +114,7 @@ class HiddenSessionFailureContracts(unittest.TestCase):
             self.session.request({"command": "browser.launch"}, timeout_s=.1)
         self.writer.write.assert_called_once()
         self.assertTrue(self.session.closed)
-        self.assertEqual(self.events[0], ("job", "owned-job"))
+        self.assertEqual(self.events[0], ("terminate-job", "owned-job"))
         self.assertEqual(self.events[-1], ("profile", True))
         with self.assertRaisesRegex(self.Error, "HIDDEN_WORKER_CLOSED"):
             self.session.request({"command": "browser.launch"})
@@ -119,7 +126,7 @@ class HiddenSessionFailureContracts(unittest.TestCase):
             self.session.request({"command": "health"})
         self.assertTrue(self.session.closed)
         self.writer.write.assert_called_once()
-        self.assertEqual(self.events[0], ("job", "owned-job"))
+        self.assertEqual(self.events[0], ("terminate-job", "owned-job"))
 
     def test_broken_pipe_after_profile_allocation_closes_and_reports_unknown(self):
         self.writer.write.side_effect = BrokenPipeError("owned worker pipe closed")
@@ -130,7 +137,21 @@ class HiddenSessionFailureContracts(unittest.TestCase):
         self.profile.close.assert_called_once_with()
         self.session.close()  # Reconciliation/cleanup may safely repeat close, never launch.
         self.profile.close.assert_called_once_with()
-        self.assertEqual(self.events, [("job", "owned-job"), ("worker", "owned-worker"), ("profile", True)])
+        self.assertEqual(self.events, [("terminate-job", "owned-job"), ("query-job", "owned-job"),
+                                       ("job", "owned-job"), ("profile", True)])
+
+    def test_job_cleanup_waits_for_descendants_and_reports_query_failure(self):
+        self.session._chrome_profile = self.profile
+        accounting_calls = []
+        def query(_, __, accounting, *args):
+            accounting_calls.append(True)
+            accounting._obj.ActiveProcesses = 1
+            return len(accounting_calls) == 1
+        self.session._k.QueryInformationJobObject.side_effect = query
+        self.session.close()
+        self.assertFalse(self.session.job_cleanup_verified)
+        self.assertEqual(len(accounting_calls), 2)
+        self.assertEqual(self.events[-2:], [("job", "owned-job"), ("profile", True)])
 
     def test_predispatch_options_or_existing_browser_do_not_destroy_live_session(self):
         with self.assertRaisesRegex(self.Error, "HIDDEN_CHROME_OPTION_FORBIDDEN"):

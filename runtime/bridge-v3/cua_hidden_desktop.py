@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from types import SimpleNamespace
 import uuid
 from cua_sidecar_supervisor import _bind_windows_kill_on_close_job, _close_windows_job_handle
@@ -29,6 +30,16 @@ class _StartupInfoEx(ctypes.Structure):
 
 class _ProcessInfo(ctypes.Structure):
     _fields_=[("hProcess",w.HANDLE),("hThread",w.HANDLE),("pid",w.DWORD),("tid",w.DWORD)]
+
+
+class _JobAccounting(ctypes.Structure):
+    _fields_ = [
+        ("TotalUserTime", ctypes.c_longlong), ("TotalKernelTime", ctypes.c_longlong),
+        ("ThisPeriodTotalUserTime", ctypes.c_longlong), ("ThisPeriodTotalKernelTime", ctypes.c_longlong),
+        ("TotalPageFaultCount", w.DWORD), ("TotalProcesses", w.DWORD),
+        ("ActiveProcesses", w.DWORD), ("TotalTerminatedProcesses", w.DWORD),
+    ]
+
 
 def _medium_desktop(u, k, desktop_name):
     """Label only the new private desktop; retain this owner's access."""
@@ -107,11 +118,12 @@ class HiddenDesktopSession:
         self.root=Path(package_root).resolve()
         self.session_id=uuid.uuid4().hex
         self.desktop_name="FFBridge-Agent-"+self.session_id
-        self._lock=threading.Lock();self._queue=queue.Queue()
+        self._lock=threading.Lock();self._close_lock=threading.Lock();self._queue=queue.Queue()
         self._desktop=None;self._process=None;self._job=None;self._writer=None;self._reader=None
         self._stderr=None;self.pid=None;self._closed=False
         self._editor_profiles=[];self.editor_profile_cleanup=[]
         self._chrome_profile=None;self.browser_profile_cleanup=[]
+        self.job_cleanup_verified=False
         self.worker_integrity=worker_integrity;self.webview_port=None
         self._u=ctypes.WinDLL("user32",use_last_error=True);self._k=ctypes.WinDLL("kernel32",use_last_error=True)
         self._u.CreateDesktopW.argtypes=[w.LPCWSTR,w.LPCWSTR,ctypes.c_void_p,w.DWORD,w.DWORD,ctypes.c_void_p];self._u.CreateDesktopW.restype=w.HANDLE
@@ -120,6 +132,8 @@ class HiddenDesktopSession:
         self._k.CloseHandle.argtypes=[w.HANDLE];self._k.ResumeThread.argtypes=[w.HANDLE]
         self._k.SetHandleInformation.argtypes=[w.HANDLE,w.DWORD,w.DWORD]
         self._k.TerminateProcess.argtypes=[w.HANDLE,w.UINT];self._k.WaitForSingleObject.argtypes=[w.HANDLE,w.DWORD]
+        self._k.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]
+        self._k.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,w.LPVOID,w.DWORD,ctypes.POINTER(w.DWORD)]
         self._k.InitializeProcThreadAttributeList.argtypes=[w.LPVOID,w.DWORD,w.DWORD,ctypes.POINTER(ctypes.c_size_t)]
         self._k.UpdateProcThreadAttribute.argtypes=[w.LPVOID,w.DWORD,ctypes.c_size_t,w.LPVOID,ctypes.c_size_t,w.LPVOID,w.LPVOID]
         self._k.DeleteProcThreadAttributeList.argtypes=[w.LPVOID]
@@ -198,26 +212,30 @@ class HiddenDesktopSession:
         if not isinstance(timeout_s,(int,float)) or not 0<timeout_s<=60:
             raise HiddenDesktopError("HIDDEN_TIMEOUT_INVALID")
         with self._lock:
-            if self._closed:raise HiddenDesktopError("HIDDEN_WORKER_CLOSED")
-            if '__owned_editor_root' in payload:raise HiddenDesktopError('EDITOR_INTERNAL_ROOT_FORBIDDEN')
-            if '__owned_browser_root' in payload:raise HiddenDesktopError('BROWSER_INTERNAL_ROOT_FORBIDDEN')
-            if payload.get('command')=='browser.launch':
-                if set(payload)!={'command'}:raise HiddenDesktopError('HIDDEN_CHROME_OPTION_FORBIDDEN')
-                if self._chrome_profile is not None:raise HiddenDesktopError('HIDDEN_CHROME_ALREADY_LAUNCHED')
-                from cua_browser_profiles import ManagedBrowserProfiles
-                state=Path(os.environ.get('FF_BRIDGE_ROOT') or Path(os.environ['LOCALAPPDATA'])/'FF-Windows-Bridge')/'state/hidden-chrome'
-                self._chrome_profile=ManagedBrowserProfiles(state)
-                payload={**payload,'__owned_browser_root':str(self._chrome_profile.path)}
-            if payload.get('command')=='editor.launch':
-                from cua_browser_profiles import ManagedBrowserProfiles
-                profiles=ManagedBrowserProfiles(Path(os.environ['LOCALAPPDATA'])/'FFWindowsBridge/state/owned-editor')
-                self._editor_profiles.append(profiles)
-                payload={**payload,'__owned_editor_root':str(profiles.path)}
+            with self._close_lock:
+                if self._closed:raise HiddenDesktopError("HIDDEN_WORKER_CLOSED")
+                if '__owned_editor_root' in payload:raise HiddenDesktopError('EDITOR_INTERNAL_ROOT_FORBIDDEN')
+                if '__owned_browser_root' in payload:raise HiddenDesktopError('BROWSER_INTERNAL_ROOT_FORBIDDEN')
+                if payload.get('command')=='browser.launch':
+                    if set(payload)!={'command'}:raise HiddenDesktopError('HIDDEN_CHROME_OPTION_FORBIDDEN')
+                    if self._chrome_profile is not None:raise HiddenDesktopError('HIDDEN_CHROME_ALREADY_LAUNCHED')
+                    from cua_browser_profiles import ManagedBrowserProfiles
+                    state=Path(os.environ.get('FF_BRIDGE_ROOT') or Path(os.environ['LOCALAPPDATA'])/'FF-Windows-Bridge')/'state/hidden-chrome'
+                    self._chrome_profile=ManagedBrowserProfiles(state)
+                    payload={**payload,'__owned_browser_root':str(self._chrome_profile.path)}
+                if payload.get('command')=='editor.launch':
+                    from cua_browser_profiles import ManagedBrowserProfiles
+                    state=Path(os.environ.get('FF_BRIDGE_ROOT') or Path(os.environ['LOCALAPPDATA'])/'FFWindowsBridge')/'state/owned-editor'
+                    profiles=ManagedBrowserProfiles(state)
+                    self._editor_profiles.append(profiles)
+                    payload={**payload,'__owned_editor_root':str(profiles.path)}
+                writer = self._writer
             request_id=uuid.uuid4().hex
+            packet=json.dumps({"id":request_id,"args":payload},ensure_ascii=True)+"\n"
             try:
-                self._writer.write(json.dumps({"id":request_id,"args":payload},ensure_ascii=True)+"\n");self._writer.flush()
+                writer.write(packet);writer.flush()
                 reply=self._queue.get(timeout=timeout_s)
-            except (OSError,queue.Empty):
+            except (OSError,ValueError,queue.Empty):
                 self.close()
                 raise HiddenDesktopError("HIDDEN_ACTION_OUTCOME_UNKNOWN")
             if reply.get("fatal") or reply.get("id")!=request_id:
@@ -233,13 +251,44 @@ class HiddenDesktopSession:
     def closed(self):
         return self._closed
 
+    def _stop_owned_processes(self):
+        job, self._job = self._job, None
+        deadline = time.monotonic() + 5
+        try:
+            terminated = bool(job and self._k.TerminateJobObject(job, 0))
+            worker_exited = True
+            if self._process:
+                if not terminated:
+                    self._k.TerminateProcess(self._process, 0)
+                worker_exited = self._k.WaitForSingleObject(self._process, max(0, int((deadline - time.monotonic()) * 1000))) == 0
+                self._k.CloseHandle(self._process)
+                self._process = None
+            if not job:
+                return worker_exited
+            if not terminated or not worker_exited:
+                return False
+            # Termination is asynchronous. Keep the owning Job handle until
+            # descendants are gone, including UIA and browser child processes.
+            accounting = _JobAccounting()
+            while self._k.QueryInformationJobObject(job, 1, ctypes.byref(accounting), ctypes.sizeof(accounting), None):
+                if accounting.ActiveProcesses == 0:
+                    return True
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+            return False
+        finally:
+            # Kill-on-close remains the fallback for a failed verification.
+            _close_windows_job_handle(job)
+
     def close(self):
-        if self._closed:return
-        self._closed=True
-        _close_windows_job_handle(self._job);self._job=None
-        if self._process:
-            self._k.TerminateProcess(self._process,0);self._k.WaitForSingleObject(self._process,5000)
-            self._k.CloseHandle(self._process);self._process=None
+        with self._close_lock:
+            if self._closed:return
+            self._closed=True
+            self._close_resources()
+
+    def _close_resources(self):
+        self.job_cleanup_verified=self._stop_owned_processes()
         if self._writer:
             # The owned worker/job is already closed. Windows can raise
             # EINVAL/EPIPE while flushing this dead pipe; do not let that
