@@ -29,7 +29,8 @@ ROOT_FILES = {
     "CHATGPT-REMOTE-CONTROL.md",
 }
 TOOL_FILES = {"tools/bridge_remote_gh.py", "tools/optional_addons.py", "tools/cua_cold_rollback_bundle.py", "tools/cua_cold_recovery_watchdog.py",
-              "tools/private_desktop_client.py","tools/private_desktop_runtime.py", "tools/agent_entry.py"}
+              "tools/private_desktop_client.py","tools/private_desktop_runtime.py", "tools/agent_entry.py",
+              "tools/canary_release_workflow.py", "tools/canary_cutover_c1_c2.ps1", "tools/canary_rollback_c1_c2.ps1"}
 TEXT_EXTENSIONS = (".py", ".ps1", ".cmd", ".json", ".mjs", ".js", ".cs", ".md", ".txt")
 SECRET_PATTERNS = (
     rb"gh[pousr]_[A-Za-z0-9]{24,}", rb"github_pat_[A-Za-z0-9_]{30,}",
