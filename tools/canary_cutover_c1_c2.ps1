@@ -43,6 +43,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+try {
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    $OutputEncoding = $utf8NoBom
+    [Console]::OutputEncoding = $utf8NoBom
+} catch {
+}
 
 $workflowPy = Join-Path $PSScriptRoot 'canary_release_workflow.py'
 if (-not (Test-Path -LiteralPath $workflowPy -PathType Leaf)) {
@@ -180,6 +186,8 @@ if ($SkipC2) { $startArgs += @('--no-c2-gateway', '--no-c2-unified') }
 $startOut = & python -X utf8 $workflowPy @startArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+$healthCode = 0
+$stopCode = 0
 try {
     $healthArgs = @('health', '--shadow-root', $ShadowRoot, '--consecutive-passes', ([string]$HealthConsecutivePasses))
     if ($StartC1Rpc) { $healthArgs += '--c1-rpc' }
@@ -187,18 +195,24 @@ try {
     if ($RequireUpstreamOmniroute) { $healthArgs += '--require-upstream-omniroute' }
     $healthOut = & python -X utf8 $workflowPy @healthArgs
     $healthCode = $LASTEXITCODE
+    $healthObj = $null
+    if ($healthOut) {
+        try { $healthObj = ($healthOut | ConvertFrom-Json) } catch { $healthObj = [ordered]@{ ok = $false; raw_output = [string]$healthOut } }
+    }
     Write-Output ([ordered]@{
         ok = ($healthCode -eq 0)
         mode = 'SHADOW_FULL'
         stage = ($stageOut | ConvertFrom-Json)
         start = ($startOut | ConvertFrom-Json)
-        health = ($healthOut | ConvertFrom-Json)
+        health = $healthObj
         live_production_mutated = $false
     } | ConvertTo-Json -Depth 10)
-    if ($healthCode -ne 0) { exit $healthCode }
 } finally {
     if ($StopAfterVerify) {
         & python -X utf8 $workflowPy stop-shadow --shadow-root $ShadowRoot | Out-Null
+        $stopCode = $LASTEXITCODE
     }
 }
+if ($healthCode -ne 0) { exit $healthCode }
+if ($StopAfterVerify -and $stopCode -ne 0) { exit $stopCode }
 exit 0

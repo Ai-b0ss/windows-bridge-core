@@ -9,6 +9,12 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+try {
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    $OutputEncoding = $utf8NoBom
+    [Console]::OutputEncoding = $utf8NoBom
+} catch {
+}
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $cutoverScript = Join-Path $repoRoot 'tools\canary_cutover_c1_c2.ps1'

@@ -30,6 +30,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+try {
+    $utf8NoBom = [Text.UTF8Encoding]::new($false)
+    $OutputEncoding = $utf8NoBom
+    [Console]::OutputEncoding = $utf8NoBom
+} catch {
+}
 
 $workflowPy = Join-Path $PSScriptRoot 'canary_release_workflow.py'
 if (-not (Test-Path -LiteralPath $workflowPy -PathType Leaf)) {
