@@ -1986,10 +1986,19 @@ def _bridge_rpc_call(port: int, secret: str, op: str, args: dict[str, Any], *, t
         return json.loads(exc.read())
 
 
-def _http_get_json(port: int, path: str, *, timeout: float = 3.0) -> tuple[int, dict[str, Any] | None]:
+def _http_get_json(
+    port: int,
+    path: str,
+    *,
+    timeout: float = 3.0,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict[str, Any] | None]:
+    req_headers = {"Accept": "application/json", "Connection": "close"}
+    if headers:
+        req_headers.update(headers)
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}",
-        headers={"Accept": "application/json", "Connection": "close"},
+        headers=req_headers,
         method="GET",
     )
     try:
@@ -2531,23 +2540,44 @@ def verify_shadow_health(
                 lease_v = verify_process_lease(root, "c2_unified", require_alive=True, check_cmdline=True)
                 uni_port = int(c2_cfg["unified_port"])
                 gw_port = int(c2_cfg["gateway_port"])
+                shadow_key_file = c2_slot / "gateway.key"
+                auth_headers: dict[str, str] = {}
+                if shadow_key_file.is_file():
+                    shadow_key = shadow_key_file.read_text(encoding="ascii").strip()
+                    if shadow_key:
+                        auth_headers["Authorization"] = "Bearer " + shadow_key
                 passes = 0
                 observed_gw_port: int | None = None
                 ready_http = 0
-                ready_body: dict[str, Any] | None = None
                 gateway_upstream_ok = False
                 for _ in range(consecutive_passes):
                     code, body = _http_get_json(uni_port, "/health", timeout=3.0)
-                    r_code, r_body = _http_get_json(uni_port, "/ready", timeout=3.0)
-                    ready_http, ready_body = r_code, r_body
+                    r_code, r_body = _http_get_json(uni_port, "/ready", timeout=3.0, headers=auth_headers)
+                    ready_http = r_code
                     observed_gw_port = body.get("gateway_port") if isinstance(body, dict) else None
-                    gw_section = (r_body or {}).get("gateway") if isinstance(r_body, dict) else None
-                    omni_section = (r_body or {}).get("omniroute") if isinstance(r_body, dict) else None
-                    gw_up = bool(gw_section.get("ok")) if isinstance(gw_section, dict) else (r_code == 200)
-                    omni_up = bool(omni_section.get("ok")) if isinstance(omni_section, dict) else (r_code == 200)
+                    # Support real C2 Unified API contract: {"ready": bool, "services": {"gateway": {"reachable": bool}, "omniroute": {"reachable": bool}}}
+                    services_map = (r_body or {}).get("services") if isinstance(r_body, dict) else None
+                    gw_section = (
+                        services_map.get("gateway")
+                        if isinstance(services_map, dict)
+                        else ((r_body or {}).get("gateway") if isinstance(r_body, dict) else None)
+                    )
+                    omni_section = (
+                        services_map.get("omniroute")
+                        if isinstance(services_map, dict)
+                        else ((r_body or {}).get("omniroute") if isinstance(r_body, dict) else None)
+                    )
+                    if isinstance(gw_section, dict):
+                        gw_up = bool(gw_section.get("reachable") if "reachable" in gw_section else gw_section.get("ok"))
+                    else:
+                        gw_up = (r_code == 200)
+                    if isinstance(omni_section, dict):
+                        omni_up = bool(omni_section.get("reachable") if "reachable" in omni_section else omni_section.get("ok"))
+                    else:
+                        omni_up = (r_code == 200)
                     gateway_upstream_ok = gw_up
                     upstream_omniroute_ok = omni_up
-                    if code == 200 and observed_gw_port == gw_port and gw_up:
+                    if code == 200 and observed_gw_port == gw_port and r_code in (200, 503) and gw_up:
                         passes += 1
                     else:
                         break
@@ -2564,6 +2594,7 @@ def verify_shadow_health(
                     "identity_verified": True,
                     "port": uni_port,
                     "gateway_port": observed_gw_port,
+                    "ready_authenticated": bool(auth_headers),
                     "gateway_upstream_ok": gateway_upstream_ok,
                     "upstream_omniroute_ok": upstream_omniroute_ok,
                     "ready_http_status": ready_http,
