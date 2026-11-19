@@ -186,7 +186,7 @@ class HubStore:
                 "agent_id": agent_id, "task_id": task_id, "resumed": bool(previous), "adopted_resources": adopted,
                 "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
 
-    def authenticate(self, session_id: Any, secret: Any, *, allow_closed=False) -> dict:
+    def authenticate(self, session_id: Any, secret: Any, *, allow_closed: bool = False, touch: bool = True) -> dict:
         if not isinstance(session_id, str) or not isinstance(secret, str):
             raise HubError("SESSION_REQUIRED", "open a session first (session_open)")
         with self._lock:
@@ -195,18 +195,37 @@ class HubStore:
                 raise HubError("SESSION_INVALID", "unknown session or wrong session secret")
             if row["state"] == "superseded" or (row["state"] != "active" and not allow_closed):
                 raise HubError("SESSION_CLOSED", "this session ended; open or resume one", state=row["state"])
-            if row['state']=='active':self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
+            if touch and row["state"] == "active":
+                self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
         return {"session_id": session_id, "agent_id": row["agent_id"], "task_id": row["task_id"]}
 
     def close_session(self, session_id: str, *, state: str = "closed") -> list[dict]:
         """End a session and return the resources it still held, for the caller to clean up."""
         with self._lock:
-            held = self.resources(session_id=session_id)
-            now = self.clock()
-            self._db.execute("UPDATE resources SET state='released', released_at=? WHERE session_id=? AND state='held'",
-                             (now, session_id))
-            self._db.execute("UPDATE sessions SET state=?, closed_at=? WHERE session_id=? AND state='active'",
-                             (state, now, session_id))
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                held = [
+                    self._resource(row)
+                    for row in self._db.execute(
+                        "SELECT * FROM resources WHERE state='held' AND session_id=? ORDER BY created_at",
+                        (session_id,),
+                    ).fetchall()
+                ]
+                now = self.clock()
+                if held:
+                    self._db.execute(
+                        "UPDATE resources SET state='released', released_at=? WHERE session_id=? AND state='held'",
+                        (now, session_id),
+                    )
+                self._db.execute(
+                    "UPDATE sessions SET state=?, closed_at=? WHERE session_id=? AND state='active'",
+                    (state, now, session_id),
+                )
+                self._db.execute("COMMIT")
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
         return held
 
     def sessions(self, *, include_closed: bool = False) -> list[dict]:

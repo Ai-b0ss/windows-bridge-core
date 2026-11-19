@@ -1070,7 +1070,14 @@ class Hub:
                 raise HubError("IDENTITY_INVALID")
             owner = self._owner(args)
         else:
-            owner = self._owner(self.store.authenticate(request.get("session_id"), request.get("session_secret"),allow_closed=op in {'task_cancel','request_status'}))
+            owner = self._owner(
+                self.store.authenticate(
+                    request.get("session_id"),
+                    request.get("session_secret"),
+                    allow_closed=op in {"task_cancel", "request_status"},
+                    touch=False,
+                )
+            )
         with self._owner_gate(owner):
             if check_access:
                 check_access()
@@ -1110,7 +1117,12 @@ class Hub:
                 if self._stopping:raise HubError('HUB_STOPPING',execution_started=False)
                 return self.store.open_session(args.get("agent_id"), args.get("task_id"),
                                                resume_token=args.get("resume_token"), note=args.get("note"))
-        session = self.store.authenticate(request.get("session_id"), request.get("session_secret"),allow_closed=op in {'task_cancel','request_status'})
+        session = self.store.authenticate(
+            request.get("session_id"),
+            request.get("session_secret"),
+            allow_closed=op in {"task_cancel", "request_status"},
+            touch=(op != "task_cancel"),
+        )
         request_key = request.get("request_key")
 
         def journaled(run: Callable[[], dict]) -> dict:
@@ -1247,9 +1259,10 @@ def make_handler(hub: Hub, key: str) -> type:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            try:self.wfile.write(data)
-            except (BrokenPipeError,ConnectionResetError):
-                hub.store.audit('client_disconnected',reply_committed=True)
+            try:
+                self.wfile.write(data)
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                hub.store.audit("client_disconnected", reply_committed=True)
 
         def do_POST(self) -> None:
             external = self.path == ENTRY_PATH
@@ -1446,7 +1459,12 @@ def _serve_locked(state_dir: Path, port: int) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        server.server_close()
         hub.shutdown()
+        try:
+            hub.store.close()
+        except Exception:
+            pass
         try:
             if json.loads(endpoint_file.read_text(encoding="utf-8")).get("pid") == os.getpid():
                 endpoint_file.unlink()

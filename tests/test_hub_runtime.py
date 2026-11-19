@@ -310,6 +310,39 @@ class StoreRecoveryTests(unittest.TestCase):
             self.store.release(other, resource_id=held["resource_id"])
         self.assertEqual(self.store.claim(other, "file", "other-report")["key"], "other-report")
 
+    def test_authenticate_touch_false_and_atomic_close_session(self):
+        before = self.store._session_row(self.session["session_id"])["last_seen_at"]
+        self.now += 0.5
+        self.store.authenticate(self.session["session_id"], self.session["session_secret"], touch=False)
+        self.assertEqual(self.store._session_row(self.session["session_id"])["last_seen_at"], before)
+        self.store.claim(self.session, "custom", "atomic-lock")
+        held = self.store.close_session(self.session["session_id"])
+        self.assertEqual(len(held), 1)
+        self.assertEqual(self.store.sessions(), [])
+        self.assertEqual(self.store.resources(session_id=self.session["session_id"]), [])
+
+    def test_handler_reply_audits_windows_connection_aborted_cleanly(self):
+        from ff_hub import make_handler
+        hub = Hub(self.path.parent / "handler-hub", browser=Browser())
+        try:
+            handler_cls = make_handler(hub, "test-key")
+            handler = handler_cls.__new__(handler_cls)
+            handler.send_response = lambda *a, **kw: None
+            handler.send_header = lambda *a, **kw: None
+            handler.end_headers = lambda: None
+
+            class _AbortedWriter:
+                def write(self, _data):
+                    raise ConnectionAbortedError(10053, "software caused connection abort")
+
+            handler.wfile = _AbortedWriter()
+            handler._reply(200, {"ok": True})
+            events = [row["event"] for row in hub.store.read_audit(limit=10)]
+            self.assertIn("client_disconnected", events)
+        finally:
+            hub.shutdown()
+            hub.store.close()
+
 
 class PolicyAndBrokerTests(unittest.TestCase):
     def test_policy_revocation_with_same_timestamp_and_size_is_seen(self):
