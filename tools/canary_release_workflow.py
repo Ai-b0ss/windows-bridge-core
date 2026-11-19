@@ -270,6 +270,71 @@ def validate_shadow_root(shadow_root: Path, *, extra_forbidden_roots: Iterable[P
     return abs_path
 
 
+def _retry_windows_fs_op(fn: Callable[[], Any], *, timeout: float = 2.0) -> Any:
+    """Retry transient Windows WinError 5/32 (AV/indexer/handle rundown) without masking live locks."""
+    if os.name != "nt":
+        return fn()
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    delay = 0.05
+    while True:
+        try:
+            return fn()
+        except PermissionError as exc:
+            if getattr(exc, "winerror", None) not in (5, 32) or time.monotonic() >= deadline:
+                raise
+            time.sleep(min(delay, max(0.01, deadline - time.monotonic())))
+            delay = min(delay * 2.0, 0.2)
+
+
+def _is_loopback_port_free(port: int) -> bool:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        sock.bind(("127.0.0.1", int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        sock.close()
+
+
+def _wait_port_released(port: int, *, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        if _is_loopback_port_free(port):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def _wait_hub_lock_released(hub_state_dir: Path, *, timeout: float = 5.0) -> bool:
+    """Wait until ff_hub's server.lock byte-range lock is released (never unlinks lock file)."""
+    lock_path = hub_state_dir / "server.lock"
+    if not lock_path.is_file():
+        return True
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        try:
+            with lock_path.open("a+b", buffering=0) as f:
+                if os.name == "nt":
+                    import msvcrt
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            return True
+        except OSError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
@@ -278,7 +343,7 @@ def _atomic_write_bytes(path: Path, data: bytes) -> None:
             stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp, path)
+        _retry_windows_fs_op(lambda: os.replace(tmp, path))
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -497,7 +562,8 @@ class CanaryReceiptStore:
         c2_manifest_sha256: str | None = None,
     ) -> tuple[str, dict[str, Any] | None]:
         req_key = request_key.strip() if isinstance(request_key, str) and request_key.strip() else None
-        req_digest = sha256_bytes(_canonical_json(request_payload or {}).encode("utf-8")) if req_key else None
+        digest_input = {"action": action, "mode": mode, "payload": request_payload or {}}
+        req_digest = sha256_bytes(_canonical_json(digest_input).encode("utf-8")) if req_key else None
         now = time.time()
         with closing(self._connect()) as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -505,13 +571,23 @@ class CanaryReceiptStore:
                 if req_key is not None:
                     row = conn.execute("SELECT * FROM canary_runs WHERE request_key=?", (req_key,)).fetchone()
                     if row is not None:
-                        if row["request_digest"] != req_digest:
+                        if row["action"] != action or row["mode"] != mode or row["request_digest"] != req_digest:
                             conn.execute("ROLLBACK")
                             raise CanaryError(
                                 "REQUEST_KEY_CONFLICT",
-                                "request_key was already used with a different request payload",
+                                "request_key was already used with a different action or request payload",
                                 request_key=req_key,
                                 existing_run_id=row["run_id"],
+                                existing_action=row["action"],
+                            )
+                        if row["status"] == "started":
+                            conn.execute("ROLLBACK")
+                            raise CanaryError(
+                                "REQUEST_OUTCOME_UNKNOWN",
+                                "A prior run with this request_key started and never recorded a terminal receipt; inspect real state before deciding",
+                                request_key=req_key,
+                                existing_run_id=row["run_id"],
+                                existing_action=row["action"],
                             )
                         summary = json.loads(row["summary_json"]) if row["summary_json"] else {}
                         conn.execute("COMMIT")
@@ -762,7 +838,7 @@ def sqlite_online_backup(
         with tmp_dst.open("r+b") as stream:
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(tmp_dst, dst_db)
+        _retry_windows_fs_op(lambda: os.replace(tmp_dst, dst_db))
     except CanaryError:
         tmp_dst.unlink(missing_ok=True)
         raise
@@ -819,8 +895,8 @@ def sqlite_restore_from_backup(backup_db: Path, expected_sha256: str, target_db:
         for suffix in ("-wal", "-shm"):
             sidecar = Path(str(target_db) + suffix)
             if sidecar.exists():
-                sidecar.unlink()
-        os.replace(tmp_target, target_db)
+                _retry_windows_fs_op(sidecar.unlink)
+        _retry_windows_fs_op(lambda: os.replace(tmp_target, target_db))
     except CanaryError:
         tmp_target.unlink(missing_ok=True)
         raise
@@ -851,7 +927,7 @@ def inspect_c2_gateway_active_jobs(db_path: Path) -> dict[str, Any]:
     assert_no_reparse(db_path, must_file=True)
     uri = db_path.resolve().as_uri() + "?mode=ro"
     try:
-        with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
+        with closing(sqlite3.connect(uri, uri=True, timeout=15)) as conn:
             tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             states: dict[str, int] = {}
             active_jobs = 0
@@ -901,7 +977,7 @@ def _loopback_opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
 
-def _hub_rpc_call(hub_state_dir: Path, op: str, args: dict[str, Any] | None = None, *, timeout: float = 5.0) -> dict[str, Any]:
+def _hub_rpc_call(hub_state_dir: Path, op: str, args: dict[str, Any] | None = None, *, timeout: float = 15.0) -> dict[str, Any]:
     endpoint_file = hub_state_dir / "endpoint.json"
     key_file = hub_state_dir / "hub.key"
     if not endpoint_file.is_file() or not key_file.is_file():
@@ -941,7 +1017,7 @@ def inspect_c1_hub_active_sessions(hub_state_dir: Path, *, require_rpc_if_runnin
     endpoint_exists = (hub_state_dir / "endpoint.json").is_file()
     if endpoint_exists:
         try:
-            st = _hub_rpc_call(hub_state_dir, "hub_status", timeout=4.0)
+            st = _hub_rpc_call(hub_state_dir, "hub_status", timeout=15.0)
             rpc_reachable = True
             rpc_sessions = len(st.get("sessions") or [])
             rpc_resources = len(st.get("resources") or [])
@@ -973,7 +1049,7 @@ def inspect_c1_hub_active_sessions(hub_state_dir: Path, *, require_rpc_if_runnin
     if db_exists:
         try:
             uri = db_path.resolve().as_uri() + "?mode=ro"
-            with closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
+            with closing(sqlite3.connect(uri, uri=True, timeout=15)) as conn:
                 tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
                 if "sessions" in tables:
                     db_sessions = int(conn.execute("SELECT COUNT(*) FROM sessions WHERE state='active'").fetchone()[0])
@@ -1025,7 +1101,7 @@ def inspect_c1_rpc_active_sessions(shadow_root: Path, *, require_rpc_if_running:
         port = active_cfg.get("rpc_port")
         if type(port) is int:
             try:
-                reply = _bridge_rpc_call(port, secret_file.read_text(encoding="ascii").strip(), "desktop_mode_status", {}, timeout=3.0)
+                reply = _bridge_rpc_call(port, secret_file.read_text(encoding="ascii").strip(), "desktop_mode_status", {}, timeout=15.0)
                 if not reply.get("ok"):
                     if rpc_alive and require_rpc_if_running:
                         return {"idle_verified": False, "reason": "SESSION_STATE_UNKNOWN_REFUSE_KILL"}
@@ -1057,6 +1133,14 @@ class _FileTime(ctypes.Structure):
     _fields_ = [("low", ctypes.wintypes.DWORD), ("high", ctypes.wintypes.DWORD)]
 
 
+class _UnicodeString(ctypes.Structure):
+    _fields_ = [
+        ("Length", ctypes.wintypes.USHORT),
+        ("MaximumLength", ctypes.wintypes.USHORT),
+        ("Buffer", ctypes.c_void_p),
+    ]
+
+
 def _win32_kernel() -> Any:
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.OpenProcess.argtypes = [ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD]
@@ -1079,6 +1163,37 @@ def _win32_kernel() -> Any:
     return kernel
 
 
+def _query_handle_cmdline(handle: int) -> str | None:
+    """Query exact command line on an ALREADY OPEN kernel handle (ProcessCommandLineInformation=60)."""
+    if os.name != "nt" or not handle:
+        return None
+    try:
+        ntdll = ctypes.WinDLL("ntdll")
+        ntdll.NtQueryInformationProcess.argtypes = [
+            ctypes.wintypes.HANDLE,
+            ctypes.wintypes.ULONG,
+            ctypes.c_void_p,
+            ctypes.wintypes.ULONG,
+            ctypes.POINTER(ctypes.wintypes.ULONG),
+        ]
+        ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+    except Exception:
+        return None
+    ret_len = ctypes.wintypes.ULONG(0)
+    status = ntdll.NtQueryInformationProcess(handle, 60, None, 0, ctypes.byref(ret_len))
+    if (status & 0xFFFFFFFF) not in (0, 0xC0000004, 0xC0000023, 0x80000005) or ret_len.value == 0:
+        return None
+    buf_size = max(int(ret_len.value) + 64, 512)
+    buf = ctypes.create_string_buffer(buf_size)
+    status2 = ntdll.NtQueryInformationProcess(handle, 60, buf, buf_size, ctypes.byref(ret_len))
+    if status2 != 0:
+        return None
+    us = _UnicodeString.from_buffer(buf)
+    if not us.Buffer or us.Length == 0:
+        return ""
+    return ctypes.wstring_at(us.Buffer, us.Length // 2)
+
+
 def _query_handle_identity(kernel: Any, handle: int) -> tuple[int, str] | None:
     start, exit_t, kern_t, user_t = _FileTime(), _FileTime(), _FileTime(), _FileTime()
     if not kernel.GetProcessTimes(handle, ctypes.byref(start), ctypes.byref(exit_t), ctypes.byref(kern_t), ctypes.byref(user_t)):
@@ -1098,8 +1213,8 @@ def _query_handle_identity(kernel: Any, handle: int) -> tuple[int, str] | None:
     return create_time, exe_path
 
 
-def query_process_identity_exact(pid: int) -> dict[str, Any] | None:
-    """Query PID + 64-bit FILETIME creation time + physical exe path on ONE kernel handle."""
+def query_process_identity_exact(pid: int, *, include_cmdline: bool = False) -> dict[str, Any] | None:
+    """Query PID + 64-bit FILETIME creation time + physical exe (+ optional cmdline) on ONE kernel handle."""
     if os.name != "nt" or type(pid) is not int or not (0 < pid <= 0xFFFFFFFF):
         return None
     kernel = _win32_kernel()
@@ -1111,33 +1226,42 @@ def query_process_identity_exact(pid: int) -> dict[str, Any] | None:
         if ident is None:
             return None
         create_time, exe_path = ident
-        return {
+        result: dict[str, Any] = {
             "pid": pid,
             "create_time_filetime": create_time,
             "executable_path": os.path.abspath(exe_path),
             "alive": True,
         }
+        if include_cmdline:
+            result["cmdline"] = _query_handle_cmdline(handle)
+        return result
     finally:
         kernel.CloseHandle(handle)
 
 
-def query_process_cmdline(pid: int) -> str | None:
-    """Read-only CIM query for a single exact PID command line on Windows."""
+def _query_process_cmdline_cim(pid: int) -> str | None:
+    """Fallback read-only CIM query for a single exact PID command line on Windows."""
     if os.name != "nt" or type(pid) is not int or pid <= 0:
         return None
     cmd = (
         "$ErrorActionPreference='Stop'; "
+        "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); "
         f"$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}'; "
         "if($null -eq $p){exit 3}; "
         "$p | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
-    cp = subprocess.run(
-        ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
+    try:
+        cp = subprocess.run(
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", cmd],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
     if cp.returncode != 0:
         return None
     try:
@@ -1148,6 +1272,19 @@ def query_process_cmdline(pid: int) -> str | None:
         return None
     raw = data.get("CommandLine")
     return str(raw) if isinstance(raw, str) else None
+
+
+def query_process_cmdline(pid: int) -> str | None:
+    """Query exact process command line via native single-handle NtQueryInformationProcess (CIM fallback)."""
+    if os.name != "nt" or type(pid) is not int or pid <= 0:
+        return None
+    ident = query_process_identity_exact(pid, include_cmdline=True)
+    if ident is None:
+        return None
+    native = ident.get("cmdline")
+    if isinstance(native, str) and native:
+        return native
+    return _query_process_cmdline_cim(pid)
 
 
 def _lease_path(shadow_root: Path, role: str) -> Path:
@@ -1250,7 +1387,7 @@ def verify_process_lease(
     if not any(ep_norm.startswith(rn + "/") for rn in root_norms):
         raise CanaryError("PROCESS_PATH_OUTSIDE_SHADOW_ROOT", "Lease entrypoint escapes shadow root", role=role)
 
-    live = query_process_identity_exact(pid)
+    live = query_process_identity_exact(pid, include_cmdline=(check_cmdline and os.name == "nt"))
     if live is None:
         if require_alive:
             raise CanaryError("PROCESS_NOT_RUNNING", f"Leased process {role} (pid={pid}) is not running", role=role, pid=pid)
@@ -1276,7 +1413,15 @@ def verify_process_lease(
 
     cmdline_verified = False
     if check_cmdline and os.name == "nt":
-        cmdline = query_process_cmdline(pid)
+        cmdline = live.get("cmdline")
+        if not isinstance(cmdline, str) or not cmdline:
+            cmdline = _query_process_cmdline_cim(pid)
+            # Re-verify creation FILETIME after CIM fallback to eliminate PID-reuse TOCTOU.
+            recheck = query_process_identity_exact(pid)
+            if recheck is None or recheck["create_time_filetime"] != create_time:
+                if require_alive:
+                    raise CanaryError("PROCESS_NOT_RUNNING", f"Leased process {role} exited during verification", role=role, pid=pid)
+                return {"alive": False, "identity_matched": False, "reason": "PID_REUSED_OR_EXITED_NO_KILL", "lease": lease}
         if not cmdline or not _cmdline_contains_path(cmdline, entry_expected):
             raise CanaryError(
                 "PROCESS_IDENTITY_MISMATCH",
@@ -1304,7 +1449,8 @@ def stop_leased_process(
     *,
     idle_checker: Callable[[], dict[str, Any]] | None = None,
     graceful_stop: Callable[[], None] | None = None,
-    timeout_seconds: float = 15.0,
+    post_exit_wait: Callable[[], None] | None = None,
+    timeout_seconds: float = 20.0,
     receipt_store: CanaryReceiptStore | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
@@ -1343,22 +1489,85 @@ def stop_leased_process(
     pid = int(lease["pid"])
     expected_ct = int(lease["create_time_filetime"])
     expected_exe = _norm_path(lease["executable_path"])
+    entry_expected = str(lease["entrypoint_path"])
+    leased_port = int(lease["port"])
 
     # Step 1: Cooperative graceful shutdown if available (e.g., Hub hub_shutdown_idle).
     if graceful_stop is not None:
-        graceful_stop()
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            cur = query_process_identity_exact(pid)
-            if cur is None or cur["create_time_filetime"] != expected_ct:
+        if os.name == "nt":
+            kernel = _win32_kernel()
+            # Open ONE handle with PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE before signaling.
+            handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
+            if not handle:
                 if receipt_store is not None:
-                    receipt_store.record_lease(run_id, lease, "stopped_idle")
-                return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid}
-            time.sleep(0.1)
-        raise CanaryError("IDLE_STOP_TIMEOUT", f"Graceful idle stop timed out for {role}", role=role, pid=pid)
+                    receipt_store.record_lease(run_id, lease, "exited_or_reused_no_kill")
+                return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid, "reason": "PROCESS_EXITED"}
+            try:
+                ident = _query_handle_identity(kernel, handle)
+                if ident is None:
+                    # Process already exiting; wait for OS rundown completion before returning.
+                    kernel.WaitForSingleObject(handle, int(timeout_seconds * 1000))
+                    if receipt_store is not None:
+                        receipt_store.record_lease(run_id, lease, "stopped_idle")
+                    return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid, "reason": "PROCESS_EXITED"}
+                actual_ct, actual_exe = ident
+                if actual_ct != expected_ct:
+                    if receipt_store is not None:
+                        receipt_store.record_lease(run_id, lease, "identity_mismatch_no_kill")
+                    return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PID_REUSED_OR_EXITED_NO_KILL"}
+                if _norm_path(actual_exe) != expected_exe:
+                    raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable path mismatch before graceful stop", role=role, pid=pid)
+                handle_cmd = _query_handle_cmdline(handle)
+                if isinstance(handle_cmd, str) and handle_cmd and not _cmdline_contains_path(handle_cmd, entry_expected):
+                    raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle command line mismatch before graceful stop", role=role, pid=pid)
+                if kernel.WaitForSingleObject(handle, 0) == 0:
+                    if receipt_store is not None:
+                        receipt_store.record_lease(run_id, lease, "stopped_idle")
+                    return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid, "reason": "PROCESS_EXITED"}
+
+                try:
+                    graceful_stop()
+                except CanaryError as exc:
+                    if exc.code == "HUB_BUSY":
+                        raise CanaryError(
+                            "ACTIVE_SESSIONS_PRESENT",
+                            f"Refusing to stop {role}: active session appeared during graceful stop",
+                            role=role,
+                            pid=pid,
+                        ) from exc
+                    if exc.code == "HUB_UNREACHABLE":
+                        # Hub may have closed its listener mid-reply while exiting; confirm via SYNCHRONIZE handle.
+                        wait_disc = kernel.WaitForSingleObject(handle, int(min(timeout_seconds, 10.0) * 1000))
+                        if wait_disc != 0:
+                            raise
+                    else:
+                        raise
+                else:
+                    wait_after = kernel.WaitForSingleObject(handle, int(timeout_seconds * 1000))
+                    if wait_after != 0:
+                        raise CanaryError("IDLE_STOP_TIMEOUT", f"Graceful idle stop timed out for {role}", role=role, pid=pid)
+            finally:
+                kernel.CloseHandle(handle)
+        else:
+            graceful_stop()
+            deadline = time.monotonic() + timeout_seconds
+            while time.monotonic() < deadline:
+                cur = query_process_identity_exact(pid)
+                if cur is None or cur["create_time_filetime"] != expected_ct:
+                    break
+                time.sleep(0.1)
+            else:
+                raise CanaryError("IDLE_STOP_TIMEOUT", f"Graceful idle stop timed out for {role}", role=role, pid=pid)
+
+        _wait_port_released(leased_port, timeout=5.0)
+        if post_exit_wait is not None:
+            post_exit_wait()
+        if receipt_store is not None:
+            receipt_store.record_lease(run_id, lease, "stopped_idle")
+        return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid}
 
     # Step 2: Re-verify active sessions immediately before exact-handle stop, then
-    # verify PID + FILETIME + executable image on ONE Windows kernel handle!
+    # verify PID + FILETIME + executable image + command line on ONE Windows kernel handle!
     idle_recheck = idle_checker()
     if not isinstance(idle_recheck, dict) or idle_recheck.get("idle_verified") is not True:
         code = str((idle_recheck or {}).get("reason") or "ACTIVE_SESSIONS_PRESENT")
@@ -1377,6 +1586,7 @@ def stop_leased_process(
     try:
         ident = _query_handle_identity(kernel, handle)
         if ident is None:
+            kernel.WaitForSingleObject(handle, int(timeout_seconds * 1000))
             if receipt_store is not None:
                 receipt_store.record_lease(run_id, lease, "exited_or_reused_no_kill")
             return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PROCESS_EXITED"}
@@ -1387,6 +1597,9 @@ def stop_leased_process(
             return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PID_REUSED_OR_EXITED_NO_KILL"}
         if _norm_path(actual_exe) != expected_exe:
             raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable path mismatch before stop", role=role, pid=pid)
+        handle_cmd = _query_handle_cmdline(handle)
+        if isinstance(handle_cmd, str) and handle_cmd and not _cmdline_contains_path(handle_cmd, entry_expected):
+            raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle command line mismatch before stop", role=role, pid=pid)
         wait_state = kernel.WaitForSingleObject(handle, 0)
         if wait_state == 0:
             if receipt_store is not None:
@@ -1400,6 +1613,9 @@ def stop_leased_process(
     finally:
         kernel.CloseHandle(handle)
 
+    _wait_port_released(leased_port, timeout=5.0)
+    if post_exit_wait is not None:
+        post_exit_wait()
     if receipt_store is not None:
         receipt_store.record_lease(run_id, lease, "stopped_idle")
     return {"stopped": True, "terminated": True, "graceful": False, "role": role, "pid": pid}
@@ -1552,7 +1768,10 @@ def stage_c1_shadow(
             for rel, (raw, digest_hex) in sorted(verified_extract.items()):
                 dst = stage_dir.joinpath(*PurePosixPath(rel).parts)
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write_bytes(dst, raw)
+                # Write directly inside the private, unpublished staging directory;
+                # atomicity is enforced by fsync'ing install-manifest.json + os.replace(stage_dir, target).
+                with dst.open("wb") as stream:
+                    stream.write(raw)
                 file_hashes[rel] = digest_hex
             if run_full_installer and is_full_core and os.name == "nt":
                 full_extract = stage_dir / ".installer-src"
@@ -1585,6 +1804,8 @@ def stage_c1_shadow(
                     ],
                     capture_output=True,
                     text=True,
+                    encoding="utf-8",
+                    errors="replace",
                     timeout=300,
                     check=False,
                 )
@@ -1604,7 +1825,7 @@ def stage_c1_shadow(
                     "files": file_hashes,
                 },
             )
-            os.replace(stage_dir, target)
+            _retry_windows_fs_op(lambda: os.replace(stage_dir, target))
         except BaseException:
             shutil.rmtree(stage_dir, ignore_errors=True)
             raise
@@ -1663,6 +1884,8 @@ def _export_c2_from_git(c2_repo: Path, pinned_commit: str, *, require_clean_head
         ["git", "--no-optional-locks", "-C", str(c2_repo), "rev-parse", "HEAD"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=20,
         check=False,
     )
@@ -1681,6 +1904,8 @@ def _export_c2_from_git(c2_repo: Path, pinned_commit: str, *, require_clean_head
             ["git", "--no-optional-locks", "-C", str(c2_repo), "status", "--porcelain=v1", "--untracked-files=no"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=20,
             check=False,
         )
@@ -1691,6 +1916,8 @@ def _export_c2_from_git(c2_repo: Path, pinned_commit: str, *, require_clean_head
         ["git", "--no-optional-locks", "-C", str(c2_repo), "rev-parse", "--verify", f"{pinned_commit}^{{commit}}"],
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         timeout=20,
         check=False,
     )
@@ -1858,7 +2085,7 @@ def stage_c2_shadow(
     owner = ensure_shadow_owner(root, create=True)
     store = receipt_store or CanaryReceiptStore(root / "state" / "canary_receipts.sqlite3")
 
-    # Refuse staging over active running C2 jobs!
+    # Refuse staging over active running C2 jobs or running shadow C2 services!
     runtime_slot = root / "state" / "c2" / "runtime"
     c2_idle = inspect_c2_gateway_active_jobs(runtime_slot / "gateway.db")
     if not c2_idle["idle_verified"]:
@@ -1867,6 +2094,16 @@ def stage_c2_shadow(
             "Refusing to stage C2 while shadow gateway.db has active jobs",
             c2_idle=c2_idle,
         )
+    for c2_role in ("c2_unified", "c2_gateway"):
+        if _lease_path(root, c2_role).is_file():
+            lv = verify_process_lease(root, c2_role, require_alive=False, check_cmdline=True)
+            if lv["alive"]:
+                raise CanaryError(
+                    "SHADOW_SERVICE_RUNNING",
+                    f"Stop shadow {c2_role} (pid={lv['pid']}) before re-staging C2 runtime slot",
+                    role=c2_role,
+                    pid=lv["pid"],
+                )
 
     release_id = f"{pinned_commit[:12]}-{manifest_sha[:12]}"
     releases_root = root / "releases" / "c2"
@@ -1886,9 +2123,10 @@ def stage_c2_shadow(
             for rel, raw in sorted(files.items()):
                 dst = stage_dir.joinpath(*PurePosixPath(rel).parts)
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                _atomic_write_bytes(dst, raw)
+                with dst.open("wb") as stream:
+                    stream.write(raw)
             _atomic_write_json(stage_dir / "c2-stage-manifest.json", full_manifest)
-            os.replace(stage_dir, target)
+            _retry_windows_fs_op(lambda: os.replace(stage_dir, target))
         except BaseException:
             shutil.rmtree(stage_dir, ignore_errors=True)
             raise
@@ -1971,7 +2209,7 @@ def stage_c2_shadow(
 # Shadow Service Lifecycle & Health Contract Verification
 # ---------------------------------------------------------------------------
 
-def _bridge_rpc_call(port: int, secret: str, op: str, args: dict[str, Any], *, timeout: float = 5.0) -> dict[str, Any]:
+def _bridge_rpc_call(port: int, secret: str, op: str, args: dict[str, Any], *, timeout: float = 15.0) -> dict[str, Any]:
     body = json.dumps({"op": op, "args": args}, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/rpc",
@@ -1990,7 +2228,7 @@ def _http_get_json(
     port: int,
     path: str,
     *,
-    timeout: float = 3.0,
+    timeout: float = 15.0,
     headers: dict[str, str] | None = None,
 ) -> tuple[int, dict[str, Any] | None]:
     req_headers = {"Accept": "application/json", "Connection": "close"}
@@ -2058,6 +2296,96 @@ def _spawn_shadow_process(
         )
 
 
+def _terminate_unleased_spawn(proc: subprocess.Popen, expected_ct: int | None, port: int | None = None) -> None:
+    """Cleanly stop and reap a newly spawned child that failed before lease publication."""
+    try:
+        if proc.poll() is None:
+            can_signal = True
+            if os.name == "nt" and expected_ct is not None:
+                ident = query_process_identity_exact(proc.pid)
+                can_signal = ident is not None and ident["create_time_filetime"] == expected_ct
+            if can_signal:
+                try:
+                    proc.terminate()
+                except OSError:
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    if os.name != "nt" or expected_ct is None:
+                        proc.kill()
+                    else:
+                        ident = query_process_identity_exact(proc.pid)
+                        if ident is not None and ident["create_time_filetime"] == expected_ct:
+                            proc.kill()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+    finally:
+        _detach_popen(proc)
+        if port is not None:
+            _wait_port_released(port, timeout=3.0)
+
+
+def _ensure_role_not_running_and_port_free(root: Path, role: str, port: int) -> None:
+    """Fail closed before spawning if the role lease is already live or the port is occupied."""
+    lp = _lease_path(root, role)
+    if lp.is_file():
+        lv = verify_process_lease(root, role, require_alive=False, check_cmdline=True)
+        if lv["alive"]:
+            raise CanaryError(
+                "SHADOW_SERVICE_ALREADY_RUNNING",
+                f"Shadow service {role} (pid={lv['pid']}) is already running; stop it cleanly before restarting",
+                role=role,
+                pid=lv["pid"],
+                port=port,
+            )
+    if not _is_loopback_port_free(port):
+        raise CanaryError(
+            "SHADOW_PORT_ALREADY_IN_USE",
+            f"Shadow port {port} for {role} is already bound by another listener",
+            role=role,
+            port=port,
+        )
+
+
+def _stop_single_role(
+    root: Path,
+    role: str,
+    *,
+    store: CanaryReceiptStore,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    c2_db = root / "state" / "c2" / "runtime" / "gateway.db"
+    hub_state = root / "state" / "c1" / "hub"
+    if role == "c1_hub":
+        return stop_leased_process(
+            root,
+            role,
+            idle_checker=lambda: inspect_c1_hub_active_sessions(hub_state, require_rpc_if_running=True),
+            graceful_stop=lambda: _hub_rpc_call(hub_state, "hub_shutdown_idle", timeout=15.0),
+            post_exit_wait=lambda: _wait_hub_lock_released(hub_state, timeout=5.0),
+            receipt_store=store,
+            run_id=run_id,
+        )
+    if role == "c1_rpc":
+        return stop_leased_process(
+            root,
+            role,
+            idle_checker=lambda: inspect_c1_rpc_active_sessions(root),
+            receipt_store=store,
+            run_id=run_id,
+        )
+    return stop_leased_process(
+        root,
+        role,
+        idle_checker=lambda: inspect_c2_gateway_active_jobs(c2_db),
+        receipt_store=store,
+        run_id=run_id,
+    )
+
+
 def start_shadow_services(
     shadow_root: Path,
     *,
@@ -2065,7 +2393,7 @@ def start_shadow_services(
     start_c1_hub: bool = True,
     start_c2_gateway: bool = True,
     start_c2_unified: bool = True,
-    startup_timeout: float = 25.0,
+    startup_timeout: float = 45.0,
     request_key: str | None = None,
 ) -> dict[str, Any]:
     """Start shadow C1/C2 services on non-production ports and record 4-factor leases."""
@@ -2089,6 +2417,16 @@ def start_shadow_services(
 
     started: dict[str, Any] = {}
     logs_dir = root / "state" / "logs"
+
+    def _cleanup_partial_starts() -> None:
+        for role in ("c2_unified", "c2_gateway", "c1_rpc", "c1_hub"):
+            if role not in started:
+                continue
+            try:
+                _stop_single_role(root, role, store=store, run_id=run_id)
+            except Exception:
+                pass
+
     try:
         c1_active_path = root / "state" / "c1" / "active.json"
         c2_active_path = root / "state" / "c2" / "active.json"
@@ -2120,6 +2458,7 @@ def start_shadow_services(
             hub_entry = bridge_dir / "ff_hub.py"
             py_exe = _c1_python_exe(rel_dir)
             hub_port = int(c1_cfg["hub_port"])
+            _ensure_role_not_running_and_port_free(root, "c1_hub", hub_port)
             hub_state = root / "state" / "c1" / "hub"
             _atomic_write_json(hub_state / "config.json", {"port": hub_port})
             env = {**os.environ, "FF_BRIDGE_ROOT": c1_runtime_env, "FF_HUB_STATE": c1_hub_env}
@@ -2129,42 +2468,50 @@ def start_shadow_services(
                 env=env,
                 log_path=logs_dir / "c1_hub.log",
             )
-            deadline = time.monotonic() + startup_timeout
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    raise CanaryError(
-                        "C1_HUB_START_FAILED",
-                        f"Shadow Hub exited early ({proc.returncode})",
-                        log_tail=_read_log_tail(logs_dir / "c1_hub.log"),
-                    )
-                try:
-                    st = _hub_rpc_call(hub_state, "hub_status", timeout=2.0)
-                    if st.get("pid") == proc.pid:
-                        break
-                except CanaryError:
-                    time.sleep(0.15)
-            else:
-                proc.terminate()
-                raise CanaryError("C1_HUB_START_FAILED", "Shadow Hub did not become ready before timeout")
-            ident = query_process_identity_exact(proc.pid)
-            if ident is None:
-                raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query shadow Hub kernel identity")
-            lease = write_process_lease(
-                root,
-                role="c1_hub",
-                pid=proc.pid,
-                create_time_filetime=ident["create_time_filetime"],
-                executable_path=ident["executable_path"],
-                entrypoint_path=str(hub_entry),
-                port=hub_port,
-                release_id=c1_cfg["release_id"],
-                owner_scope_id=owner["owner_scope_id"],
-                receipt_store=store,
-                run_id=run_id,
-            )
-            _detach_popen(proc)
-            started["c1_hub"] = lease
-            store.record_step(run_id, "c1", "start_c1_hub", "succeeded", {"pid": proc.pid, "port": hub_port})
+            spawn_ident = query_process_identity_exact(proc.pid)
+            spawn_ct = spawn_ident["create_time_filetime"] if spawn_ident else None
+            leased = False
+            try:
+                deadline = time.monotonic() + startup_timeout
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        raise CanaryError(
+                            "C1_HUB_START_FAILED",
+                            f"Shadow Hub exited early ({proc.returncode})",
+                            log_tail=_read_log_tail(logs_dir / "c1_hub.log"),
+                        )
+                    try:
+                        probe_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
+                        st = _hub_rpc_call(hub_state, "hub_status", timeout=probe_timeout)
+                        if st.get("pid") == proc.pid:
+                            break
+                    except CanaryError:
+                        time.sleep(0.15)
+                else:
+                    raise CanaryError("C1_HUB_START_FAILED", "Shadow Hub did not become ready before timeout")
+                ident = query_process_identity_exact(proc.pid)
+                if ident is None:
+                    raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query shadow Hub kernel identity")
+                lease = write_process_lease(
+                    root,
+                    role="c1_hub",
+                    pid=proc.pid,
+                    create_time_filetime=ident["create_time_filetime"],
+                    executable_path=ident["executable_path"],
+                    entrypoint_path=str(hub_entry),
+                    port=hub_port,
+                    release_id=c1_cfg["release_id"],
+                    owner_scope_id=owner["owner_scope_id"],
+                    receipt_store=store,
+                    run_id=run_id,
+                )
+                _detach_popen(proc)
+                leased = True
+                started["c1_hub"] = lease
+                store.record_step(run_id, "c1", "start_c1_hub", "succeeded", {"pid": proc.pid, "port": hub_port})
+            finally:
+                if not leased:
+                    _terminate_unleased_spawn(proc, spawn_ct, port=hub_port)
 
         if start_c1_rpc:
             if c1_cfg is None:
@@ -2177,6 +2524,7 @@ def start_shadow_services(
                 raise CanaryError("C1_RPC_ENTRY_MISSING", "ff_win_v3_main.py missing in C1 release")
             py_exe = _c1_python_exe(rel_dir)
             rpc_port = int(c1_cfg["rpc_port"])
+            _ensure_role_not_running_and_port_free(root, "c1_rpc", rpc_port)
             env = {**os.environ, "FF_BRIDGE_ROOT": c1_runtime_env, "FF_HUB_STATE": c1_hub_env}
             proc = _spawn_shadow_process(
                 [py_exe, str(rpc_entry), "serve", "--host", "127.0.0.1", "--port", str(rpc_port)],
@@ -2184,45 +2532,53 @@ def start_shadow_services(
                 env=env,
                 log_path=logs_dir / "c1_rpc.log",
             )
-            secret_file = root / "state" / "c1" / "runtime" / "bridge-v3" / "secret"
-            deadline = time.monotonic() + startup_timeout
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    raise CanaryError(
-                        "C1_RPC_START_FAILED",
-                        f"Shadow Bridge RPC exited early ({proc.returncode})",
-                        log_tail=_read_log_tail(logs_dir / "c1_rpc.log"),
-                    )
-                if secret_file.is_file():
-                    try:
-                        reply = _bridge_rpc_call(rpc_port, secret_file.read_text(encoding="ascii").strip(), "ping", {}, timeout=2.0)
-                        if reply.get("ok"):
-                            break
-                    except Exception:
-                        pass
-                time.sleep(0.15)
-            else:
-                proc.terminate()
-                raise CanaryError("C1_RPC_START_FAILED", "Shadow Bridge RPC did not become ready before timeout")
-            ident = query_process_identity_exact(proc.pid)
-            if ident is None:
-                raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query shadow RPC kernel identity")
-            lease = write_process_lease(
-                root,
-                role="c1_rpc",
-                pid=proc.pid,
-                create_time_filetime=ident["create_time_filetime"],
-                executable_path=ident["executable_path"],
-                entrypoint_path=str(rpc_entry),
-                port=rpc_port,
-                release_id=c1_cfg["release_id"],
-                owner_scope_id=owner["owner_scope_id"],
-                receipt_store=store,
-                run_id=run_id,
-            )
-            _detach_popen(proc)
-            started["c1_rpc"] = lease
-            store.record_step(run_id, "c1", "start_c1_rpc", "succeeded", {"pid": proc.pid, "port": rpc_port})
+            spawn_ident = query_process_identity_exact(proc.pid)
+            spawn_ct = spawn_ident["create_time_filetime"] if spawn_ident else None
+            leased = False
+            try:
+                secret_file = root / "state" / "c1" / "runtime" / "bridge-v3" / "secret"
+                deadline = time.monotonic() + startup_timeout
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        raise CanaryError(
+                            "C1_RPC_START_FAILED",
+                            f"Shadow Bridge RPC exited early ({proc.returncode})",
+                            log_tail=_read_log_tail(logs_dir / "c1_rpc.log"),
+                        )
+                    if secret_file.is_file():
+                        try:
+                            probe_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
+                            reply = _bridge_rpc_call(rpc_port, secret_file.read_text(encoding="ascii").strip(), "ping", {}, timeout=probe_timeout)
+                            if reply.get("ok") and (reply.get("result") or {}).get("pid") == proc.pid:
+                                break
+                        except Exception:
+                            pass
+                    time.sleep(0.15)
+                else:
+                    raise CanaryError("C1_RPC_START_FAILED", "Shadow Bridge RPC did not become ready before timeout")
+                ident = query_process_identity_exact(proc.pid)
+                if ident is None:
+                    raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query shadow RPC kernel identity")
+                lease = write_process_lease(
+                    root,
+                    role="c1_rpc",
+                    pid=proc.pid,
+                    create_time_filetime=ident["create_time_filetime"],
+                    executable_path=ident["executable_path"],
+                    entrypoint_path=str(rpc_entry),
+                    port=rpc_port,
+                    release_id=c1_cfg["release_id"],
+                    owner_scope_id=owner["owner_scope_id"],
+                    receipt_store=store,
+                    run_id=run_id,
+                )
+                _detach_popen(proc)
+                leased = True
+                started["c1_rpc"] = lease
+                store.record_step(run_id, "c1", "start_c1_rpc", "succeeded", {"pid": proc.pid, "port": rpc_port})
+            finally:
+                if not leased:
+                    _terminate_unleased_spawn(proc, spawn_ct, port=rpc_port)
 
         if start_c2_gateway:
             if c2_cfg is None:
@@ -2232,6 +2588,7 @@ def start_shadow_services(
             _verify_c2_dir_against_manifest(c2_slot, c2_rel_mf)
             gw_entry = c2_slot / "server.py"
             gw_port = int(c2_cfg["gateway_port"])
+            _ensure_role_not_running_and_port_free(root, "c2_gateway", gw_port)
             env = {
                 **os.environ,
                 "GEMINI_GATEWAY_PORT": str(gw_port),
@@ -2246,40 +2603,48 @@ def start_shadow_services(
                 env=env,
                 log_path=logs_dir / "c2_gateway.log",
             )
-            deadline = time.monotonic() + startup_timeout
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    raise CanaryError(
-                        "C2_GATEWAY_START_FAILED",
-                        f"Shadow C2 Gateway exited early ({proc.returncode})",
-                        log_tail=_read_log_tail(logs_dir / "c2_gateway.log"),
-                    )
-                code, _ = _http_get_json(gw_port, "/health", timeout=2.0)
-                if code == 200:
-                    break
-                time.sleep(0.15)
-            else:
-                proc.terminate()
-                raise CanaryError("C2_GATEWAY_START_FAILED", "Shadow C2 Gateway did not become ready before timeout")
-            ident = query_process_identity_exact(proc.pid)
-            if ident is None:
-                raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query C2 Gateway kernel identity")
-            lease = write_process_lease(
-                root,
-                role="c2_gateway",
-                pid=proc.pid,
-                create_time_filetime=ident["create_time_filetime"],
-                executable_path=ident["executable_path"],
-                entrypoint_path=str(gw_entry),
-                port=gw_port,
-                release_id=c2_cfg["release_id"],
-                owner_scope_id=owner["owner_scope_id"],
-                receipt_store=store,
-                run_id=run_id,
-            )
-            _detach_popen(proc)
-            started["c2_gateway"] = lease
-            store.record_step(run_id, "c2", "start_c2_gateway", "succeeded", {"pid": proc.pid, "port": gw_port})
+            spawn_ident = query_process_identity_exact(proc.pid)
+            spawn_ct = spawn_ident["create_time_filetime"] if spawn_ident else None
+            leased = False
+            try:
+                deadline = time.monotonic() + startup_timeout
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        raise CanaryError(
+                            "C2_GATEWAY_START_FAILED",
+                            f"Shadow C2 Gateway exited early ({proc.returncode})",
+                            log_tail=_read_log_tail(logs_dir / "c2_gateway.log"),
+                        )
+                    probe_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
+                    code, _ = _http_get_json(gw_port, "/health", timeout=probe_timeout)
+                    if code == 200 and proc.poll() is None:
+                        break
+                    time.sleep(0.15)
+                else:
+                    raise CanaryError("C2_GATEWAY_START_FAILED", "Shadow C2 Gateway did not become ready before timeout")
+                ident = query_process_identity_exact(proc.pid)
+                if ident is None:
+                    raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query C2 Gateway kernel identity")
+                lease = write_process_lease(
+                    root,
+                    role="c2_gateway",
+                    pid=proc.pid,
+                    create_time_filetime=ident["create_time_filetime"],
+                    executable_path=ident["executable_path"],
+                    entrypoint_path=str(gw_entry),
+                    port=gw_port,
+                    release_id=c2_cfg["release_id"],
+                    owner_scope_id=owner["owner_scope_id"],
+                    receipt_store=store,
+                    run_id=run_id,
+                )
+                _detach_popen(proc)
+                leased = True
+                started["c2_gateway"] = lease
+                store.record_step(run_id, "c2", "start_c2_gateway", "succeeded", {"pid": proc.pid, "port": gw_port})
+            finally:
+                if not leased:
+                    _terminate_unleased_spawn(proc, spawn_ct, port=gw_port)
 
         if start_c2_unified:
             if c2_cfg is None:
@@ -2289,6 +2654,7 @@ def start_shadow_services(
             uni_port = int(c2_cfg["unified_port"])
             gw_port = int(c2_cfg["gateway_port"])
             omni_port = int(c2_cfg.get("omni_port", DEFAULT_C2_OMNI_PORT))
+            _ensure_role_not_running_and_port_free(root, "c2_unified", uni_port)
             env = {
                 **os.environ,
                 "UNIFIED_API_PORT": str(uni_port),
@@ -2302,59 +2668,80 @@ def start_shadow_services(
                 env=env,
                 log_path=logs_dir / "c2_unified.log",
             )
-            deadline = time.monotonic() + startup_timeout
-            while time.monotonic() < deadline:
-                if proc.poll() is not None:
-                    raise CanaryError(
-                        "C2_UNIFIED_START_FAILED",
-                        f"Shadow C2 Unified API exited early ({proc.returncode})",
-                        log_tail=_read_log_tail(logs_dir / "c2_unified.log"),
-                    )
-                code, _ = _http_get_json(uni_port, "/health", timeout=2.0)
-                if code == 200:
-                    break
-                time.sleep(0.15)
-            else:
-                proc.terminate()
-                raise CanaryError("C2_UNIFIED_START_FAILED", "Shadow C2 Unified API did not become ready before timeout")
-            ident = query_process_identity_exact(proc.pid)
-            if ident is None:
-                raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query C2 Unified API kernel identity")
-            lease = write_process_lease(
-                root,
-                role="c2_unified",
-                pid=proc.pid,
-                create_time_filetime=ident["create_time_filetime"],
-                executable_path=ident["executable_path"],
-                entrypoint_path=str(uni_entry),
-                port=uni_port,
-                release_id=c2_cfg["release_id"],
-                owner_scope_id=owner["owner_scope_id"],
-                receipt_store=store,
-                run_id=run_id,
-            )
-            _detach_popen(proc)
-            started["c2_unified"] = lease
-            store.record_step(run_id, "c2", "start_c2_unified", "succeeded", {"pid": proc.pid, "port": uni_port})
+            spawn_ident = query_process_identity_exact(proc.pid)
+            spawn_ct = spawn_ident["create_time_filetime"] if spawn_ident else None
+            leased = False
+            try:
+                deadline = time.monotonic() + startup_timeout
+                while time.monotonic() < deadline:
+                    if proc.poll() is not None:
+                        raise CanaryError(
+                            "C2_UNIFIED_START_FAILED",
+                            f"Shadow C2 Unified API exited early ({proc.returncode})",
+                            log_tail=_read_log_tail(logs_dir / "c2_unified.log"),
+                        )
+                    probe_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
+                    code, _ = _http_get_json(uni_port, "/health", timeout=probe_timeout)
+                    if code == 200 and proc.poll() is None:
+                        break
+                    time.sleep(0.15)
+                else:
+                    raise CanaryError("C2_UNIFIED_START_FAILED", "Shadow C2 Unified API did not become ready before timeout")
+                ident = query_process_identity_exact(proc.pid)
+                if ident is None:
+                    raise CanaryError("PROCESS_IDENTITY_UNAVAILABLE", "Could not query C2 Unified API kernel identity")
+                lease = write_process_lease(
+                    root,
+                    role="c2_unified",
+                    pid=proc.pid,
+                    create_time_filetime=ident["create_time_filetime"],
+                    executable_path=ident["executable_path"],
+                    entrypoint_path=str(uni_entry),
+                    port=uni_port,
+                    release_id=c2_cfg["release_id"],
+                    owner_scope_id=owner["owner_scope_id"],
+                    receipt_store=store,
+                    run_id=run_id,
+                )
+                _detach_popen(proc)
+                leased = True
+                started["c2_unified"] = lease
+                store.record_step(run_id, "c2", "start_c2_unified", "succeeded", {"pid": proc.pid, "port": uni_port})
+            finally:
+                if not leased:
+                    _terminate_unleased_spawn(proc, spawn_ct, port=uni_port)
 
         summary = {"ok": True, "run_id": run_id, "services": started}
         receipt = store.finish_run(run_id, "succeeded", summary={"services": sorted(started.keys())})
         summary["receipt"] = receipt
         return summary
     except CanaryError as exc:
+        _cleanup_partial_starts()
         store.finish_run(run_id, "failed", error_code=exc.code, summary=exc.to_dict())
         raise
     except Exception as exc:
+        _cleanup_partial_starts()
         store.finish_run(run_id, "failed", error_code=type(exc).__name__)
         raise
 
 
 def _probe_hub_entry_v1(hub_state_dir: Path, hub_port: int, release_dir: Path) -> dict[str, Any]:
     """Authenticated /agent/v1 probe (capabilities + route_plan) with clean grant revoke."""
-    bridge_dir = _c1_bridge_dir(release_dir)
-    if str(bridge_dir) not in sys.path:
-        sys.path.insert(0, str(bridge_dir))
-    from ff_agent_entry import ENTRY_PATH, EntryAuthority  # noqa: E402
+    bridge_dir = str(_c1_bridge_dir(release_dir))
+    added_sys_path = False
+    try:
+        from ff_agent_entry import ENTRY_PATH, EntryAuthority  # noqa: E402
+    except ImportError:
+        if bridge_dir not in sys.path:
+            sys.path.insert(0, bridge_dir)
+            added_sys_path = True
+        from ff_agent_entry import ENTRY_PATH, EntryAuthority  # noqa: E402
+    finally:
+        if added_sys_path:
+            try:
+                sys.path.remove(bridge_dir)
+            except ValueError:
+                pass
 
     auth = EntryAuthority(hub_state_dir)
     task_id = "canary-health-" + uuid.uuid4().hex[:12]
@@ -2378,7 +2765,7 @@ def _probe_hub_entry_v1(hub_state_dir: Path, hub_port: int, release_dir: Path) -
                 },
                 method="POST",
             )
-            with _loopback_opener().open(req, timeout=10) as resp:
+            with _loopback_opener().open(req, timeout=15.0) as resp:
                 return json.loads(resp.read())
 
         caps = post_entry("capabilities", {})
@@ -2448,7 +2835,7 @@ def verify_shadow_health(
                 passes = 0
                 last_status: dict[str, Any] = {}
                 for _ in range(consecutive_passes):
-                    st = _hub_rpc_call(hub_state, "hub_status", timeout=4.0)
+                    st = _hub_rpc_call(hub_state, "hub_status", timeout=15.0)
                     if st.get("pid") != lease_v["pid"]:
                         raise CanaryError("HEALTH_CONTRACT_FAILED", "Hub status PID disagrees with verified lease")
                     last_status = st
@@ -2476,10 +2863,11 @@ def verify_shadow_health(
                 expected_agent_sha = sha256_file(_c1_bridge_dir(rel_dir) / "ff_win_v3_agent.py")
                 passes = 0
                 for _ in range(consecutive_passes):
-                    ping = _bridge_rpc_call(rpc_port, secret, "ping", {}, timeout=4.0)
-                    caps = _bridge_rpc_call(rpc_port, secret, "capabilities", {}, timeout=4.0)
+                    ping = _bridge_rpc_call(rpc_port, secret, "ping", {}, timeout=15.0)
+                    caps = _bridge_rpc_call(rpc_port, secret, "capabilities", {}, timeout=15.0)
                     agent_sha = ((caps.get("result") or {}).get("agent_sha256") or "").lower()
-                    if ping.get("ok") and caps.get("ok") and hmac.compare_digest(agent_sha, expected_agent_sha):
+                    ping_pid = (ping.get("result") or {}).get("pid")
+                    if ping.get("ok") and ping_pid == lease_v["pid"] and caps.get("ok") and hmac.compare_digest(agent_sha, expected_agent_sha):
                         passes += 1
                     else:
                         break
@@ -2515,7 +2903,7 @@ def verify_shadow_health(
                 passes = 0
                 last_body: dict[str, Any] | None = None
                 for _ in range(consecutive_passes):
-                    code, body = _http_get_json(gw_port, "/health", timeout=3.0)
+                    code, body = _http_get_json(gw_port, "/health", timeout=15.0)
                     if code == 200 and isinstance(body, dict) and (body.get("ok") is True or body.get("status") == "ok"):
                         passes += 1
                         last_body = body
@@ -2551,8 +2939,8 @@ def verify_shadow_health(
                 ready_http = 0
                 gateway_upstream_ok = False
                 for _ in range(consecutive_passes):
-                    code, body = _http_get_json(uni_port, "/health", timeout=3.0)
-                    r_code, r_body = _http_get_json(uni_port, "/ready", timeout=3.0, headers=auth_headers)
+                    code, body = _http_get_json(uni_port, "/health", timeout=15.0)
+                    r_code, r_body = _http_get_json(uni_port, "/ready", timeout=15.0, headers=auth_headers)
                     ready_http = r_code
                     observed_gw_port = body.get("gateway_port") if isinstance(body, dict) else None
                     # Support real C2 Unified API contract: {"ready": bool, "services": {"gateway": {"reachable": bool}, "omniroute": {"reachable": bool}}}
@@ -2691,32 +3079,7 @@ def stop_shadow_services(
         lp = _lease_path(root, role)
         if not lp.is_file():
             continue
-        if role == "c1_hub":
-            res = stop_leased_process(
-                root,
-                role,
-                idle_checker=lambda: inspect_c1_hub_active_sessions(hub_state, require_rpc_if_running=True),
-                graceful_stop=lambda: _hub_rpc_call(hub_state, "hub_shutdown_idle", timeout=5.0),
-                receipt_store=store,
-                run_id=run_id,
-            )
-        elif role == "c1_rpc":
-            res = stop_leased_process(
-                root,
-                role,
-                idle_checker=lambda: inspect_c1_rpc_active_sessions(root),
-                receipt_store=store,
-                run_id=run_id,
-            )
-        else:
-            res = stop_leased_process(
-                root,
-                role,
-                idle_checker=lambda: inspect_c2_gateway_active_jobs(c2_db),
-                receipt_store=store,
-                run_id=run_id,
-            )
-        stopped[role] = res
+        stopped[role] = _stop_single_role(root, role, store=store, run_id=run_id)
     return {"ok": True, "stopped": stopped}
 
 
@@ -2898,12 +3261,14 @@ def rollback_canary(
         request_payload={
             "shadow_root": str(root),
             "c1_target_release_id": c1_target_release_id,
+            "c1_baseline_zip_sha256": c1_baseline_zip_sha256,
             "c2_target_release_id": c2_target_release_id,
             "restore_c2_db_backup_sha256": restore_c2_db_backup_sha256,
+            "private_runtime_home": str(Path(private_runtime_home).resolve()) if private_runtime_home is not None else None,
         },
     )
     if cached is not None:
-        return {"ok": cached["status"] == "succeeded", **cached}
+        return {"ok": cached["status"] in {"succeeded", "rolled_back"}, **cached}
 
     try:
         # 1) Mandatory active-session / active-job guard & verified idle stop!
@@ -2930,6 +3295,8 @@ def rollback_canary(
                 [sys.executable, "-X", "utf8", str(rt_tool), "--home", str(pr_home), "rollback"],
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=60,
                 check=False,
             )

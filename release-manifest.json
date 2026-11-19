@@ -624,7 +624,7 @@
     "tools/agent_entry.py": "6199156128f7e45a684ce9ea1e000a4fbe7cc0507bc8530772b842686d3250cc",
     "tools/bridge_remote_gh.py": "cf5d7d827fb70f19966fff1e41e714a50e89b9d44852d6c034f5a5bd6bfe8ddb",
     "tools/canary_cutover_c1_c2.ps1": "0b0a90f746b9ce1c3ee7ee76e3c206eca363fe4ce18b5135513db0ac322371d7",
-    "tools/canary_release_workflow.py": "88c29cfeb4e1c1eb5234eebf562db60b5db9542b1f499388943d1c39faabd124",
+    "tools/canary_release_workflow.py": "60f0c9d949f9c7bdcfef7c80596949ef6dc40ecb4b04e26f724e361c195e779a",
     "tools/canary_rollback_c1_c2.ps1": "e107a7cf2d45124a537c8001b3c06061fe0cccd5335ff8d7762350158a5d501f",
     "tools/cua_cold_recovery_watchdog.py": "2fabe980fada6db85e3cc10e8a4df8e1c9d4928002ad342504a8c40d70de9061",
     "tools/cua_cold_rollback_bundle.py": "bec15aea080c9d5918a8b4fe89b05e61159f2709f1010031ef98861aa317c34f",
