@@ -25,7 +25,33 @@ sys.path.insert(0, str(ROOT / "runtime" / "bridge-v3"))
 
 import canary_release_workflow as canary  # noqa: E402
 from ff_hub import HubClient  # noqa: E402
+from ff_hub_store import HubError  # noqa: E402
 from ff_win_process_identity import process_creation_token  # noqa: E402
+
+
+def _cancel_hub_session_reconciled(hub_client: HubClient, request_key: str, *, wait_seconds: float = 30.0) -> dict:
+    """Cancel an active Hub session and reconcile via durable request_status if a reply is lost."""
+    try:
+        return hub_client.call("task_cancel", request_key=request_key)
+    except HubError as exc:
+        if exc.code != "HUB_UNREACHABLE":
+            raise
+        deadline = time.monotonic() + wait_seconds
+        last_status = None
+        while time.monotonic() < deadline:
+            try:
+                st = hub_client.call("request_status", {"request_key": request_key})
+                last_status = st
+                if st.get("state") == "completed":
+                    return st.get("response") or {"closed": True, "reconciled": True}
+                if st.get("state") in {"failed", "unknown"}:
+                    raise AssertionError(f"task_cancel reached non-completed state after lost reply: {st}") from exc
+            except HubError:
+                pass
+            time.sleep(0.25)
+        raise AssertionError(
+            f"task_cancel lost reply and did not complete within {wait_seconds}s: {last_status}"
+        ) from exc
 
 
 def _free_ports(count: int) -> list[int]:
@@ -519,7 +545,7 @@ class TestSqliteBackupAndProcessIdentity(unittest.TestCase):
 class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory(prefix="ff-canary-e2e-")
-        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self._ordered_cleanup)
         self.base = Path(self.tmp.name)
         self.shadow = self.base / "shadow-root"
         self.c2_repo = self.base / "c2-repo"
@@ -545,13 +571,34 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
         conn.close()
         self.source_c2_db_sha_before = _sha256_bytes(self.source_c2_db.read_bytes())
 
-    def tearDown(self):
-        # Always ensure any shadow processes started during test are cleaned up even on assertion failure.
-        if (self.shadow / "canary-shadow-owner.json").is_file():
-            try:
-                canary.stop_shadow_services(self.shadow, ignore_missing=True)
-            except Exception:
-                pass
+    def _ordered_cleanup(self):
+        # Stop every owned shadow root BEFORE removing temp files; never mask stop failures
+        # and never delete leases/ while owned shadow processes remain alive.
+        stop_errors: list[tuple[str, Exception]] = []
+        live_after_stop: list[dict] = []
+        if self.base.is_dir():
+            for marker in sorted(self.base.rglob("canary-shadow-owner.json")):
+                shadow_dir = marker.parent
+                try:
+                    canary.stop_shadow_services(shadow_dir, ignore_missing=True)
+                except Exception as exc:
+                    stop_errors.append((str(shadow_dir), exc))
+                leases_dir = shadow_dir / "leases"
+                if leases_dir.is_dir():
+                    for lf in sorted(leases_dir.glob("*.lease.json")):
+                        role = lf.name[: -len(".lease.json")]
+                        try:
+                            lv = canary.verify_process_lease(shadow_dir, role, require_alive=False, check_cmdline=True)
+                            if lv.get("alive"):
+                                live_after_stop.append({"shadow": str(shadow_dir), "role": role, "pid": lv.get("pid")})
+                        except Exception as exc:
+                            live_after_stop.append({"shadow": str(shadow_dir), "role": role, "verify_error": repr(exc)})
+        if stop_errors or live_after_stop:
+            raise AssertionError(
+                f"Shadow cleanup left live processes or failed to stop; preserved {self.base} "
+                f"to keep process leases intact. stop_errors={stop_errors!r}, live_after_stop={live_after_stop!r}"
+            )
+        canary._retry_windows_fs_op(self.tmp.cleanup, timeout=3.0)
 
     @unittest.skipUnless(os.name == "nt", "Real Windows shadow E2E lifecycle")
     def test_full_c1_c2_shadow_upgrade_health_active_guard_rollback_and_receipts(self):
@@ -671,7 +718,7 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
         self.assertFalse(health["live_production_cutover_executed"])
 
         # 4) Open a real active Hub session -> rollback MUST be DENIED without killing Hub!
-        hub_client = HubClient(self.shadow / "state" / "c1" / "hub", timeout=5)
+        hub_client = HubClient(self.shadow / "state" / "c1" / "hub", timeout=30.0)
         hub_client.call("session_open", {"agent_id": "canary-active", "task_id": "keep-alive"})
         try:
             with self.assertRaises(canary.CanaryError) as ctx:
@@ -680,7 +727,7 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
             # Confirm Hub is STILL alive and session intact!
             self.assertEqual(len(hub_client.call("hub_status")["sessions"]), 1)
         finally:
-            hub_client.call("task_cancel", request_key="cancel-canary-active")
+            _cancel_hub_session_reconciled(hub_client, "cancel-canary-active")
 
         # 5) Insert an active job into shadow C2 gateway.db -> rollback MUST be DENIED without killing C2!
         c2_db_path = self.shadow / "state" / "c2" / "runtime" / "gateway.db"
@@ -713,6 +760,22 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
         self.assertEqual(rb["c1"]["restored_release_id"], stage_v1["c1"]["release_id"])
         self.assertEqual(rb["c2"]["restored_release_id"], stage_v1["c2"]["release_id"])
         self.assertTrue(rb["c2"]["db_restored"])
+        # Idempotent replay of a completed rollback MUST return ok=True and deduplicated=True!
+        rb_dup = canary.rollback_canary(
+            self.shadow,
+            confirm_shadow_rollback=True,
+            restore_c2_db_backup=Path(pre_v2_c2_backup["backup_path"]),
+            restore_c2_db_backup_sha256=pre_v2_c2_backup["backup_sha256"],
+            request_key="rb-real-success",
+        )
+        self.assertTrue(rb_dup["ok"])
+        self.assertTrue(rb_dup["deduplicated"])
+        self.assertEqual(rb_dup["status"], "rolled_back")
+        # Confirm every shadow port was released and zero leased processes remain alive.
+        for role in ("c1_hub", "c1_rpc", "c2_gateway", "c2_unified"):
+            self.assertFalse(canary.verify_process_lease(self.shadow, role, require_alive=False)["alive"])
+        for port in (c1_rpc_port, c1_hub_port, c2_gw_port, c2_uni_port):
+            self.assertTrue(canary._is_loopback_port_free(port), f"port {port} still occupied after rollback stop")
         self.assertTrue((self.shadow / "state" / "c2" / "runtime" / "legacy_only.py").is_file())
         self.assertFalse((self.shadow / "state" / "c2" / "runtime" / "candidate_feature.py").exists())
         # Verify C2 source git repo HEAD was NEVER touched by rollback!
@@ -910,6 +973,220 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
                 restore_c2_db_backup_sha256="0" * 64,
             )
         self.assertEqual(ctx.exception.code, "SQLITE_BACKUP_HASH_MISMATCH")
+
+    @unittest.skipUnless(os.name == "nt", "Windows single-handle identity, port guards, and partial startup rollback")
+    def test_single_handle_identity_port_guards_and_partial_startup_cleanup(self):
+        # 1) Native single-handle NtQueryInformationProcess returns exact cmdline without PowerShell!
+        self_ident = canary.query_process_identity_exact(os.getpid(), include_cmdline=True)
+        self.assertIsNotNone(self_ident)
+        self.assertIsInstance(self_ident.get("cmdline"), str)
+        self.assertIn("python", self_ident["cmdline"].casefold())
+
+        # 2) Stage C1 + C2, then occupy c2_gateway port with a local socket BEFORE starting:
+        #    start_shadow_services must roll back the just-started c1_hub cleanly with ZERO leaks!
+        c1_rpc_port, c1_hub_port, c2_gw_port, c2_uni_port, fake_omni_port = _free_ports(5)
+        _git(self.c2_repo, "checkout", "-q", self.c2_v2)
+        canary.run_shadow_stage(
+            shadow_root=self.shadow,
+            c1_zip=self.c1_v2_zip,
+            c1_zip_sha256=self.c1_v2_sha,
+            c1_expected_commit=self.c1_v2_commit,
+            c2_repo=self.c2_repo,
+            c2_commit=self.c2_v2,
+            c1_rpc_port=c1_rpc_port,
+            c1_hub_port=c1_hub_port,
+            c2_gateway_port=c2_gw_port,
+            c2_unified_port=c2_uni_port,
+            c2_omni_port=fake_omni_port,
+            request_key="partial-start-stage",
+        )
+        blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        blocker.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        blocker.bind(("127.0.0.1", c2_gw_port))
+        blocker.listen(1)
+        try:
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.start_shadow_services(
+                    self.shadow,
+                    start_c1_rpc=False,
+                    start_c1_hub=True,
+                    start_c2_gateway=True,
+                    start_c2_unified=False,
+                )
+            self.assertEqual(ctx.exception.code, "SHADOW_PORT_ALREADY_IN_USE")
+        finally:
+            blocker.close()
+
+        # Verify c1_hub was rolled back cleanly (not orphaned!) and its port & lock are free!
+        hub_lease = canary.verify_process_lease(self.shadow, "c1_hub", require_alive=False, check_cmdline=True)
+        self.assertFalse(hub_lease["alive"])
+        self.assertTrue(canary._is_loopback_port_free(c1_hub_port))
+        self.assertTrue(canary._wait_hub_lock_released(self.shadow / "state" / "c1" / "hub", timeout=2.0))
+
+        # 3) Start c1_hub + c2_gateway cleanly; duplicate start MUST fail closed with SHADOW_SERVICE_ALREADY_RUNNING,
+        #    and re-staging C2 while c2_gateway is alive MUST fail closed with SHADOW_SERVICE_RUNNING!
+        started = canary.start_shadow_services(
+            self.shadow,
+            start_c1_rpc=False,
+            start_c1_hub=True,
+            start_c2_gateway=True,
+            start_c2_unified=False,
+        )
+        self.assertTrue(started["ok"])
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.start_shadow_services(
+                self.shadow,
+                start_c1_rpc=False,
+                start_c1_hub=True,
+                start_c2_gateway=False,
+                start_c2_unified=False,
+            )
+        self.assertEqual(ctx.exception.code, "SHADOW_SERVICE_ALREADY_RUNNING")
+
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.stage_c2_shadow(
+                self.shadow,
+                c2_repo=self.c2_repo,
+                c2_commit=self.c2_v2,
+                gateway_port=c2_gw_port,
+                unified_port=c2_uni_port,
+                omni_port=fake_omni_port,
+            )
+        self.assertEqual(ctx.exception.code, "SHADOW_SERVICE_RUNNING")
+
+    @unittest.skipUnless(os.name == "nt", "Windows Hub cancel receipt reconciliation and graceful disconnect stop")
+    def test_hub_cancel_lost_reply_reconciliation_and_graceful_stop_disconnect(self):
+        c1_rpc_port, c1_hub_port = _free_ports(2)
+        canary.run_shadow_stage(
+            shadow_root=self.shadow,
+            c1_zip=self.c1_v1_zip,
+            c1_zip_sha256=self.c1_v1_sha,
+            c1_expected_commit=self.c1_v1_commit,
+            c1_rpc_port=c1_rpc_port,
+            c1_hub_port=c1_hub_port,
+            skip_c2=True,
+            request_key="hub-reconcile-stage",
+        )
+        canary.start_shadow_services(
+            self.shadow,
+            start_c1_rpc=False,
+            start_c1_hub=True,
+            start_c2_gateway=False,
+            start_c2_unified=False,
+        )
+        hub_state = self.shadow / "state" / "c1" / "hub"
+        hub_client = HubClient(hub_state, timeout=30.0)
+        hub_client.call("session_open", {"agent_id": "reconcile-agent", "task_id": "lost-reply"})
+
+        # Simulate lost reply after server executed task_cancel: first call runs task_cancel
+        # on server but raises HUB_UNREACHABLE to caller; reconciliation via request_status succeeds!
+        real_raw = hub_client.raw
+        injected = {"dropped": False}
+
+        def drop_first_cancel_reply(req):
+            reply = real_raw(req)
+            if req.get("op") == "task_cancel" and not injected["dropped"]:
+                injected["dropped"] = True
+                raise HubError("HUB_UNREACHABLE", "simulated lost reply after commit", retry_safe=False)
+            return reply
+
+        hub_client.raw = drop_first_cancel_reply
+        reconciled = _cancel_hub_session_reconciled(hub_client, "cancel-lost-reply-01")
+        self.assertTrue(reconciled["closed"])
+        self.assertTrue(injected["dropped"])
+        self.assertEqual(hub_client.call("hub_status")["sessions"], [])
+
+        # Graceful stop when Hub reports HUB_BUSY -> fails closed as ACTIVE_SESSIONS_PRESENT without kill!
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.stop_leased_process(
+                self.shadow,
+                "c1_hub",
+                idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+                graceful_stop=lambda: (_ for _ in ()).throw(canary.CanaryError("HUB_BUSY", "busy")),
+            )
+        self.assertEqual(ctx.exception.code, "ACTIVE_SESSIONS_PRESENT")
+        self.assertTrue(canary.verify_process_lease(self.shadow, "c1_hub", require_alive=True)["alive"])
+
+        # Graceful stop when socket drops while Hub stays alive -> fails closed (no force kill)!
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.stop_leased_process(
+                self.shadow,
+                "c1_hub",
+                idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+                graceful_stop=lambda: (_ for _ in ()).throw(canary.CanaryError("HUB_UNREACHABLE", "timeout")),
+                timeout_seconds=0.4,
+            )
+        self.assertEqual(ctx.exception.code, "HUB_UNREACHABLE")
+        self.assertTrue(canary.verify_process_lease(self.shadow, "c1_hub", require_alive=True)["alive"])
+
+        # Graceful stop where Hub actually shuts down AND socket drops mid-reply -> SYNCHRONIZE handle confirms exit!
+        def shutdown_then_disconnect():
+            canary._hub_rpc_call(hub_state, "hub_shutdown_idle", timeout=15.0)
+            raise canary.CanaryError("HUB_UNREACHABLE", "simulated disconnect during shutdown")
+
+        res = canary.stop_leased_process(
+            self.shadow,
+            "c1_hub",
+            idle_checker=lambda: canary.inspect_c1_hub_active_sessions(hub_state, require_rpc_if_running=True),
+            graceful_stop=shutdown_then_disconnect,
+            post_exit_wait=lambda: canary._wait_hub_lock_released(hub_state, timeout=5.0),
+        )
+        self.assertTrue(res["stopped"])
+        self.assertTrue(res["graceful"])
+        self.assertFalse(canary.verify_process_lease(self.shadow, "c1_hub", require_alive=False)["alive"])
+        self.assertTrue(canary._is_loopback_port_free(c1_hub_port))
+
+    def test_receipt_cross_action_conflict_and_started_outcome_unknown(self):
+        canary.ensure_shadow_owner(self.shadow, create=True)
+        store = canary.CanaryReceiptStore(self.shadow / "state" / "canary_receipts.sqlite3")
+
+        # 1) Cross-action reuse of request_key with identical payload MUST raise REQUEST_KEY_CONFLICT!
+        run_id, cached = store.begin_run("stage_shadow", "shadow", request_key="shared-key-1", request_payload={"a": 1})
+        self.assertIsNone(cached)
+        store.finish_run(run_id, "succeeded", summary={"ok": True})
+        with self.assertRaises(canary.CanaryError) as ctx:
+            store.begin_run("rollback", "shadow", request_key="shared-key-1", request_payload={"a": 1})
+        self.assertEqual(ctx.exception.code, "REQUEST_KEY_CONFLICT")
+
+        # 2) Interrupted/crashed run stuck in 'started' MUST fail closed with REQUEST_OUTCOME_UNKNOWN!
+        stuck_id, cached2 = store.begin_run("rollback", "shadow", request_key="interrupted-rb-1", request_payload={"x": 2})
+        self.assertIsNone(cached2)
+        self.assertTrue(stuck_id.startswith("crun-"))
+        with self.assertRaises(canary.CanaryError) as ctx:
+            store.begin_run("rollback", "shadow", request_key="interrupted-rb-1", request_payload={"x": 2})
+        self.assertEqual(ctx.exception.code, "REQUEST_OUTCOME_UNKNOWN")
+
+    @unittest.skipUnless(os.name == "nt", "Windows ordered teardown lease preservation")
+    def test_ordered_cleanup_preserves_leases_when_stop_is_refused(self):
+        c1_rpc_port, c1_hub_port = _free_ports(2)
+        canary.run_shadow_stage(
+            shadow_root=self.shadow,
+            c1_zip=self.c1_v1_zip,
+            c1_zip_sha256=self.c1_v1_sha,
+            c1_expected_commit=self.c1_v1_commit,
+            c1_rpc_port=c1_rpc_port,
+            c1_hub_port=c1_hub_port,
+            skip_c2=True,
+            request_key="cleanup-preserve-stage",
+        )
+        canary.start_shadow_services(
+            self.shadow,
+            start_c1_rpc=False,
+            start_c1_hub=True,
+            start_c2_gateway=False,
+            start_c2_unified=False,
+        )
+        hub_client = HubClient(self.shadow / "state" / "c1" / "hub", timeout=30.0)
+        hub_client.call("session_open", {"agent_id": "cleanup-guard", "task_id": "busy"})
+        try:
+            # Ordered cleanup MUST fail loudly and keep leases/c1_hub.lease.json intact (never orphan!).
+            with self.assertRaises(AssertionError) as ctx:
+                self._ordered_cleanup()
+            self.assertIn("ACTIVE_SESSIONS_PRESENT", str(ctx.exception))
+            self.assertTrue((self.shadow / "leases" / "c1_hub.lease.json").is_file())
+            self.assertTrue(canary.verify_process_lease(self.shadow, "c1_hub", require_alive=True)["alive"])
+        finally:
+            _cancel_hub_session_reconciled(hub_client, "cancel-cleanup-guard")
 
 
 if __name__ == "__main__":

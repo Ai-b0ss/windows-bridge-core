@@ -544,7 +544,7 @@
     "tests/test_build_chatgpt_plugin.py": "a1785a7ea20a7149e38535b1fb3b5fc1a17ffbd3b96c38b65cd797b0eca6a760",
     "tests/test_canary_powershell.ps1": "3aace13aff81e5c9a70be9db9e800f3289a0932e7adf10194bea3ff8a2be6fec",
     "tests/test_canary_powershell_regression.py": "24df9929a47cfc4027608dac97e4649dda0b341bc4372200deec5f8573a33831",
-    "tests/test_canary_release_workflow.py": "47de8a5d1ca2d116e4a2722fa02258395edb13e3c5cad16847f2847071d8efbd",
+    "tests/test_canary_release_workflow.py": "f9a8ea5012fc97b0ee3f6852d053951b04121004b7d69505bf96be2c99bda143",
     "tests/test_cf_flight_controller_node.py": "e3fe916d5eb58dc56e33ce2d1aa01e3035c5e70f4c946441e8769db71e0d3c4b",
     "tests/test_chat_consent.py": "3fdb51e2f76660f0606fb40c732ed7e40681095952e12369ad8c5ffd3dc47b21",
     "tests/test_chat_effect_permission.py": "5803d1b23c35b81a3cd8490318fdfaf2dc950fb4ff078c0e950234e14cc83646",
