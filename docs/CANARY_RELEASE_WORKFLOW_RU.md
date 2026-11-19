@@ -33,7 +33,7 @@
    - Каждый запущенный shadow-процесс (`c1_rpc`, `c1_hub`, `c2_gateway`, `c2_unified`) получает owner-scoped lease в `<SHADOW_ROOT>/leases/<role>.lease.json` (`schema: ff-canary-process-lease-v1`), связывающий 4 независимых фактора:
      1. `pid`;
      2. 64-битный kernel `FILETIME` времени старта процесса (`GetProcessTimes`);
-     3. физический путь исполняемого файла (`QueryFullProcessImageNameW` на том же kernel handle) + проверку пути скрипта внутри `<SHADOW_ROOT>` и командной строки;
+     3. физический путь исполняемого файла (`QueryFullProcessImageNameW` на том же kernel handle) + его криптографический хэш `executable_sha256` + граничную проверку пути скрипта внутри `<SHADOW_ROOT>` и командной строки (fail-closed);
      4. `owner_scope_id`, совпадающий с `canary-shadow-owner.json`.
    - Поиск процессов по подстроке и слепой `Stop-Process -Force` полностью исключены.
    - При несовпадении `create_time_filetime` (повторно использованный PID ОС) процесс не трогается (`PID_REUSED_OR_EXITED_NO_KILL`).

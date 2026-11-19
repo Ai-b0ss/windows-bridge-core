@@ -1188,6 +1188,414 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
         finally:
             _cancel_hub_session_reconciled(hub_client, "cancel-cleanup-guard")
 
+    @unittest.skipUnless(os.name == "nt", "Windows 4-factor executable hash, cmdline boundary, and fail-closed kill handle")
+    def test_4factor_executable_hash_cmdline_boundary_and_fail_closed_kill_handle(self):
+        from unittest import mock
+
+        owner = canary.ensure_shadow_owner(self.shadow, create=True)
+        script = self.shadow / "state" / "dummy_worker.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+
+        # Cmdline path matching MUST enforce argument boundaries (no prefix-collision spoofing!).
+        self.assertFalse(
+            canary._cmdline_contains_path(
+                f'"{sys.executable}" "{script}.evil"',
+                str(script),
+            )
+        )
+        self.assertTrue(
+            canary._cmdline_contains_path(
+                f'"{sys.executable}" "{script}" --worker',
+                str(script),
+            )
+        )
+
+        proc = subprocess.Popen(
+            [sys.executable, str(script)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            ident = canary.query_process_identity_exact(proc.pid)
+            self.assertIsNotNone(ident)
+            expected_exe_sha = canary.sha256_file(Path(ident["executable_path"]))
+            lease = canary.write_process_lease(
+                self.shadow,
+                role="c2_gateway",
+                pid=proc.pid,
+                create_time_filetime=ident["create_time_filetime"],
+                executable_path=ident["executable_path"],
+                entrypoint_path=str(script),
+                port=_free_ports(1)[0],
+                release_id="rel-hash-test",
+                owner_scope_id=owner["owner_scope_id"],
+            )
+            # Factor 3 MUST bind the cryptographic SHA-256 hash of the executable image!
+            self.assertEqual(lease.get("executable_sha256"), expected_exe_sha)
+            verified = canary.verify_process_lease(self.shadow, "c2_gateway", require_alive=True, check_cmdline=True)
+            self.assertEqual(verified.get("executable_sha256"), expected_exe_sha)
+
+            lease_path = self.shadow / "leases" / "c2_gateway.lease.json"
+
+            # Negative 1: Tampered executable_sha256 -> PROCESS_IDENTITY_MISMATCH, MUST NOT kill!
+            bad_hash_lease = dict(lease, executable_sha256="0" * 64)
+            lease_path.write_text(json.dumps(bad_hash_lease, indent=2), encoding="utf-8")
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.stop_leased_process(
+                    self.shadow,
+                    "c2_gateway",
+                    idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+                )
+            self.assertEqual(ctx.exception.code, "PROCESS_IDENTITY_MISMATCH")
+            self.assertIsNone(proc.poll(), "Process must NEVER be killed when executable_sha256 mismatches")
+
+            # Negative 2: Missing executable_sha256 -> PROCESS_LEASE_INVALID, MUST NOT kill!
+            no_hash_lease = {k: v for k, v in lease.items() if k != "executable_sha256"}
+            lease_path.write_text(json.dumps(no_hash_lease, indent=2), encoding="utf-8")
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.stop_leased_process(
+                    self.shadow,
+                    "c2_gateway",
+                    idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+                )
+            self.assertEqual(ctx.exception.code, "PROCESS_LEASE_INVALID")
+            self.assertIsNone(proc.poll())
+
+            # Negative 3: Unreadable cmdline on the kill handle MUST fail closed (never kill on None/empty!).
+            lease_path.write_text(json.dumps(lease, indent=2), encoding="utf-8")
+            real_query_cmd = canary._query_handle_cmdline
+            calls = {"n": 0}
+
+            def fail_on_kill_handle(handle):
+                calls["n"] += 1
+                # First call is verify_process_lease; second call is the actual TerminateProcess handle!
+                if calls["n"] >= 2:
+                    return None
+                return real_query_cmd(handle)
+
+            with mock.patch.object(canary, "_query_handle_cmdline", side_effect=fail_on_kill_handle), \
+                 mock.patch.object(canary, "_query_process_cmdline_cim", return_value=None):
+                with self.assertRaises(canary.CanaryError) as ctx:
+                    canary.stop_leased_process(
+                        self.shadow,
+                        "c2_gateway",
+                        idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+                    )
+                self.assertEqual(ctx.exception.code, "PROCESS_IDENTITY_MISMATCH")
+                self.assertIsNone(proc.poll(), "Kill handle MUST fail closed when cmdline cannot be read")
+
+            # Valid 4-factor lease stops the verified idle process cleanly.
+            stopped = canary.stop_leased_process(
+                self.shadow,
+                "c2_gateway",
+                idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+            )
+            self.assertTrue(stopped["stopped"])
+            self.assertIsNotNone(proc.wait(timeout=5))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    def test_sqlite_locked_backup_restore_and_readonly_receipts_fail_closed(self):
+        # 1) Read-only receipt verification on missing DB must NOT create file and MUST fail closed!
+        missing_receipts = self.base / "never-created" / "canary_receipts.sqlite3"
+        ro_store = canary.CanaryReceiptStore(missing_receipts, readonly=True)
+        self.assertFalse(missing_receipts.exists())
+        with self.assertRaises(canary.CanaryError) as ctx:
+            ro_store.verify_receipt_chain()
+        self.assertEqual(ctx.exception.code, "RECEIPT_CHAIN_CORRUPTED")
+        self.assertFalse(missing_receipts.exists())
+
+        # 2) SQLite locked receipt DB fails closed with structured SQLITE_RECEIPT_LOCKED!
+        rc_path = self.base / "locked-receipts.sqlite3"
+        rw_store = canary.CanaryReceiptStore(rc_path, timeout=0.3)
+        lock_conn = sqlite3.connect(str(rc_path), isolation_level=None, timeout=1.0)
+        try:
+            lock_conn.execute("BEGIN EXCLUSIVE")
+            with self.assertRaises(canary.CanaryError) as ctx:
+                rw_store.begin_run("stage_shadow", "shadow", request_key="locked-key-1")
+            self.assertEqual(ctx.exception.code, "SQLITE_RECEIPT_LOCKED")
+        finally:
+            if lock_conn.in_transaction:
+                lock_conn.execute("ROLLBACK")
+            lock_conn.close()
+
+        # 3) SQLite online backup fails FAST (bounded deadline, never hangs!) on EXCLUSIVE-locked
+        #    DELETE-mode DB with zero leftover .bkp.tmp files and cleanly released handles!
+        excl_db = self.base / "excl_source.db"
+        c_excl = sqlite3.connect(str(excl_db), isolation_level=None)
+        try:
+            c_excl.execute("PRAGMA journal_mode=DELETE")
+            c_excl.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY, status TEXT)")
+            c_excl.execute("INSERT INTO jobs VALUES ('j0', 'completed')")
+            c_excl.execute("BEGIN EXCLUSIVE")
+            c_excl.execute("INSERT INTO jobs VALUES ('j1', 'running')")
+            out_bkp = self.base / "backups" / "should_not_exist.db"
+            t0 = time.monotonic()
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.sqlite_online_backup(excl_db, out_bkp, timeout=0.35)
+            elapsed = time.monotonic() - t0
+            self.assertEqual(ctx.exception.code, "SQLITE_BACKUP_LOCKED")
+            self.assertLess(elapsed, 2.5, f"Preflight EXCLUSIVE lock backup hung ({elapsed:.2f}s)")
+            self.assertFalse(out_bkp.exists())
+            self.assertEqual(list(out_bkp.parent.glob("*.bkp.tmp*")), [])
+
+            # 3b) Adversarial mid-backup SQLITE_BUSY race (preflight bypassed, lock held DURING
+            #     sqlite3.Connection.backup): bounded progress deadline MUST abort cleanly without
+            #     hanging, close both handles, and leave ZERO 0-byte .bkp.tmp files!
+            from unittest import mock
+
+            t1 = time.monotonic()
+            with mock.patch.object(canary, "_sqlite_preflight_readable", return_value=None):
+                with self.assertRaises(canary.CanaryError) as ctx_mid:
+                    canary.sqlite_online_backup(excl_db, out_bkp, timeout=0.35, pages=1)
+            elapsed_mid = time.monotonic() - t1
+            self.assertEqual(ctx_mid.exception.code, "SQLITE_BACKUP_LOCKED")
+            self.assertLess(elapsed_mid, 2.5, f"Mid-backup SQLITE_BUSY hung ({elapsed_mid:.2f}s)")
+            self.assertFalse(out_bkp.exists())
+            self.assertEqual(list(out_bkp.parent.glob("*.bkp.tmp*")), [])
+
+            # 3c) Same bounded deadline applies to sqlite_restore_from_backup on EXCLUSIVE-locked source!
+            excl_sha = canary.sha256_file(excl_db)
+            restored_dst = self.base / "backups" / "restore_should_not_exist.db"
+            t2 = time.monotonic()
+            with self.assertRaises(canary.CanaryError) as ctx_res:
+                canary.sqlite_restore_from_backup(excl_db, excl_sha, restored_dst, timeout=0.35)
+            elapsed_res = time.monotonic() - t2
+            self.assertEqual(ctx_res.exception.code, "SQLITE_BACKUP_LOCKED")
+            self.assertLess(elapsed_res, 2.5, f"Locked restore source hung ({elapsed_res:.2f}s)")
+            self.assertFalse(restored_dst.exists())
+            self.assertEqual(list(restored_dst.parent.glob("*.restore.tmp*")), [])
+        finally:
+            if c_excl.in_transaction:
+                c_excl.execute("ROLLBACK")
+            c_excl.close()
+
+        # After lock release, online backup succeeds cleanly with full integrity!
+        ok_bkp = self.base / "backups" / "unlocked_ok.db"
+        ok_info = canary.sqlite_online_backup(excl_db, ok_bkp, expected_tables=("jobs",), timeout=5.0)
+        self.assertTrue(ok_info["integrity_ok"])
+        self.assertEqual(ok_info["row_counts"]["jobs"], 1)
+
+        # 4) SQLite restore MUST refuse locked WAL target WITHOUT deleting target-wal or losing live rows!
+        if os.name == "nt":
+            target_db = self.base / "live_wal_target.db"
+            bkp_db = self.base / "clean_backup.db"
+            c_live = sqlite3.connect(str(target_db), isolation_level=None)
+            try:
+                c_live.execute("PRAGMA journal_mode=WAL")
+                c_live.execute("PRAGMA wal_autocheckpoint=0")
+                c_live.execute("CREATE TABLE jobs(id TEXT PRIMARY KEY, status TEXT)")
+                c_live.execute("INSERT INTO jobs VALUES ('seed', 'completed')")
+                bkp_info = canary.sqlite_online_backup(target_db, bkp_db, expected_tables=("jobs",))
+                # Write a new row that lives only in -wal while connection stays open!
+                c_live.execute("INSERT INTO jobs VALUES ('uncheckpointed-wal-row', 'running')")
+                wal_path = Path(str(target_db) + "-wal")
+                self.assertTrue(wal_path.is_file() and wal_path.stat().st_size > 0)
+
+                with self.assertRaises(canary.CanaryError) as ctx:
+                    canary.sqlite_restore_from_backup(
+                        bkp_db,
+                        bkp_info["backup_sha256"],
+                        target_db,
+                        timeout=0.3,
+                    )
+                self.assertEqual(ctx.exception.code, "SQLITE_TARGET_LOCKED")
+                self.assertTrue(wal_path.is_file(), "Locked restore MUST NEVER unlink live target -wal file!")
+            finally:
+                c_live.close()
+
+            # Confirm the live WAL row survived the refused restore intact!
+            c_verify = sqlite3.connect(str(target_db))
+            try:
+                ids = [r[0] for r in c_verify.execute("SELECT id FROM jobs ORDER BY id").fetchall()]
+                self.assertEqual(ids, ["seed", "uncheckpointed-wal-row"])
+            finally:
+                c_verify.close()
+
+    @unittest.skipUnless(os.name == "nt", "Windows C2 health identity, wildcard port occupation, C1 running guard, and baseline pin")
+    def test_c2_health_identity_port_occupied_and_rollback_baseline_pinning(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        c1_rpc_port, c1_hub_port, c2_gw_port, c2_uni_port, fake_omni_port = _free_ports(5)
+        _git(self.c2_repo, "checkout", "-q", self.c2_v1)
+        canary.run_shadow_stage(
+            shadow_root=self.shadow,
+            c1_zip=self.c1_v1_zip,
+            c1_zip_sha256=self.c1_v1_sha,
+            c1_expected_commit=self.c1_v1_commit,
+            c2_repo=self.c2_repo,
+            c2_commit=self.c2_v1,
+            c1_rpc_port=c1_rpc_port,
+            c1_hub_port=c1_hub_port,
+            c2_gateway_port=c2_gw_port,
+            c2_unified_port=c2_uni_port,
+            c2_omni_port=fake_omni_port,
+            request_key="ident-stage-v1",
+        )
+        _git(self.c2_repo, "checkout", "-q", self.c2_v2)
+        canary.run_shadow_stage(
+            shadow_root=self.shadow,
+            c1_zip=self.c1_v2_zip,
+            c1_zip_sha256=self.c1_v2_sha,
+            c1_expected_commit=self.c1_v2_commit,
+            c2_repo=self.c2_repo,
+            c2_commit=self.c2_v2,
+            c1_rpc_port=c1_rpc_port,
+            c1_hub_port=c1_hub_port,
+            c2_gateway_port=c2_gw_port,
+            c2_unified_port=c2_uni_port,
+            c2_omni_port=fake_omni_port,
+            request_key="ident-stage-v2",
+        )
+
+        # 1) Wildcard 0.0.0.0 SO_REUSEADDR listener (foreign process port) MUST be detected as occupied!
+        wild = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        wild.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        wild.bind(("0.0.0.0", c2_gw_port))
+        wild.listen(1)
+        try:
+            self.assertFalse(canary._is_loopback_port_free(c2_gw_port))
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.start_shadow_services(
+                    self.shadow,
+                    start_c1_rpc=False,
+                    start_c1_hub=True,
+                    start_c2_gateway=True,
+                    start_c2_unified=False,
+                )
+            self.assertEqual(ctx.exception.code, "SHADOW_PORT_ALREADY_IN_USE")
+        finally:
+            wild.close()
+
+        # 2) Start real C1 Hub + C2 Gateway + C2 Unified and verify kernel listener_pid_verified == True!
+        canary.start_shadow_services(
+            self.shadow,
+            start_c1_rpc=False,
+            start_c1_hub=True,
+            start_c2_gateway=True,
+            start_c2_unified=True,
+        )
+        health = canary.verify_shadow_health(
+            self.shadow,
+            check_c1_rpc=False,
+            check_c1_hub=True,
+            check_c2_gateway=True,
+            check_c2_unified=True,
+            consecutive_passes=1,
+        )
+        self.assertTrue(health["shadow_health_ok"])
+        self.assertTrue(health["checks"]["c1_hub"].get("listener_pid_verified"))
+        self.assertTrue(health["checks"]["c2_gateway"].get("listener_pid_verified"))
+        self.assertTrue(health["checks"]["c2_unified"].get("listener_pid_verified"))
+
+        # 3) Re-staging C1 while c1_hub is alive (even with 0 active sessions!) MUST fail closed!
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.stage_c1_shadow(
+                self.shadow,
+                c1_zip=self.c1_v1_zip,
+                c1_zip_sha256=self.c1_v1_sha,
+                c1_expected_commit=self.c1_v1_commit,
+                rpc_port=c1_rpc_port,
+                hub_port=c1_hub_port,
+            )
+        self.assertEqual(ctx.exception.code, "SHADOW_SERVICE_RUNNING")
+
+        # 4) Rollback with tampered lease executable_sha256 MUST fail closed BEFORE stopping ANY process!
+        gw_lease_path = self.shadow / "leases" / "c2_gateway.lease.json"
+        orig_gw_lease_text = gw_lease_path.read_text(encoding="utf-8")
+        gw_lease_obj = json.loads(orig_gw_lease_text)
+        gw_lease_path.write_text(json.dumps({**gw_lease_obj, "executable_sha256": "f" * 64}), encoding="utf-8")
+        try:
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.rollback_canary(self.shadow, confirm_shadow_rollback=True, request_key="rb-lease-mismatch")
+            self.assertEqual(ctx.exception.code, "PROCESS_IDENTITY_MISMATCH")
+            # Neither C2 Gateway nor C1 Hub was killed!
+            self.assertTrue(canary.verify_process_lease(self.shadow, "c1_hub", require_alive=True)["alive"])
+            self.assertIsNotNone(canary.query_process_identity_exact(gw_lease_obj["pid"]))
+        finally:
+            gw_lease_path.write_text(orig_gw_lease_text, encoding="utf-8")
+
+        # 5) Rollback with c1_baseline_zip pointing to v2 while previous_release_id is v1 MUST fail closed!
+        canary.stop_shadow_services(self.shadow, ignore_missing=True)
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.rollback_canary(
+                self.shadow,
+                confirm_shadow_rollback=True,
+                c1_baseline_zip=self.c1_v2_zip,
+                c1_baseline_zip_sha256=self.c1_v2_sha,
+                request_key="rb-wrong-baseline-pin",
+            )
+        self.assertEqual(ctx.exception.code, "PINNED_SHA256_MISMATCH")
+
+        # 6) Impostor listener on c2_gateway port (owned by test PID, NOT leased dummy worker PID):
+        #    verify_shadow_health MUST reject with HEALTH_IDENTITY_MISMATCH!
+        class _ImpostorHandler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                body = json.dumps({"ok": True, "service": "gateway", "port": c2_gw_port}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        impostor_srv = ThreadingHTTPServer(("127.0.0.1", c2_gw_port), _ImpostorHandler)
+        impostor_thr = threading.Thread(target=impostor_srv.serve_forever, daemon=True)
+        impostor_thr.start()
+        fake_script = self.shadow / "state" / "c2" / "runtime" / "server.py"
+        # Spawn a harmless sleeper whose cmdline contains fake_script path (via -c comment? No, run a separate sleeper inside shadow!)
+        sleeper_script = self.shadow / "state" / "c2" / "impostor_sleeper.py"
+        sleeper_script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+        sleeper = subprocess.Popen(
+            [sys.executable, str(sleeper_script)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            owner = canary.ensure_shadow_owner(self.shadow, create=False)
+            sl_ident = canary.query_process_identity_exact(sleeper.pid)
+            self.assertIsNotNone(sl_ident)
+            canary.write_process_lease(
+                self.shadow,
+                role="c2_gateway",
+                pid=sleeper.pid,
+                create_time_filetime=sl_ident["create_time_filetime"],
+                executable_path=sl_ident["executable_path"],
+                entrypoint_path=str(sleeper_script),
+                port=c2_gw_port,
+                release_id=canary._read_json(self.shadow / "state" / "c2" / "active.json")["release_id"],
+                owner_scope_id=owner["owner_scope_id"],
+            )
+            with self.assertRaises(canary.CanaryError) as ctx:
+                canary.verify_shadow_health(
+                    self.shadow,
+                    check_c1_rpc=False,
+                    check_c1_hub=False,
+                    check_c2_gateway=True,
+                    check_c2_unified=False,
+                    consecutive_passes=1,
+                )
+            self.assertEqual(ctx.exception.code, "HEALTH_IDENTITY_MISMATCH")
+        finally:
+            impostor_srv.shutdown()
+            impostor_srv.server_close()
+            if sleeper.poll() is None:
+                sleeper.kill()
+                sleeper.wait(timeout=5)
+            # Clean up temporary sleeper script so manifest stays clean
+            sleeper_script.unlink(missing_ok=True)
+
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -33,6 +33,7 @@ import secrets
 import shutil
 import socket
 import sqlite3
+import struct
 import subprocess
 import sys
 import tarfile
@@ -286,7 +287,105 @@ def _retry_windows_fs_op(fn: Callable[[], Any], *, timeout: float = 2.0) -> Any:
             delay = min(delay * 2.0, 0.2)
 
 
+class _MibTcpRowOwnerPid(ctypes.Structure):
+    _fields_ = [
+        ("dwState", ctypes.wintypes.DWORD),
+        ("dwLocalAddr", ctypes.wintypes.DWORD),
+        ("dwLocalPort", ctypes.wintypes.DWORD),
+        ("dwRemoteAddr", ctypes.wintypes.DWORD),
+        ("dwRemotePort", ctypes.wintypes.DWORD),
+        ("dwOwningPid", ctypes.wintypes.DWORD),
+    ]
+
+
+def _tcp_listener_pids_windows(port: int) -> set[int] | None:
+    """Return kernel owning PIDs listening on 127.0.0.1:<port> or 0.0.0.0:<port> (Windows)."""
+    if os.name != "nt" or type(port) is not int or not (1 <= port <= 65535):
+        return None
+    try:
+        iphlpapi = ctypes.WinDLL("iphlpapi", use_last_error=True)
+        size = ctypes.wintypes.DWORD(0)
+        # AF_INET = 2, TCP_TABLE_OWNER_PID_LISTENER = 3
+        res = iphlpapi.GetExtendedTcpTable(None, ctypes.byref(size), False, 2, 3, 0)
+        if res not in (0, 122) or size.value == 0:
+            return None
+        buf = ctypes.create_string_buffer(size.value)
+        res = iphlpapi.GetExtendedTcpTable(buf, ctypes.byref(size), False, 2, 3, 0)
+        if res != 0:
+            return None
+        count = struct.unpack_from("<I", buf, 0)[0]
+        pids: set[int] = set()
+        offset = 4
+        row_size = ctypes.sizeof(_MibTcpRowOwnerPid)
+        for _ in range(count):
+            if offset + row_size > len(buf):
+                break
+            row = _MibTcpRowOwnerPid.from_buffer(buf, offset)
+            offset += row_size
+            local_port = socket.ntohs(row.dwLocalPort & 0xFFFF)
+            # 127.0.0.1 is 0x0100007F (little-endian DWORD), 0.0.0.0 is 0x00000000
+            if local_port == port and row.dwLocalAddr in (0x0100007F, 0x00000000):
+                pids.add(int(row.dwOwningPid))
+        return pids
+    except Exception:
+        return None
+
+
+def _assert_windows_files_unlocked(paths: Iterable[Path], *, timeout: float = 2.0) -> None:
+    """Non-mutating check that target files have zero open sharing handles on Windows."""
+    if os.name != "nt":
+        return
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [
+        ctypes.wintypes.LPCWSTR,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.wintypes.DWORD,
+        ctypes.wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    kernel.CreateFileW.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    generic_rw = 0x80000000 | 0x40000000
+    open_existing = 3
+
+    targets = [Path(p) for p in paths]
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    delay = 0.05
+    while True:
+        locked_target: tuple[Path, int] | None = None
+        for target in targets:
+            if not target.exists():
+                continue
+            handle = kernel.CreateFileW(str(target), generic_rw, 0, None, open_existing, 0, None)
+            if handle == invalid_handle or not handle:
+                err = ctypes.get_last_error()
+                if err in (2, 3):  # File disappeared before probe
+                    continue
+                locked_target = (target, int(err))
+                break
+            kernel.CloseHandle(handle)
+        if locked_target is None:
+            return
+        if time.monotonic() >= deadline:
+            path_obj, winerr = locked_target
+            raise CanaryError(
+                "SQLITE_TARGET_LOCKED",
+                f"Target SQLite file is locked by an active handle (WinError {winerr}): {path_obj.name}",
+                file=path_obj.name,
+                winerror=winerr,
+            )
+        time.sleep(min(delay, max(0.01, deadline - time.monotonic())))
+        delay = min(delay * 2.0, 0.2)
+
+
 def _is_loopback_port_free(port: int) -> bool:
+    listener_pids = _tcp_listener_pids_windows(port)
+    if listener_pids:
+        return False
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
@@ -500,6 +599,7 @@ CREATE TABLE IF NOT EXISTS canary_leases (
     pid INTEGER NOT NULL,
     create_time_filetime INTEGER NOT NULL,
     executable_path TEXT NOT NULL,
+    executable_sha256 TEXT,
     entrypoint_path TEXT NOT NULL,
     port INTEGER NOT NULL,
     release_id TEXT NOT NULL,
@@ -525,18 +625,28 @@ CREATE TABLE IF NOT EXISTS canary_receipt_chain (
 class CanaryReceiptStore:
     """Durable SQLite WAL receipt journal preserved across rollbacks."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, readonly: bool = False, timeout: float = 10.0):
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        assert_no_reparse(self.path.parent)
-        self._init_schema()
+        self.readonly = bool(readonly)
+        self.timeout = max(0.05, float(timeout))
+        if not self.readonly:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            assert_no_reparse(self.path.parent)
+            self._init_schema()
+
+    @staticmethod
+    def _wrap_sqlite_locked(exc: sqlite3.OperationalError) -> CanaryError:
+        msg = str(exc).lower()
+        if "locked" in msg or "busy" in msg:
+            return CanaryError("SQLITE_RECEIPT_LOCKED", f"Receipts SQLite database is locked: {exc}")
+        return CanaryError("SQLITE_RECEIPT_ERROR", f"Receipts SQLite error: {exc}")
 
     def _connect(self, *, readonly: bool = False) -> sqlite3.Connection:
-        if readonly:
-            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+        if readonly or self.readonly:
+            conn = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=self.timeout)
             conn.row_factory = sqlite3.Row
             return conn
-        conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=10)
+        conn = sqlite3.connect(str(self.path), isolation_level=None, timeout=self.timeout)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=FULL")
@@ -544,10 +654,16 @@ class CanaryReceiptStore:
         return conn
 
     def _init_schema(self) -> None:
-        with closing(self._connect()) as conn:
-            conn.executescript(_RECEIPTS_SCHEMA)
-            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES('schema', ?)", (SCHEMA_RECEIPTS,))
-            conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES('version', '1')")
+        try:
+            with closing(self._connect()) as conn:
+                conn.executescript(_RECEIPTS_SCHEMA)
+                lease_cols = {row[1] for row in conn.execute("PRAGMA table_info(canary_leases)").fetchall()}
+                if "executable_sha256" not in lease_cols:
+                    conn.execute("ALTER TABLE canary_leases ADD COLUMN executable_sha256 TEXT")
+                conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES('schema', ?)", (SCHEMA_RECEIPTS,))
+                conn.execute("INSERT OR IGNORE INTO schema_meta(key, value) VALUES('version', '1')")
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
 
     def begin_run(
         self,
@@ -565,135 +681,148 @@ class CanaryReceiptStore:
         digest_input = {"action": action, "mode": mode, "payload": request_payload or {}}
         req_digest = sha256_bytes(_canonical_json(digest_input).encode("utf-8")) if req_key else None
         now = time.time()
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                if req_key is not None:
-                    row = conn.execute("SELECT * FROM canary_runs WHERE request_key=?", (req_key,)).fetchone()
-                    if row is not None:
-                        if row["action"] != action or row["mode"] != mode or row["request_digest"] != req_digest:
-                            conn.execute("ROLLBACK")
-                            raise CanaryError(
-                                "REQUEST_KEY_CONFLICT",
-                                "request_key was already used with a different action or request payload",
-                                request_key=req_key,
-                                existing_run_id=row["run_id"],
-                                existing_action=row["action"],
-                            )
-                        if row["status"] == "started":
-                            conn.execute("ROLLBACK")
-                            raise CanaryError(
-                                "REQUEST_OUTCOME_UNKNOWN",
-                                "A prior run with this request_key started and never recorded a terminal receipt; inspect real state before deciding",
-                                request_key=req_key,
-                                existing_run_id=row["run_id"],
-                                existing_action=row["action"],
-                            )
-                        summary = json.loads(row["summary_json"]) if row["summary_json"] else {}
-                        conn.execute("COMMIT")
-                        return row["run_id"], {
-                            "run_id": row["run_id"],
-                            "request_key": req_key,
-                            "action": row["action"],
-                            "status": row["status"],
-                            "error_code": row["error_code"],
-                            "summary": summary,
-                            "deduplicated": True,
-                        }
-                run_id = "crun-" + uuid.uuid4().hex
-                conn.execute(
-                    "INSERT INTO canary_runs(run_id, request_key, request_digest, action, mode, status, "
-                    "c1_zip_sha256, c1_commit, c2_commit, c2_manifest_sha256, started_at) "
-                    "VALUES(?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)",
-                    (run_id, req_key, req_digest, action, mode, c1_zip_sha256, c1_commit, c2_commit, c2_manifest_sha256, now),
-                )
-                conn.execute("COMMIT")
-                return run_id, None
-            except BaseException:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    if req_key is not None:
+                        row = conn.execute("SELECT * FROM canary_runs WHERE request_key=?", (req_key,)).fetchone()
+                        if row is not None:
+                            if row["action"] != action or row["mode"] != mode or row["request_digest"] != req_digest:
+                                conn.execute("ROLLBACK")
+                                raise CanaryError(
+                                    "REQUEST_KEY_CONFLICT",
+                                    "request_key was already used with a different action or request payload",
+                                    request_key=req_key,
+                                    existing_run_id=row["run_id"],
+                                    existing_action=row["action"],
+                                )
+                            if row["status"] == "started":
+                                conn.execute("ROLLBACK")
+                                raise CanaryError(
+                                    "REQUEST_OUTCOME_UNKNOWN",
+                                    "A prior run with this request_key started and never recorded a terminal receipt; inspect real state before deciding",
+                                    request_key=req_key,
+                                    existing_run_id=row["run_id"],
+                                    existing_action=row["action"],
+                                )
+                            summary = json.loads(row["summary_json"]) if row["summary_json"] else {}
+                            conn.execute("COMMIT")
+                            return row["run_id"], {
+                                "run_id": row["run_id"],
+                                "request_key": req_key,
+                                "action": row["action"],
+                                "status": row["status"],
+                                "error_code": row["error_code"],
+                                "summary": summary,
+                                "deduplicated": True,
+                            }
+                    run_id = "crun-" + uuid.uuid4().hex
+                    conn.execute(
+                        "INSERT INTO canary_runs(run_id, request_key, request_digest, action, mode, status, "
+                        "c1_zip_sha256, c1_commit, c2_commit, c2_manifest_sha256, started_at) "
+                        "VALUES(?, ?, ?, ?, ?, 'started', ?, ?, ?, ?, ?)",
+                        (run_id, req_key, req_digest, action, mode, c1_zip_sha256, c1_commit, c2_commit, c2_manifest_sha256, now),
+                    )
+                    conn.execute("COMMIT")
+                    return run_id, None
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
 
     def record_step(self, run_id: str, component: str, step_name: str, status: str, detail: dict[str, Any] | None = None) -> None:
         now = time.time()
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM canary_steps WHERE run_id=?", (run_id,)).fetchone()[0]
-                conn.execute(
-                    "INSERT INTO canary_steps(step_id, run_id, seq, component, step_name, status, at, detail_json) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                    ("cstep-" + uuid.uuid4().hex, run_id, seq, component, step_name, status, now, _canonical_json(detail or {})),
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    seq = conn.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM canary_steps WHERE run_id=?", (run_id,)).fetchone()[0]
+                    conn.execute(
+                        "INSERT INTO canary_steps(step_id, run_id, seq, component, step_name, status, at, detail_json) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        ("cstep-" + uuid.uuid4().hex, run_id, seq, component, step_name, status, now, _canonical_json(detail or {})),
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
 
     def record_backup(self, run_id: str, component: str, db_name: str, backup_info: dict[str, Any]) -> str:
         backup_id = "cbkp-" + uuid.uuid4().hex
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute(
-                    "INSERT INTO canary_backups(backup_id, run_id, component, db_name, source_sha256, "
-                    "backup_path, backup_sha256, integrity_ok, row_counts_json, created_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        backup_id,
-                        run_id,
-                        component,
-                        db_name,
-                        str(backup_info["source_sha256"]),
-                        str(backup_info["backup_path"]),
-                        str(backup_info["backup_sha256"]),
-                        1 if backup_info.get("integrity_ok") else 0,
-                        _canonical_json(backup_info.get("row_counts") or {}),
-                        time.time(),
-                    ),
-                )
-                conn.execute("COMMIT")
-            except BaseException:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    conn.execute(
+                        "INSERT INTO canary_backups(backup_id, run_id, component, db_name, source_sha256, "
+                        "backup_path, backup_sha256, integrity_ok, row_counts_json, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            backup_id,
+                            run_id,
+                            component,
+                            db_name,
+                            str(backup_info["source_sha256"]),
+                            str(backup_info["backup_path"]),
+                            str(backup_info["backup_sha256"]),
+                            1 if backup_info.get("integrity_ok") else 0,
+                            _canonical_json(backup_info.get("row_counts") or {}),
+                            time.time(),
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
         return backup_id
 
     def record_lease(self, run_id: str | None, lease: dict[str, Any], state: str) -> None:
         now = time.time()
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = conn.execute("SELECT lease_id FROM canary_leases WHERE lease_id=?", (lease["lease_id"],)).fetchone()
-                if existing is None:
-                    conn.execute(
-                        "INSERT INTO canary_leases(lease_id, run_id, owner_scope_id, role, pid, "
-                        "create_time_filetime, executable_path, entrypoint_path, port, release_id, "
-                        "state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            lease["lease_id"],
-                            run_id,
-                            lease["owner_scope_id"],
-                            lease["role"],
-                            int(lease["pid"]),
-                            int(lease["create_time_filetime"]),
-                            str(lease["executable_path"]),
-                            str(lease["entrypoint_path"]),
-                            int(lease["port"]),
-                            str(lease["release_id"]),
-                            state,
-                            float(lease.get("issued_at") or now),
-                            now,
-                        ),
-                    )
-                else:
-                    conn.execute("UPDATE canary_leases SET state=?, updated_at=? WHERE lease_id=?", (state, now, lease["lease_id"]))
-                conn.execute("COMMIT")
-            except BaseException:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    existing = conn.execute("SELECT lease_id FROM canary_leases WHERE lease_id=?", (lease["lease_id"],)).fetchone()
+                    if existing is None:
+                        conn.execute(
+                            "INSERT INTO canary_leases(lease_id, run_id, owner_scope_id, role, pid, "
+                            "create_time_filetime, executable_path, executable_sha256, entrypoint_path, port, release_id, "
+                            "state, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                lease["lease_id"],
+                                run_id,
+                                lease["owner_scope_id"],
+                                lease["role"],
+                                int(lease["pid"]),
+                                int(lease["create_time_filetime"]),
+                                str(lease["executable_path"]),
+                                str(lease.get("executable_sha256") or ""),
+                                str(lease["entrypoint_path"]),
+                                int(lease["port"]),
+                                str(lease["release_id"]),
+                                state,
+                                float(lease.get("issued_at") or now),
+                                now,
+                            ),
+                        )
+                    else:
+                        conn.execute("UPDATE canary_leases SET state=?, updated_at=? WHERE lease_id=?", (state, now, lease["lease_id"]))
+                    conn.execute("COMMIT")
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
 
     def finish_run(
         self,
@@ -706,71 +835,77 @@ class CanaryReceiptStore:
         now = time.time()
         summary_data = summary or {}
         summary_json = _canonical_json(summary_data)
-        with closing(self._connect()) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                row = conn.execute("SELECT action, mode FROM canary_runs WHERE run_id=?", (run_id,)).fetchone()
-                if row is None:
-                    raise CanaryError("RECEIPT_RUN_NOT_FOUND", "Unknown canary run_id", run_id=run_id)
-                conn.execute(
-                    "UPDATE canary_runs SET status=?, finished_at=?, error_code=?, summary_json=? WHERE run_id=?",
-                    (status, now, error_code, summary_json, run_id),
-                )
-                prev = conn.execute("SELECT receipt_hash FROM canary_receipt_chain ORDER BY seq DESC LIMIT 1").fetchone()
-                prev_hash = prev["receipt_hash"] if prev is not None else ("0" * 64)
-                receipt_id = "crcpt-" + uuid.uuid4().hex
-                payload = {
-                    "receipt_id": receipt_id,
-                    "run_id": run_id,
-                    "action": row["action"],
-                    "mode": row["mode"],
-                    "status": status,
-                    "error_code": error_code,
-                    "summary": summary_data,
-                    "created_at": now,
-                }
-                payload_json = _canonical_json(payload)
-                receipt_hash = sha256_bytes((prev_hash + "|" + payload_json).encode("utf-8"))
-                conn.execute(
-                    "INSERT INTO canary_receipt_chain(receipt_id, run_id, action, status, payload_json, prev_hash, receipt_hash, created_at) "
-                    "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
-                    (receipt_id, run_id, row["action"], status, payload_json, prev_hash, receipt_hash, now),
-                )
-                conn.execute("COMMIT")
-                return {
-                    "receipt_id": receipt_id,
-                    "run_id": run_id,
-                    "receipt_hash": receipt_hash,
-                    "prev_hash": prev_hash,
-                    "status": status,
-                }
-            except BaseException:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise
+        try:
+            with closing(self._connect()) as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute("SELECT action, mode FROM canary_runs WHERE run_id=?", (run_id,)).fetchone()
+                    if row is None:
+                        raise CanaryError("RECEIPT_RUN_NOT_FOUND", "Unknown canary run_id", run_id=run_id)
+                    conn.execute(
+                        "UPDATE canary_runs SET status=?, finished_at=?, error_code=?, summary_json=? WHERE run_id=?",
+                        (status, now, error_code, summary_json, run_id),
+                    )
+                    prev = conn.execute("SELECT receipt_hash FROM canary_receipt_chain ORDER BY seq DESC LIMIT 1").fetchone()
+                    prev_hash = prev["receipt_hash"] if prev is not None else ("0" * 64)
+                    receipt_id = "crcpt-" + uuid.uuid4().hex
+                    payload = {
+                        "receipt_id": receipt_id,
+                        "run_id": run_id,
+                        "action": row["action"],
+                        "mode": row["mode"],
+                        "status": status,
+                        "error_code": error_code,
+                        "summary": summary_data,
+                        "created_at": now,
+                    }
+                    payload_json = _canonical_json(payload)
+                    receipt_hash = sha256_bytes((prev_hash + "|" + payload_json).encode("utf-8"))
+                    conn.execute(
+                        "INSERT INTO canary_receipt_chain(receipt_id, run_id, action, status, payload_json, prev_hash, receipt_hash, created_at) "
+                        "VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+                        (receipt_id, run_id, row["action"], status, payload_json, prev_hash, receipt_hash, now),
+                    )
+                    conn.execute("COMMIT")
+                    return {
+                        "receipt_id": receipt_id,
+                        "run_id": run_id,
+                        "receipt_hash": receipt_hash,
+                        "prev_hash": prev_hash,
+                        "status": status,
+                    }
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
 
     def verify_receipt_chain(self) -> dict[str, Any]:
         if not self.path.is_file():
             raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Receipts database file is missing")
-        with closing(self._connect(readonly=True)) as conn:
-            integrity = conn.execute("PRAGMA integrity_check").fetchall()
-            if [tuple(r) for r in integrity] != [("ok",)]:
-                raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "SQLite PRAGMA integrity_check failed")
-            rows = conn.execute("SELECT * FROM canary_receipt_chain ORDER BY seq ASC").fetchall()
-            prev = "0" * 64
-            for row in rows:
-                if row["prev_hash"] != prev:
-                    raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Broken prev_hash link", seq=row["seq"])
-                payload_obj = json.loads(row["payload_json"])
-                if payload_obj.get("status") != row["status"] or payload_obj.get("action") != row["action"] or payload_obj.get("run_id") != row["run_id"]:
-                    raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Row column mismatch against chained payload", seq=row["seq"])
-                expected = sha256_bytes((prev + "|" + row["payload_json"]).encode("utf-8"))
-                if not hmac.compare_digest(expected, row["receipt_hash"]):
-                    raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Receipt SHA-256 hash mismatch", seq=row["seq"])
-                prev = row["receipt_hash"]
-            runs_count = conn.execute("SELECT COUNT(*) FROM canary_runs").fetchone()[0]
-            backups_count = conn.execute("SELECT COUNT(*) FROM canary_backups").fetchone()[0]
-            leases_count = conn.execute("SELECT COUNT(*) FROM canary_leases").fetchone()[0]
+        try:
+            with closing(self._connect(readonly=True)) as conn:
+                integrity = conn.execute("PRAGMA integrity_check").fetchall()
+                if [tuple(r) for r in integrity] != [("ok",)]:
+                    raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "SQLite PRAGMA integrity_check failed")
+                rows = conn.execute("SELECT * FROM canary_receipt_chain ORDER BY seq ASC").fetchall()
+                prev = "0" * 64
+                for row in rows:
+                    if row["prev_hash"] != prev:
+                        raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Broken prev_hash link", seq=row["seq"])
+                    payload_obj = json.loads(row["payload_json"])
+                    if payload_obj.get("status") != row["status"] or payload_obj.get("action") != row["action"] or payload_obj.get("run_id") != row["run_id"]:
+                        raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Row column mismatch against chained payload", seq=row["seq"])
+                    expected = sha256_bytes((prev + "|" + row["payload_json"]).encode("utf-8"))
+                    if not hmac.compare_digest(expected, row["receipt_hash"]):
+                        raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Receipt SHA-256 hash mismatch", seq=row["seq"])
+                    prev = row["receipt_hash"]
+                runs_count = conn.execute("SELECT COUNT(*) FROM canary_runs").fetchone()[0]
+                backups_count = conn.execute("SELECT COUNT(*) FROM canary_backups").fetchone()[0]
+                leases_count = conn.execute("SELECT COUNT(*) FROM canary_leases").fetchone()[0]
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
         return {
             "ok": True,
             "schema": SCHEMA_RECEIPTS,
@@ -784,12 +919,17 @@ class CanaryReceiptStore:
 
     def list_receipts(self, limit: int = 50) -> list[dict[str, Any]]:
         limit = max(1, min(int(limit), 500))
-        with closing(self._connect(readonly=True)) as conn:
-            rows = conn.execute(
-                "SELECT seq, receipt_id, run_id, action, status, prev_hash, receipt_hash, created_at "
-                "FROM canary_receipt_chain ORDER BY seq DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
+        if not self.path.is_file():
+            raise CanaryError("RECEIPT_CHAIN_CORRUPTED", "Receipts database file is missing")
+        try:
+            with closing(self._connect(readonly=True)) as conn:
+                rows = conn.execute(
+                    "SELECT seq, receipt_id, run_id, action, status, prev_hash, receipt_hash, created_at "
+                    "FROM canary_receipt_chain ORDER BY seq DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            raise self._wrap_sqlite_locked(exc) from exc
         return [dict(row) for row in reversed(rows)]
 
 
@@ -797,11 +937,90 @@ class CanaryReceiptStore:
 # SQLite Online Backup API & read-only active session/job inspection
 # ---------------------------------------------------------------------------
 
+class _SqliteBackupDeadlineExceeded(RuntimeError):
+    def __init__(self, last_status: int):
+        super().__init__(f"SQLite online backup deadline exceeded (last_status={last_status})")
+        self.last_status = int(last_status)
+
+
+def _sqlite_preflight_readable(src_conn: sqlite3.Connection, *, deadline: float, step_ms: int) -> None:
+    """Fail closed before creating any temp backup file if source DB is exclusively locked."""
+    src_conn.execute(f"PRAGMA busy_timeout={int(step_ms)}")
+    while True:
+        try:
+            src_conn.execute("SELECT COUNT(*) FROM sqlite_master").fetchone()
+            return
+        except sqlite3.OperationalError as exc:
+            msg = str(exc).lower()
+            if "locked" in msg or "busy" in msg:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise CanaryError(
+                        "SQLITE_BACKUP_LOCKED",
+                        "Source SQLite database is exclusively locked (preflight read timed out)",
+                    ) from exc
+                time.sleep(min(0.05, remaining))
+                continue
+            raise
+
+
+def _bounded_sqlite_backup(
+    src_conn: sqlite3.Connection,
+    dst_conn: sqlite3.Connection,
+    *,
+    pages: int = 128,
+    deadline: float,
+    sleep: float = 0.05,
+) -> None:
+    """Run sqlite3.Connection.backup with a hard wall-clock deadline (never hangs on SQLITE_BUSY)."""
+    remaining_init = max(0.05, deadline - time.monotonic())
+    step_ms = max(25, min(200, int(remaining_init * 1000)))
+    src_conn.execute(f"PRAGMA busy_timeout={step_ms}")
+    dst_conn.execute(f"PRAGMA busy_timeout={step_ms}")
+
+    def _progress(status: int, _remaining: int, _total: int) -> None:
+        # SQLITE_DONE == 101; SQLITE_BUSY == 5; SQLITE_LOCKED == 6.
+        if status != 101 and time.monotonic() >= deadline:
+            raise _SqliteBackupDeadlineExceeded(status)
+
+    try:
+        src_conn.backup(
+            dst_conn,
+            pages=max(1, int(pages)),
+            progress=_progress,
+            sleep=min(0.05, max(0.01, float(sleep))),
+        )
+    except _SqliteBackupDeadlineExceeded as exc:
+        if exc.last_status in (5, 6):
+            raise CanaryError(
+                "SQLITE_BACKUP_LOCKED",
+                f"SQLite online backup aborted: source/destination remained locked past deadline (sqlite_rc={exc.last_status})",
+                sqlite_rc=exc.last_status,
+            ) from exc
+        raise CanaryError(
+            "SQLITE_BACKUP_TIMEOUT",
+            f"SQLite online backup exceeded bounded wall-clock deadline (sqlite_rc={exc.last_status})",
+            sqlite_rc=exc.last_status,
+        ) from exc
+
+
+def _cleanup_sqlite_temp_files(tmp_path: Path) -> None:
+    for suffix in ("", "-wal", "-shm", "-journal"):
+        candidate = Path(str(tmp_path) + suffix)
+        if candidate.exists():
+            try:
+                _retry_windows_fs_op(lambda c=candidate: c.unlink(missing_ok=True), timeout=1.0)
+            except OSError:
+                pass
+
+
 def sqlite_online_backup(
     src_db: Path,
     dst_db: Path,
     *,
     expected_tables: Iterable[str] = (),
+    timeout: float = 10.0,
+    pages: int = 128,
 ) -> dict[str, Any]:
     """Snapshot a live SQLite DB strictly via SQLite Online Backup API (read-only source)."""
     src_db = Path(src_db)
@@ -809,14 +1028,20 @@ def sqlite_online_backup(
     assert_no_reparse(src_db, must_file=True)
     assert_no_reparse(dst_db.parent)
     dst_db.parent.mkdir(parents=True, exist_ok=True)
+    db_timeout = max(0.05, float(timeout))
+    deadline = time.monotonic() + db_timeout
+    step_ms = max(25, min(200, int(db_timeout * 1000)))
 
     source_sha = sha256_file(src_db)
     tmp_dst = dst_db.with_name(f".{dst_db.name}.{uuid.uuid4().hex}.bkp.tmp")
     src_uri = src_db.resolve().as_uri() + "?mode=ro"
     try:
-        with closing(sqlite3.connect(src_uri, uri=True, timeout=10)) as src_conn:
-            with closing(sqlite3.connect(str(tmp_dst), timeout=10)) as dst_conn:
-                src_conn.backup(dst_conn, pages=128)
+        with closing(sqlite3.connect(src_uri, uri=True, timeout=min(db_timeout, 0.25))) as src_conn:
+            # Preflight read check BEFORE creating tmp_dst so an exclusively locked DB
+            # fails fast and never creates a 0-byte .bkp.tmp file.
+            _sqlite_preflight_readable(src_conn, deadline=deadline, step_ms=step_ms)
+            with closing(sqlite3.connect(str(tmp_dst), timeout=min(db_timeout, 0.25))) as dst_conn:
+                _bounded_sqlite_backup(src_conn, dst_conn, pages=pages, deadline=deadline)
                 dst_conn.execute("PRAGMA journal_mode=DELETE")
                 dst_conn.commit()
                 integrity = [tuple(r) for r in dst_conn.execute("PRAGMA integrity_check").fetchall()]
@@ -840,11 +1065,17 @@ def sqlite_online_backup(
             os.fsync(stream.fileno())
         _retry_windows_fs_op(lambda: os.replace(tmp_dst, dst_db))
     except CanaryError:
-        tmp_dst.unlink(missing_ok=True)
+        _cleanup_sqlite_temp_files(tmp_dst)
         raise
     except (sqlite3.Error, OSError) as exc:
-        tmp_dst.unlink(missing_ok=True)
+        _cleanup_sqlite_temp_files(tmp_dst)
+        msg = str(exc).lower()
+        if isinstance(exc, sqlite3.OperationalError) and ("locked" in msg or "busy" in msg):
+            raise CanaryError("SQLITE_BACKUP_LOCKED", f"SQLite backup failed: database locked ({type(exc).__name__})") from exc
         raise CanaryError("SQLITE_BACKUP_INTEGRITY_FAILED", f"SQLite backup failed: {type(exc).__name__}") from exc
+    except BaseException:
+        _cleanup_sqlite_temp_files(tmp_dst)
+        raise
 
     backup_sha = sha256_file(dst_db)
     return {
@@ -858,13 +1089,22 @@ def sqlite_online_backup(
     }
 
 
-def sqlite_restore_from_backup(backup_db: Path, expected_sha256: str, target_db: Path) -> dict[str, Any]:
+def sqlite_restore_from_backup(
+    backup_db: Path,
+    expected_sha256: str,
+    target_db: Path,
+    *,
+    timeout: float = 10.0,
+) -> dict[str, Any]:
     """Restore a SQLite DB from a SHA-256-pinned backup via SQLite Online Backup API."""
     pinned = validate_sha256(expected_sha256, "backup_sha256")
     backup_db = Path(backup_db)
     target_db = Path(target_db)
     assert_no_reparse(backup_db, must_file=True)
     assert_no_reparse(target_db.parent)
+    db_timeout = max(0.05, float(timeout))
+    deadline = time.monotonic() + db_timeout
+    step_ms = max(25, min(200, int(db_timeout * 1000)))
     actual_sha = sha256_file(backup_db)
     if not hmac.compare_digest(actual_sha, pinned):
         raise CanaryError(
@@ -877,12 +1117,13 @@ def sqlite_restore_from_backup(backup_db: Path, expected_sha256: str, target_db:
     tmp_target = target_db.with_name(f".{target_db.name}.{uuid.uuid4().hex}.restore.tmp")
     src_uri = backup_db.resolve().as_uri() + "?mode=ro"
     try:
-        with closing(sqlite3.connect(src_uri, uri=True, timeout=10)) as src_conn:
+        with closing(sqlite3.connect(src_uri, uri=True, timeout=min(db_timeout, 0.25))) as src_conn:
+            _sqlite_preflight_readable(src_conn, deadline=deadline, step_ms=step_ms)
             src_check = [tuple(r) for r in src_conn.execute("PRAGMA integrity_check").fetchall()]
             if src_check != [("ok",)]:
                 raise CanaryError("SQLITE_BACKUP_INTEGRITY_FAILED", "Backup file failed PRAGMA integrity_check")
-            with closing(sqlite3.connect(str(tmp_target), timeout=10)) as dst_conn:
-                src_conn.backup(dst_conn, pages=128)
+            with closing(sqlite3.connect(str(tmp_target), timeout=min(db_timeout, 0.25))) as dst_conn:
+                _bounded_sqlite_backup(src_conn, dst_conn, pages=128, deadline=deadline)
                 dst_conn.execute("PRAGMA journal_mode=DELETE")
                 dst_conn.commit()
                 dst_check = [tuple(r) for r in dst_conn.execute("PRAGMA integrity_check").fetchall()]
@@ -891,18 +1132,28 @@ def sqlite_restore_from_backup(backup_db: Path, expected_sha256: str, target_db:
         with tmp_target.open("r+b") as stream:
             stream.flush()
             os.fsync(stream.fileno())
-        # Remove stale WAL/SHM sidecars only after verified idle state (caller guarantees idle).
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(str(target_db) + suffix)
+        # Verify target DB and WAL/SHM sidecars have zero open handles BEFORE removing
+        # any sidecars so a locked live DB NEVER loses uncommitted WAL frames!
+        wal_path = Path(str(target_db) + "-wal")
+        shm_path = Path(str(target_db) + "-shm")
+        _assert_windows_files_unlocked((target_db, wal_path, shm_path), timeout=min(db_timeout, 2.0))
+        # Remove stale WAL/SHM sidecars only after verified unlocked/idle state.
+        for sidecar in (wal_path, shm_path):
             if sidecar.exists():
-                _retry_windows_fs_op(sidecar.unlink)
-        _retry_windows_fs_op(lambda: os.replace(tmp_target, target_db))
+                _retry_windows_fs_op(sidecar.unlink, timeout=min(db_timeout, 2.0))
+        _retry_windows_fs_op(lambda: os.replace(tmp_target, target_db), timeout=min(db_timeout, 2.0))
     except CanaryError:
-        tmp_target.unlink(missing_ok=True)
+        _cleanup_sqlite_temp_files(tmp_target)
         raise
     except (sqlite3.Error, OSError) as exc:
-        tmp_target.unlink(missing_ok=True)
+        _cleanup_sqlite_temp_files(tmp_target)
+        msg = str(exc).lower()
+        if isinstance(exc, sqlite3.OperationalError) and ("locked" in msg or "busy" in msg):
+            raise CanaryError("SQLITE_BACKUP_LOCKED", f"SQLite restore failed: database locked ({type(exc).__name__})") from exc
         raise CanaryError("SQLITE_BACKUP_INTEGRITY_FAILED", f"SQLite restore failed: {type(exc).__name__}") from exc
+    except BaseException:
+        _cleanup_sqlite_temp_files(tmp_target)
+        raise
 
     return {
         "restored": True,
@@ -1300,6 +1551,7 @@ def write_process_lease(
     pid: int,
     create_time_filetime: int,
     executable_path: str,
+    executable_sha256: str | None = None,
     entrypoint_path: str,
     port: int,
     release_id: str,
@@ -1311,6 +1563,16 @@ def write_process_lease(
     owner = ensure_shadow_owner(root, create=False)
     if owner["owner_scope_id"] != owner_scope_id:
         raise CanaryError("PROCESS_LEASE_OWNER_MISMATCH", "owner_scope_id does not match shadow root owner")
+    exe_abs = Path(os.path.abspath(executable_path))
+    if executable_sha256 is not None:
+        exe_sha = validate_sha256(executable_sha256, "executable_sha256")
+    else:
+        try:
+            if not exe_abs.is_file():
+                raise CanaryError("PROCESS_LEASE_INVALID", "Executable path for lease does not exist", role=role)
+            exe_sha = sha256_file(exe_abs)
+        except OSError as exc:
+            raise CanaryError("PROCESS_LEASE_INVALID", f"Could not hash executable for lease: {type(exc).__name__}", role=role) from exc
     ep = Path(os.path.abspath(entrypoint_path))
     assert_no_reparse(ep)
     if not (_norm_path(ep).startswith(_norm_path(root) + "/") or _norm_path(ep.resolve()).startswith(_norm_path(root.resolve()) + "/")):
@@ -1322,7 +1584,8 @@ def write_process_lease(
         "role": role,
         "pid": int(pid),
         "create_time_filetime": int(create_time_filetime),
-        "executable_path": os.path.abspath(executable_path),
+        "executable_path": str(exe_abs),
+        "executable_sha256": exe_sha,
         "entrypoint_path": str(ep.resolve()) if ep.exists() else str(ep),
         "expected_root": str(root.resolve()),
         "port": int(port),
@@ -1337,7 +1600,10 @@ def write_process_lease(
 
 
 def _cmdline_contains_path(cmdline: str, target_path: str) -> bool:
-    norm_cmd = cmdline.replace('"', "").replace("\\", "/").casefold()
+    """Verify target_path appears as a complete path argument in cmdline (no prefix collisions)."""
+    if not isinstance(cmdline, str) or not cmdline.strip():
+        return False
+    cmd_norm = cmdline.replace("\\", "/").casefold()
     candidates = {_norm_path(target_path)}
     p = Path(target_path)
     try:
@@ -1345,7 +1611,60 @@ def _cmdline_contains_path(cmdline: str, target_path: str) -> bool:
             candidates.add(_norm_path(p.resolve()))
     except OSError:
         pass
-    return any(cand in norm_cmd for cand in candidates)
+    for cand in candidates:
+        if not cand:
+            continue
+        pattern = r'(?:^|[\s"\'=])' + re.escape(cand) + r'(?:$|[\s"\'])'
+        if re.search(pattern, cmd_norm):
+            return True
+    return False
+
+
+def _hash_live_executable_or_raise(exe_path: str, *, role: str, pid: int) -> str:
+    try:
+        p = Path(exe_path)
+        if not p.is_file():
+            raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Live executable path does not exist", role=role, pid=pid)
+        return sha256_file(p)
+    except CanaryError:
+        raise
+    except OSError as exc:
+        raise CanaryError(
+            "PROCESS_IDENTITY_MISMATCH",
+            f"Could not hash live executable image: {type(exc).__name__}",
+            role=role,
+            pid=pid,
+        ) from exc
+
+
+def _verify_handle_cmdline_fail_closed(
+    kernel: Any,
+    handle: int,
+    *,
+    pid: int,
+    expected_ct: int,
+    entry_expected: str,
+    role: str,
+) -> None:
+    """Fail-closed cmdline verification bound to an already-open kernel handle."""
+    handle_cmd = _query_handle_cmdline(handle)
+    if not isinstance(handle_cmd, str) or not handle_cmd.strip():
+        handle_cmd = _query_process_cmdline_cim(pid)
+        recheck = _query_handle_identity(kernel, handle)
+        if recheck is None or recheck[0] != expected_ct:
+            raise CanaryError(
+                "PROCESS_IDENTITY_MISMATCH",
+                "Handle identity changed during command-line fallback verification",
+                role=role,
+                pid=pid,
+            )
+    if not isinstance(handle_cmd, str) or not handle_cmd.strip() or not _cmdline_contains_path(handle_cmd, entry_expected):
+        raise CanaryError(
+            "PROCESS_IDENTITY_MISMATCH",
+            "Handle command line missing or does not match leased shadow entrypoint",
+            role=role,
+            pid=pid,
+        )
 
 
 def verify_process_lease(
@@ -1355,7 +1674,7 @@ def verify_process_lease(
     require_alive: bool = False,
     check_cmdline: bool = False,
 ) -> dict[str, Any]:
-    """Verify 4-factor process identity: PID + creation FILETIME + exe/entrypoint path + owner lease."""
+    """Verify 4-factor process identity: PID + creation FILETIME + exe path/SHA-256 & entrypoint + owner lease."""
     root = validate_shadow_root(shadow_root)
     owner = ensure_shadow_owner(root, create=False)
     path = _lease_path(root, role)
@@ -1369,6 +1688,7 @@ def verify_process_lease(
     pid = lease.get("pid")
     create_time = lease.get("create_time_filetime")
     exe_expected = lease.get("executable_path")
+    exe_sha_raw = lease.get("executable_sha256")
     entry_expected = lease.get("entrypoint_path")
     if (
         type(pid) is not int
@@ -1377,10 +1697,14 @@ def verify_process_lease(
         or create_time <= 0
         or not isinstance(exe_expected, str)
         or not exe_expected
+        or not isinstance(exe_sha_raw, str)
+        or not HEX64_RE.fullmatch(exe_sha_raw.strip().lower())
+        or exe_sha_raw != exe_sha_raw.strip()
         or not isinstance(entry_expected, str)
         or not entry_expected
     ):
-        raise CanaryError("PROCESS_LEASE_INVALID", "Malformed fields in process lease", role=role)
+        raise CanaryError("PROCESS_LEASE_INVALID", "Malformed or incomplete 4-factor fields in process lease", role=role)
+    exe_sha_expected = exe_sha_raw.lower()
     # Entrypoint MUST reside strictly within shadow_root.
     ep_norm = _norm_path(entry_expected)
     root_norms = {_norm_path(root), _norm_path(root.resolve())}
@@ -1407,6 +1731,15 @@ def verify_process_lease(
         raise CanaryError(
             "PROCESS_IDENTITY_MISMATCH",
             "Process executable image path does not match lease",
+            role=role,
+            pid=pid,
+        )
+
+    live_exe_sha = _hash_live_executable_or_raise(live["executable_path"], role=role, pid=pid)
+    if not hmac.compare_digest(live_exe_sha, exe_sha_expected):
+        raise CanaryError(
+            "PROCESS_IDENTITY_MISMATCH",
+            "Process executable SHA-256 hash does not match lease",
             role=role,
             pid=pid,
         )
@@ -1438,6 +1771,7 @@ def verify_process_lease(
         "pid": pid,
         "create_time_filetime": create_time,
         "executable_path": live["executable_path"],
+        "executable_sha256": live_exe_sha,
         "entrypoint_path": entry_expected,
         "lease": lease,
     }
@@ -1489,6 +1823,7 @@ def stop_leased_process(
     pid = int(lease["pid"])
     expected_ct = int(lease["create_time_filetime"])
     expected_exe = _norm_path(lease["executable_path"])
+    expected_exe_sha = str(lease["executable_sha256"]).lower()
     entry_expected = str(lease["entrypoint_path"])
     leased_port = int(lease["port"])
 
@@ -1499,6 +1834,9 @@ def stop_leased_process(
             # Open ONE handle with PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE before signaling.
             handle = kernel.OpenProcess(0x1000 | 0x100000, False, pid)
             if not handle:
+                still = query_process_identity_exact(pid)
+                if still is not None and still["create_time_filetime"] == expected_ct:
+                    raise CanaryError("IDLE_STOP_FAILED", f"Cannot open query/sync handle for live {role}", role=role, pid=pid)
                 if receipt_store is not None:
                     receipt_store.record_lease(run_id, lease, "exited_or_reused_no_kill")
                 return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid, "reason": "PROCESS_EXITED"}
@@ -1517,9 +1855,17 @@ def stop_leased_process(
                     return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PID_REUSED_OR_EXITED_NO_KILL"}
                 if _norm_path(actual_exe) != expected_exe:
                     raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable path mismatch before graceful stop", role=role, pid=pid)
-                handle_cmd = _query_handle_cmdline(handle)
-                if isinstance(handle_cmd, str) and handle_cmd and not _cmdline_contains_path(handle_cmd, entry_expected):
-                    raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle command line mismatch before graceful stop", role=role, pid=pid)
+                actual_exe_sha = _hash_live_executable_or_raise(actual_exe, role=role, pid=pid)
+                if not hmac.compare_digest(actual_exe_sha, expected_exe_sha):
+                    raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable SHA-256 mismatch before graceful stop", role=role, pid=pid)
+                _verify_handle_cmdline_fail_closed(
+                    kernel,
+                    handle,
+                    pid=pid,
+                    expected_ct=expected_ct,
+                    entry_expected=entry_expected,
+                    role=role,
+                )
                 if kernel.WaitForSingleObject(handle, 0) == 0:
                     if receipt_store is not None:
                         receipt_store.record_lease(run_id, lease, "stopped_idle")
@@ -1567,7 +1913,7 @@ def stop_leased_process(
         return {"stopped": True, "terminated": False, "graceful": True, "role": role, "pid": pid}
 
     # Step 2: Re-verify active sessions immediately before exact-handle stop, then
-    # verify PID + FILETIME + executable image + command line on ONE Windows kernel handle!
+    # verify PID + FILETIME + executable image + SHA-256 + command line on ONE Windows kernel handle!
     idle_recheck = idle_checker()
     if not isinstance(idle_recheck, dict) or idle_recheck.get("idle_verified") is not True:
         code = str((idle_recheck or {}).get("reason") or "ACTIVE_SESSIONS_PRESENT")
@@ -1580,6 +1926,9 @@ def stop_leased_process(
     # Open ONE handle with PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE
     handle = kernel.OpenProcess(0x0001 | 0x1000 | 0x100000, False, pid)
     if not handle:
+        still = query_process_identity_exact(pid)
+        if still is not None and still["create_time_filetime"] == expected_ct:
+            raise CanaryError("IDLE_STOP_FAILED", f"Cannot open terminate handle for live leased {role}", role=role, pid=pid)
         if receipt_store is not None:
             receipt_store.record_lease(run_id, lease, "exited_or_reused_no_kill")
         return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PROCESS_EXITED"}
@@ -1597,9 +1946,17 @@ def stop_leased_process(
             return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PID_REUSED_OR_EXITED_NO_KILL"}
         if _norm_path(actual_exe) != expected_exe:
             raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable path mismatch before stop", role=role, pid=pid)
-        handle_cmd = _query_handle_cmdline(handle)
-        if isinstance(handle_cmd, str) and handle_cmd and not _cmdline_contains_path(handle_cmd, entry_expected):
-            raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle command line mismatch before stop", role=role, pid=pid)
+        actual_exe_sha = _hash_live_executable_or_raise(actual_exe, role=role, pid=pid)
+        if not hmac.compare_digest(actual_exe_sha, expected_exe_sha):
+            raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable SHA-256 mismatch before stop", role=role, pid=pid)
+        _verify_handle_cmdline_fail_closed(
+            kernel,
+            handle,
+            pid=pid,
+            expected_ct=expected_ct,
+            entry_expected=entry_expected,
+            role=role,
+        )
         wait_state = kernel.WaitForSingleObject(handle, 0)
         if wait_state == 0:
             if receipt_store is not None:
@@ -1747,13 +2104,34 @@ def stage_c1_shadow(
     owner = ensure_shadow_owner(root, create=True)
     store = receipt_store or CanaryReceiptStore(root / "state" / "canary_receipts.sqlite3")
 
-    # Refuse staging over active running shadow C1 sessions!
+    # Refuse staging over active running shadow C1 sessions or running C1 shadow services!
     hub_idle = inspect_c1_hub_active_sessions(root / "state" / "c1" / "hub", require_rpc_if_running=True)
     if not hub_idle["idle_verified"]:
         raise CanaryError(str(hub_idle.get("reason") or "ACTIVE_SESSIONS_PRESENT"), "Cannot stage C1 while shadow Hub has active sessions")
+    rpc_idle = inspect_c1_rpc_active_sessions(root, require_rpc_if_running=True)
+    if not rpc_idle["idle_verified"]:
+        raise CanaryError(str(rpc_idle.get("reason") or "ACTIVE_SESSIONS_PRESENT"), "Cannot stage C1 while shadow RPC has active grants or unknown state")
+    for c1_role in ("c1_rpc", "c1_hub"):
+        if _lease_path(root, c1_role).is_file():
+            lv = verify_process_lease(root, c1_role, require_alive=False, check_cmdline=True)
+            if lv["alive"]:
+                raise CanaryError(
+                    "SHADOW_SERVICE_RUNNING",
+                    f"Stop shadow {c1_role} (pid={lv['pid']}) before re-staging C1",
+                    role=c1_role,
+                    pid=lv["pid"],
+                )
 
     # Backup existing shadow C1 SQLite DBs via SQLite Online Backup API before changing active pointer.
     pre_backups = _backup_existing_c1_state(root, run_id, store) if run_id else []
+    if not run_id:
+        hub_dir = root / "state" / "c1" / "hub"
+        bkp_tag = "ad-hoc-" + uuid.uuid4().hex[:12]
+        for db_name in ("hub.db", "entry-grants.sqlite3"):
+            src = hub_dir / db_name
+            if src.is_file():
+                dst = root / "backups" / bkp_tag / f"c1_{db_name}"
+                pre_backups.append({"db_name": db_name, **sqlite_online_backup(src, dst)})
 
     release_id = f"{source_commit[:12]}-{actual_sha[:12]}"
     releases_root = root / "releases" / "c1"
@@ -2424,8 +2802,17 @@ def start_shadow_services(
                 continue
             try:
                 _stop_single_role(root, role, store=store, run_id=run_id)
-            except Exception:
-                pass
+            except Exception as cleanup_exc:
+                try:
+                    store.record_step(
+                        run_id,
+                        "cleanup",
+                        f"partial_cleanup_{role}",
+                        "failed",
+                        {"error_type": type(cleanup_exc).__name__, "error": str(cleanup_exc)[:240]},
+                    )
+                except Exception:
+                    pass
 
     try:
         c1_active_path = root / "state" / "c1" / "active.json"
@@ -2616,8 +3003,10 @@ def start_shadow_services(
                             log_tail=_read_log_tail(logs_dir / "c2_gateway.log"),
                         )
                     probe_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
-                    code, _ = _http_get_json(gw_port, "/health", timeout=probe_timeout)
-                    if code == 200 and proc.poll() is None:
+                    code, body = _http_get_json(gw_port, "/health", timeout=probe_timeout)
+                    gw_pids = _tcp_listener_pids_windows(gw_port)
+                    owner_ok = (gw_pids is None) or (proc.pid in gw_pids)
+                    if code == 200 and _c2_gateway_health_payload_ok(body, gw_port) and owner_ok and proc.poll() is None:
                         break
                     time.sleep(0.15)
                 else:
@@ -2681,8 +3070,10 @@ def start_shadow_services(
                             log_tail=_read_log_tail(logs_dir / "c2_unified.log"),
                         )
                     probe_timeout = min(5.0, max(1.0, deadline - time.monotonic()))
-                    code, _ = _http_get_json(uni_port, "/health", timeout=probe_timeout)
-                    if code == 200 and proc.poll() is None:
+                    code, body = _http_get_json(uni_port, "/health", timeout=probe_timeout)
+                    uni_pids = _tcp_listener_pids_windows(uni_port)
+                    owner_ok = (uni_pids is None) or (proc.pid in uni_pids)
+                    if code == 200 and _c2_unified_health_payload_ok(body, uni_port, gw_port) and owner_ok and proc.poll() is None:
                         break
                     time.sleep(0.15)
                 else:
@@ -2723,6 +3114,49 @@ def start_shadow_services(
         _cleanup_partial_starts()
         store.finish_run(run_id, "failed", error_code=type(exc).__name__)
         raise
+
+
+def _verify_shadow_listener_pid(role: str, port: int, expected_pid: int) -> bool:
+    """Confirm the Windows kernel TCP listener on shadow port belongs to the exact leased PID."""
+    pids = _tcp_listener_pids_windows(port)
+    if pids is None:
+        return False
+    if expected_pid not in pids:
+        raise CanaryError(
+            "HEALTH_IDENTITY_MISMATCH",
+            f"TCP listener on shadow port {port} is not owned by leased {role} pid={expected_pid}",
+            role=role,
+            port=port,
+            expected_pid=expected_pid,
+            observed_listener_pids=sorted(pids),
+        )
+    return True
+
+
+def _c2_gateway_health_payload_ok(body: Any, gw_port: int) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if not (body.get("ok") is True or body.get("status") == "ok"):
+        return False
+    if body.get("port") is not None and body.get("port") != gw_port:
+        return False
+    if body.get("service") is not None and "gateway" not in str(body.get("service")).casefold():
+        return False
+    return True
+
+
+def _c2_unified_health_payload_ok(body: Any, uni_port: int, gw_port: int) -> bool:
+    if not isinstance(body, dict):
+        return False
+    if not (body.get("ok") is True or body.get("status") == "ok"):
+        return False
+    if body.get("gateway_port") != gw_port:
+        return False
+    if body.get("port") is not None and body.get("port") != uni_port:
+        return False
+    if body.get("service") is not None and "unified" not in str(body.get("service")).casefold():
+        return False
+    return True
 
 
 def _probe_hub_entry_v1(hub_state_dir: Path, hub_port: int, release_dir: Path) -> dict[str, Any]:
@@ -2832,6 +3266,7 @@ def verify_shadow_health(
                 lease_v = verify_process_lease(root, "c1_hub", require_alive=True, check_cmdline=True)
                 hub_state = root / "state" / "c1" / "hub"
                 hub_port = int(c1_cfg["hub_port"])
+                hub_listener_ok = _verify_shadow_listener_pid("c1_hub", hub_port, lease_v["pid"])
                 passes = 0
                 last_status: dict[str, Any] = {}
                 for _ in range(consecutive_passes):
@@ -2849,7 +3284,9 @@ def verify_shadow_health(
                     "required_passes": consecutive_passes,
                     "pid": lease_v["pid"],
                     "create_time_filetime": lease_v["create_time_filetime"],
+                    "executable_sha256": lease_v.get("executable_sha256"),
                     "identity_verified": True,
+                    "listener_pid_verified": hub_listener_ok,
                     "active_sessions": len(last_status.get("sessions") or []),
                     "entry_v1_authenticated_ok": entry_probe["ok"],
                     "entry_probe": entry_probe,
@@ -2859,6 +3296,7 @@ def verify_shadow_health(
             if check_c1_rpc:
                 lease_v = verify_process_lease(root, "c1_rpc", require_alive=True, check_cmdline=True)
                 rpc_port = int(c1_cfg["rpc_port"])
+                rpc_listener_ok = _verify_shadow_listener_pid("c1_rpc", rpc_port, lease_v["pid"])
                 secret = (root / "state" / "c1" / "runtime" / "bridge-v3" / "secret").read_text(encoding="ascii").strip()
                 expected_agent_sha = sha256_file(_c1_bridge_dir(rel_dir) / "ff_win_v3_agent.py")
                 passes = 0
@@ -2879,7 +3317,9 @@ def verify_shadow_health(
                     "required_passes": consecutive_passes,
                     "pid": lease_v["pid"],
                     "create_time_filetime": lease_v["create_time_filetime"],
+                    "executable_sha256": lease_v.get("executable_sha256"),
                     "identity_verified": True,
+                    "listener_pid_verified": rpc_listener_ok,
                     "expected_agent_sha256": expected_agent_sha,
                 }
                 store.record_step(run_id, "health", "c1_rpc", "succeeded" if checks["c1_rpc"]["ok"] else "failed", checks["c1_rpc"])
@@ -2900,11 +3340,13 @@ def verify_shadow_health(
             if check_c2_gateway:
                 lease_v = verify_process_lease(root, "c2_gateway", require_alive=True, check_cmdline=True)
                 gw_port = int(c2_cfg["gateway_port"])
+                gw_listener_ok = _verify_shadow_listener_pid("c2_gateway", gw_port, lease_v["pid"])
                 passes = 0
                 last_body: dict[str, Any] | None = None
                 for _ in range(consecutive_passes):
                     code, body = _http_get_json(gw_port, "/health", timeout=15.0)
-                    if code == 200 and isinstance(body, dict) and (body.get("ok") is True or body.get("status") == "ok"):
+                    if code == 200 and _c2_gateway_health_payload_ok(body, gw_port):
+                        _verify_shadow_listener_pid("c2_gateway", gw_port, lease_v["pid"])
                         passes += 1
                         last_body = body
                     else:
@@ -2917,7 +3359,9 @@ def verify_shadow_health(
                     "required_passes": consecutive_passes,
                     "pid": lease_v["pid"],
                     "create_time_filetime": lease_v["create_time_filetime"],
+                    "executable_sha256": lease_v.get("executable_sha256"),
                     "identity_verified": True,
+                    "listener_pid_verified": gw_listener_ok,
                     "port": gw_port,
                     "active_jobs": c2_db_status["active_jobs"],
                     "health_payload": last_body,
@@ -2928,12 +3372,15 @@ def verify_shadow_health(
                 lease_v = verify_process_lease(root, "c2_unified", require_alive=True, check_cmdline=True)
                 uni_port = int(c2_cfg["unified_port"])
                 gw_port = int(c2_cfg["gateway_port"])
+                uni_listener_ok = _verify_shadow_listener_pid("c2_unified", uni_port, lease_v["pid"])
                 shadow_key_file = c2_slot / "gateway.key"
                 auth_headers: dict[str, str] = {}
                 if shadow_key_file.is_file():
                     shadow_key = shadow_key_file.read_text(encoding="ascii").strip()
                     if shadow_key:
                         auth_headers["Authorization"] = "Bearer " + shadow_key
+                if not auth_headers:
+                    raise CanaryError("HEALTH_CONTRACT_FAILED", "Shadow C2 gateway.key missing for authenticated /ready probe")
                 passes = 0
                 observed_gw_port: int | None = None
                 ready_http = 0
@@ -2965,7 +3412,8 @@ def verify_shadow_health(
                         omni_up = (r_code == 200)
                     gateway_upstream_ok = gw_up
                     upstream_omniroute_ok = omni_up
-                    if code == 200 and observed_gw_port == gw_port and r_code in (200, 503) and gw_up:
+                    if code == 200 and _c2_unified_health_payload_ok(body, uni_port, gw_port) and r_code in (200, 503) and gw_up:
+                        _verify_shadow_listener_pid("c2_unified", uni_port, lease_v["pid"])
                         passes += 1
                     else:
                         break
@@ -2979,7 +3427,9 @@ def verify_shadow_health(
                     "required_passes": consecutive_passes,
                     "pid": lease_v["pid"],
                     "create_time_filetime": lease_v["create_time_filetime"],
+                    "executable_sha256": lease_v.get("executable_sha256"),
                     "identity_verified": True,
+                    "listener_pid_verified": uni_listener_ok,
                     "port": uni_port,
                     "gateway_port": observed_gw_port,
                     "ready_authenticated": bool(auth_headers),
@@ -3064,6 +3514,14 @@ def stop_shadow_services(
                 str(hub_idle.get("reason") or "ACTIVE_SESSIONS_PRESENT"),
                 "Refusing to stop shadow C1 while active sessions exist",
                 idle_check=hub_idle,
+            )
+    if "c1_rpc" in active_roles:
+        rpc_idle = inspect_c1_rpc_active_sessions(root, require_rpc_if_running=True)
+        if not rpc_idle["idle_verified"]:
+            raise CanaryError(
+                str(rpc_idle.get("reason") or "ACTIVE_SESSIONS_PRESENT"),
+                "Refusing to stop shadow C1 RPC while active desktop grants or unknown state exist",
+                idle_check=rpc_idle,
             )
     if any(r in active_roles for r in ("c2_gateway", "c2_unified")):
         c2_idle = inspect_c2_gateway_active_jobs(c2_db)
@@ -3243,6 +3701,7 @@ def rollback_canary(
         }
 
     # Validate pinned baseline ZIP / DB backup SHA-256 upfront BEFORE stopping anything!
+    pinned_base: str | None = None
     if c1_baseline_zip is not None:
         pinned_base = validate_sha256(c1_baseline_zip_sha256, "c1_baseline_zip_sha256")
         assert_no_reparse(Path(c1_baseline_zip), must_file=True)
@@ -3316,6 +3775,14 @@ def rollback_canary(
             if not target_dir.is_dir():
                 raise CanaryError("TARGET_RELEASE_NOT_FOUND", f"C1 target release missing: {target_c1}")
             target_mf = _verify_c1_release_dir_hashes(target_dir)
+            if pinned_base is not None and not hmac.compare_digest(str(target_mf.get("c1_zip_sha256") or "").lower(), pinned_base):
+                raise CanaryError(
+                    "PINNED_SHA256_MISMATCH",
+                    "Target C1 rollback release does not match pinned c1_baseline_zip_sha256",
+                    expected=pinned_base,
+                    actual=target_mf.get("c1_zip_sha256"),
+                    target_release_id=target_c1,
+                )
             new_c1_active = {
                 **c1_active,
                 "release_id": target_c1,
@@ -3430,7 +3897,7 @@ def prepare_cutover_readiness(shadow_root: Path, output_path: Path) -> dict[str,
     """Emit a verifiable readiness manifest from verified shadow state & receipt chain."""
     root = validate_shadow_root(shadow_root)
     ensure_shadow_owner(root, create=False)
-    store = CanaryReceiptStore(root / "state" / "canary_receipts.sqlite3")
+    store = CanaryReceiptStore(root / "state" / "canary_receipts.sqlite3", readonly=True)
     chain = store.verify_receipt_chain()
     c1_active = _read_json(root / "state" / "c1" / "active.json")
     c2_active = _read_json(root / "state" / "c2" / "active.json") if (root / "state" / "c2" / "active.json").is_file() else None
@@ -3700,7 +4167,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "verify-receipts":
             root = validate_shadow_root(args.shadow_root)
             ensure_shadow_owner(root, create=False)
-            store = CanaryReceiptStore(root / "state" / "canary_receipts.sqlite3")
+            store = CanaryReceiptStore(root / "state" / "canary_receipts.sqlite3", readonly=True)
             chain = store.verify_receipt_chain()
             result = {**chain, "recent_receipts": store.list_receipts(limit=args.limit)}
         elif args.command == "prepare-readiness":

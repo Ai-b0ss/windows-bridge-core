@@ -43,6 +43,8 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$env:PYTHONUTF8 = '1'
+$env:PYTHONIOENCODING = 'utf-8'
 try {
     $utf8NoBom = [Text.UTF8Encoding]::new($false)
     $OutputEncoding = $utf8NoBom
@@ -188,6 +190,7 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $healthCode = 0
 $stopCode = 0
+$healthObj = $null
 try {
     $healthArgs = @('health', '--shadow-root', $ShadowRoot, '--consecutive-passes', ([string]$HealthConsecutivePasses))
     if ($StartC1Rpc) { $healthArgs += '--c1-rpc' }
@@ -195,24 +198,25 @@ try {
     if ($RequireUpstreamOmniroute) { $healthArgs += '--require-upstream-omniroute' }
     $healthOut = & python -X utf8 $workflowPy @healthArgs
     $healthCode = $LASTEXITCODE
-    $healthObj = $null
     if ($healthOut) {
-        try { $healthObj = ($healthOut | ConvertFrom-Json) } catch { $healthObj = [ordered]@{ ok = $false; raw_output = [string]$healthOut } }
+        try { $healthObj = (($healthOut -join "`n") | ConvertFrom-Json) } catch { $healthObj = [ordered]@{ ok = $false; raw_output = ($healthOut -join "`n") } }
     }
-    Write-Output ([ordered]@{
-        ok = ($healthCode -eq 0)
-        mode = 'SHADOW_FULL'
-        stage = ($stageOut | ConvertFrom-Json)
-        start = ($startOut | ConvertFrom-Json)
-        health = $healthObj
-        live_production_mutated = $false
-    } | ConvertTo-Json -Depth 10)
 } finally {
     if ($StopAfterVerify) {
         & python -X utf8 $workflowPy stop-shadow --shadow-root $ShadowRoot | Out-Null
         $stopCode = $LASTEXITCODE
     }
 }
+$overallOk = ($healthCode -eq 0) -and (-not $StopAfterVerify -or $stopCode -eq 0)
+Write-Output ([ordered]@{
+    ok = $overallOk
+    mode = 'SHADOW_FULL'
+    stage = (($stageOut -join "`n") | ConvertFrom-Json)
+    start = (($startOut -join "`n") | ConvertFrom-Json)
+    health = $healthObj
+    stop_after_verify_exit_code = if ($StopAfterVerify) { $stopCode } else { $null }
+    live_production_mutated = $false
+} | ConvertTo-Json -Depth 10)
 if ($healthCode -ne 0) { exit $healthCode }
 if ($StopAfterVerify -and $stopCode -ne 0) { exit $stopCode }
 exit 0
