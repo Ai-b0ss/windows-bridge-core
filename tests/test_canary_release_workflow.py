@@ -853,6 +853,38 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
         self.assertEqual(staged["verified_files"], 3)
         self.assertFalse((shadow / "releases" / "c2" / staged["release_id"] / "gateway.db").exists())
 
+        # Older C2 baseline (server.py + unified_api.py without newer helper modules) stages cleanly,
+        # while a bundle missing server.py or unified_api.py fails closed with C2_REQUIRED_FILE_MISSING.
+        legacy_zip = self.base / "c2-legacy.zip"
+        with zipfile.ZipFile(legacy_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("server.py", b"LEGACY_SERVER = 1\n")
+            zf.writestr("unified_api.py", b"LEGACY_UNIFIED = 1\n")
+        legacy_sha = _sha256_bytes(legacy_zip.read_bytes())
+        legacy_staged = canary.stage_c2_shadow(
+            shadow,
+            c2_zip=legacy_zip,
+            c2_zip_sha256=legacy_sha,
+            c2_commit="d" * 40,
+            gateway_port=49587,
+            unified_port=49588,
+        )
+        self.assertTrue(legacy_staged["ok"])
+        self.assertEqual(legacy_staged["verified_files"], 2)
+
+        incomplete_zip = self.base / "c2-incomplete.zip"
+        with zipfile.ZipFile(incomplete_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("server.py", b"ONLY_SERVER = 1\n")
+        with self.assertRaises(canary.CanaryError) as ctx:
+            canary.stage_c2_shadow(
+                shadow,
+                c2_zip=incomplete_zip,
+                c2_zip_sha256=_sha256_bytes(incomplete_zip.read_bytes()),
+                c2_commit="e" * 40,
+                gateway_port=49587,
+                unified_port=49588,
+            )
+        self.assertEqual(ctx.exception.code, "C2_REQUIRED_FILE_MISSING")
+
         # Rollback with wrong baseline ZIP SHA-256 or wrong DB backup SHA-256 fails closed!
         with self.assertRaises(canary.CanaryError) as ctx:
             canary.rollback_canary(

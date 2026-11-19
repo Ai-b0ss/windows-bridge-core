@@ -71,7 +71,7 @@ DEFAULT_SHADOW_PORTS = {
 }
 DEFAULT_C2_OMNI_PORT = 20128
 
-C2_REQUIRED_FILES = ("server.py", "unified_api.py", "idempotency_utils.py")
+C2_REQUIRED_FILES = ("server.py", "unified_api.py")
 C2_ACTIVE_JOB_STATES = ("queued", "running", "submitted", "needs_attention")
 C2_ACTIVE_TURN_STATES = ("queued", "running", "in_progress", "pending", "submitted")
 C2_PRESERVED_RUNTIME_FILES = frozenset({
