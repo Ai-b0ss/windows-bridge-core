@@ -15,6 +15,19 @@ class TestWindowsBridgeSkillSource(unittest.TestCase):
                        "independently verify", "clean"):
             self.assertIn(phrase.lower(),text.lower())
 
+    def test_live_route_profile_name_is_not_hardcoded(self):
+        skill=SKILL.read_text(encoding="utf-8")
+        api=(SKILL.parent/"references"/"API.md").read_text(encoding="utf-8")
+        self.assertIn("Critical profile identity",skill)
+        self.assertIn("Default",skill)
+        self.assertIn("Profile 1",skill)
+        self.assertIn("route_plan",skill)
+        self.assertIn("profile_dir_name",skill)
+        self.assertIn("STANDING_GRANT",skill)
+        self.assertIn("legacy",skill.lower())
+        self.assertIn("Default",api)
+        self.assertIn("different Chrome directories",api)
+
     def test_reference_bundle_and_no_embedded_machine_identifier(self):
         root=SKILL.parent
         for name in ("API.md","PERMISSIONS.md","APP_ROUTES.md","TROUBLESHOOTING.md"):

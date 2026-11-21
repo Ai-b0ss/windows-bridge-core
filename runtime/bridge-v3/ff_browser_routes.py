@@ -1187,7 +1187,7 @@ def route_plan(
     pw_probe = probe_playwright(hub=hub) if surface == "browser" else {"ok": False, "probe_ms": 0, "reason": "APP_SURFACE"}
     chrome_res = apps.resolve("chrome") if surface == "browser" else {"found": False}
 
-    # Probe primary P0 owner Chrome Profile 1 hidden secondary route only when authorized/requested.
+    # Probe primary P0 owner Chrome configured-profile hidden secondary route only when authorized/requested.
     if surface != "browser":
         owner_hidden_probe: dict[str, Any] = {"ok": False, "reason": "APP_SURFACE", "probe_ms": 0}
         owner_hidden_state = "UNAVAILABLE"
@@ -1202,7 +1202,7 @@ def route_plan(
     elif not owner_hidden_allowed:
         owner_hidden_probe = {
             "ok": False,
-            "reason": "owner Chrome Profile 1 hidden secondary route requires explicit owner-authorized selection",
+            "reason": "owner Chrome configured-profile hidden secondary route requires explicit owner-authorized selection",
             "error_code": "OWNER_CHROME_NOT_AUTHORIZED",
             "probe_ms": 0,
         }
@@ -1309,7 +1309,7 @@ def route_plan(
             "satisfies_owner_profile_auth": False,
             "reason": (
                 f"optional isolated headless Playwright persistent context ({pw_probe.get('playwright_version')}); "
-                "does NOT inherit owner Chrome Profile 1 auth"
+                "does NOT inherit owner Chrome configured-profile auth"
                 if pw_usable else str(pw_probe.get("reason") or "Playwright managed adapter unavailable")
             ),
             "playwright_version": pw_probe.get("playwright_version"),
@@ -1322,10 +1322,10 @@ def route_plan(
             "mode": "optional_isolated_mode",
             "satisfies_owner_profile_auth": False,
             "reason": (
-                "optional isolated Chrome on private Win32 desktop; does NOT inherit owner Chrome Profile 1 auth"
+                "optional isolated Chrome on private Win32 desktop; does NOT inherit owner Chrome configured-profile auth"
                 if cdp_usable else "private Chrome executable unavailable or scope missing"
             ),
-            "authorization": "optional isolated private desktop profile; no owner Chrome Profile 1 access",
+            "authorization": "optional isolated private desktop profile; no owner Chrome configured-profile access",
             "probe_ms": 0,
         },
         {

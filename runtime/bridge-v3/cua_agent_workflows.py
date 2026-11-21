@@ -27,6 +27,11 @@ def agent_workflows() -> dict:
             "session_bootstrap": {"op": "session_open", "args": {"agent_id": "<stable-agent-id>", "task_id": "<stable-task-id>"}},
             "session_required_for_work": True,
             "session_secret_must_remain_private": True,
+            "profile_selection_rule": (
+                "The route ID owner_chrome_profile1_hidden_secondary is a legacy name, NOT a Chrome profile directory. "
+                "Use live Hub route_plan.profile_dir_name and select the already-running owner Chrome profile. "
+                "Default and Profile 1 are distinct on-disk profile directories; never assume they are equivalent."
+            ),
             "request_key_required_for_mutations": True,
             "resume_requires_saved_token": True,
             "foreground_input_available": False,
@@ -34,11 +39,11 @@ def agent_workflows() -> dict:
             "instruction": (
                 "When enabled, route ALL browser and hidden-desktop work through the shared Hub or /agent/v1 Agent Entry. "
                 "Primary owner-auth browser route is owner_chrome_profile1_hidden_secondary (Hub op owner_chrome_hidden: windowless "
-                "hidden target inside already-running owner Chrome Profile 1 via Chrome >=158 loopback CDP Target.createTarget({hidden:true}); "
+                "hidden target inside already-running owner Chrome selected active profile via Chrome >=158 loopback CDP Target.createTarget({hidden:true}); "
                 "inherits owner auth with zero cookie copying and zero visible HWNDs/taskbar/tab-strip side effects; fails closed if CDP or "
-                "Profile 1 defaultBrowserContextId is unavailable). NEVER silently substitute an isolated profile, visible/minimized secondary "
+                "selected-profile defaultBrowserContextId is unavailable). NEVER silently substitute an isolated profile, visible/minimized secondary "
                 "window, 2nd Chrome process on owner User Data, or direct visible Playwright. Optional isolated persistent profile "
-                "(managed_browser / private_browser) is an explicit separate mode only (does not provide owner Profile 1 auth)."
+                "(managed_browser / private_browser) is an explicit separate mode only (does not provide owner-profile auth)."
             ),
         },
         "browser_workflow": {
@@ -47,12 +52,14 @@ def agent_workflows() -> dict:
                 "route": "owner_chrome_profile1_hidden_secondary",
                 "hub_op": "owner_chrome_hidden",
                 "transport": "chrome_158_loopback_cdp_hidden_target",
-                "owner_profile": "already_running_chrome_profile_1",
+                "owner_profile": "selected_active_profile_from_live_route_plan",
+                "profile_dir_name_source": "Hub route_plan primary owner_chrome_profile1_hidden_secondary.profile_dir_name",
+                "profile_dir_name_examples": ["Default", "Profile 1"],
                 "auth_inheritance": True,
                 "profile_copy_forbidden": True,
                 "second_chrome_process_same_profile_forbidden": True,
                 "zero_visible_side_effects": True,
-                "requires_profile1_default_browser_context": True,
+                "requires_selected_profile_default_browser_context": True,
                 "screenshot_supported": False,
                 "fail_closed_if_unavailable": True,
                 "silent_fallback_to_isolated_forbidden": True,

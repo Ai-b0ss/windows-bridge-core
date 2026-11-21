@@ -79,6 +79,17 @@ class TestAgentWorkflowManifest(unittest.TestCase):
             data["route_preference"].index("shared_hub_isolated_hidden_browser"),
         )
 
+    def test_profile_resolves_from_live_route_plan_not_legacy_route_name(self):
+        data=agent_workflows()
+        hub=data["shared_hub"]
+        primary=data["browser_workflow"]["primary_owner_auth_route"]
+        self.assertIn("profile_dir_name",hub["profile_selection_rule"])
+        self.assertIn("distinct",hub["profile_selection_rule"])
+        self.assertEqual(primary["owner_profile"],"selected_active_profile_from_live_route_plan")
+        self.assertTrue(primary["requires_selected_profile_default_browser_context"])
+        self.assertEqual(primary["profile_dir_name_examples"],["Default","Profile 1"])
+        self.assertNotIn("requires_profile1_default_browser_context",primary)
+
     def test_advertised_preflight_is_not_assumed_to_be_live_supported(self):
         data=agent_workflows()
         self.assertIs(data["preflight_actual_rpc_support_verified"], False)

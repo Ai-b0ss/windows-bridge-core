@@ -41,7 +41,7 @@ TOOL = {
     "name": "hub",
     "description": (
         "Shared FF Hub: call capabilities or route_plan first, then session_open with a unique task_id. "
-        "Primary owner-auth browser route is owner_chrome_hidden (owner_chrome_profile1_hidden_secondary: windowless hidden target inside already-running owner Chrome Profile 1 via loopback CDP; inherits auth with zero cookie copying and zero visible side effects; fail-closed if CDP or Profile 1 default context is unavailable — NEVER silently substitute an isolated profile). "
+        "Primary owner-auth browser route is owner_chrome_hidden (owner_chrome_profile1_hidden_secondary: windowless hidden target inside already-running owner Chrome selected active profile via loopback CDP; inherits auth with zero cookie copying and zero visible side effects; fail-closed if CDP or selected-profile default context is unavailable — NEVER silently substitute an isolated profile). "
         "For a no-interruption read-only site read using only already authorized and connected supported providers, use site_read (or route_plan capability='background_tab_read' with url and visibility='background_tab'|'strict_invisible'): distinguishes ordinary non-activating background tabs from strict invisibility (never substitutes a visible tab when strict invisibility is requested), reports one actionable capability result before any UI or pending request when no provider is eligible, and closes owned tabs deterministically. FF Browser Companion 0.1.1 only supports downloads and Native Messaging (never a browser page reader). "
         "For supported background form operations on already authorized owned tabs without foreground interaction or policy changes, plan with route_plan capability='background_tab_form' and drive owned tabs through owner_chrome_hidden or browser (open, observe/snapshot, act: fill|click|select|check|uncheck|press, wait_for, reload, read, close) with a stable request_key for every mutation to prevent duplicate submission. "
         "Optional isolated mode (no owner auth): managed_browser or private_browser. "
@@ -385,7 +385,7 @@ class Adapter:
                         "legacy_unkeyed_operations": ["session_close", "resource_release"],
                     },
                     "quickstart": [
-                        "hub {op:'route_plan', args:{surface:'browser', capability:'owner_profile_hidden'}} -> primary owner Chrome Profile 1 hidden secondary target (owner_chrome_hidden; fail-closed if CDP/Profile 1 unavailable; never silently substitutes isolated profile)",
+                        "hub {op:'route_plan', args:{surface:'browser', capability:'owner_profile_hidden'}} -> primary owner Chrome selected active profile hidden secondary target (owner_chrome_hidden; fail-closed if CDP/selected-profile unavailable; never silently substitutes isolated profile)",
                         "optional isolated mode (no owner auth): managed_browser / private_browser; explicit visible-tab extension mode: browser",
                         "hub {op:'session_open', task_id:'unique-task', args:{}}",
                         "keep task_id on every task call; agent identity and credentials are fixed by this adapter",

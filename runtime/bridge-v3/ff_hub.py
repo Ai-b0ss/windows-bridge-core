@@ -749,7 +749,7 @@ class Hub:
             self.store.update_resource_meta(resource["resource_id"], {**resource["meta"], "url": url})
         return result
 
-    # ---- owner Chrome Profile 1 hidden secondary target (browser-level loopback CDP) -----
+    # ---- owner Chrome selected-profile hidden secondary target (browser-level loopback CDP) -----
     def _call_owner_chrome_secondary(self, op: str, args: dict | None = None, *, timeout: float = 30.0) -> dict:
         try:
             return self.owner_chrome_secondary.call(op, args or {}, timeout=timeout)
@@ -2091,12 +2091,12 @@ class Hub:
                 "isolated_substitution_forbidden": True,
                 "silent_playwright_fallback": False,
             },
-            "purpose": "shared infrastructure for every agent on this PC: sessions, ownership, owner Chrome Profile 1 hidden secondary targets, "
+            "purpose": "shared infrastructure for every agent on this PC: sessions, ownership, owner Chrome selected-profile hidden secondary targets, "
                        "optional isolated hidden browsers, explicit visible-tab owner Chrome extension, private desktops for GUI apps, permissions, brokered secrets, recovery",
             "quickstart": [
                 "session_open {agent_id, task_id} -> keep session_id, session_secret, resume_token",
                 "send session_id and session_secret with every other call; any call is a heartbeat",
-                "route_plan {surface:'browser', capability:'owner_profile_hidden'} -> primary owner Chrome Profile 1 hidden secondary target (owner_chrome_hidden, fail-closed if CDP/Profile 1 default context unavailable; NEVER silently substitutes isolated profile)",
+                "route_plan {surface:'browser', capability:'owner_profile_hidden'} -> primary owner Chrome selected-profile hidden secondary target (owner_chrome_hidden, fail-closed if CDP/selected-profile default context unavailable; NEVER silently substitutes isolated profile)",
                 "optional isolated mode (no owner auth): managed_browser or private_browser; explicit visible-tab extension mode: browser",
                 "app_discover {app} -> routes; app_open {app} -> app_id; app_observe / app_act; app_close",
                 "give every mutating call a stable request_key; after a lost reply ask request_status, never repeat blindly",
