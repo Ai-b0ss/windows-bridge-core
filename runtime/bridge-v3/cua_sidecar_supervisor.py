@@ -144,6 +144,7 @@ class JsonLineSidecarSupervisor:
         env: Mapping[str, str] | None = None,
         timeout_seconds: float = 3.0,
         startup_grace_seconds: float = 0.05,
+        shutdown_grace_seconds: float = 2.5,
         max_line_chars: int = 2_000_000,
         multiplex: bool = False,
     ):
@@ -159,6 +160,7 @@ class JsonLineSidecarSupervisor:
         self.env = dict(env) if env is not None else None
         self.timeout_seconds = float(timeout_seconds)
         self.startup_grace_seconds = max(0.0, float(startup_grace_seconds))
+        self.shutdown_grace_seconds = min(max(0.0, float(shutdown_grace_seconds)), 10.0)
         self.max_line_chars = int(max_line_chars)
         self.multiplex = bool(multiplex)
         self.process: subprocess.Popen[str] | None = None
@@ -214,7 +216,7 @@ class JsonLineSidecarSupervisor:
                 "winerror": getattr(exc, "winerror", None) or getattr(exc, "errno", None),
                 "error": str(exc),
             }
-            self._invalidate(kill=True)
+            self._invalidate(kill=True, graceful=False)
             raise SidecarError("SIDECAR_CONTAINMENT_FAILED", details=details) from exc
         self._reader = threading.Thread(
             target=self._read_loop, args=(self.process, response_queue, pending), daemon=True
@@ -433,7 +435,7 @@ class JsonLineSidecarSupervisor:
         if proc.poll() is None:
             proc.kill()
 
-    def _invalidate(self, *, kill: bool) -> None:
+    def _invalidate(self, *, kill: bool, graceful: bool = True) -> None:
         with self._write_lock:
             proc = self.process
             job_handle = self._job_handle
@@ -452,7 +454,22 @@ class JsonLineSidecarSupervisor:
                     target.put_nowait(error)
                 except queue.Full:
                     pass
-        # Closing a KILL_ON_JOB_CLOSE handle terminates the whole Windows
+        # Before hard-killing via Job close or taskkill /T /F, close child stdin
+        # and wait a bounded grace period so Node/Python sidecars (e.g.
+        # cua_browser_rpc.mjs finally block) can close owned tabs gracefully.
+        if proc is not None and proc.poll() is None and graceful and self.shutdown_grace_seconds > 0:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                proc.wait(timeout=self.shutdown_grace_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+            except Exception:
+                pass
+        # Closing a KILL_ON_JOB_CLOSE handle terminates any surviving Windows
         # sidecar tree, including grandchildren. Keep taskkill as a fallback
         # for pre-job or non-job children and for tests that inject fake procs.
         _close_windows_job_handle(job_handle)

@@ -24,6 +24,60 @@ const MIN_BACKGROUND_EXTENSION = [0, 5, 0];
 const PLAYWRIGHT_EXTENSION_ID = 'mmlmfjhmonkocbjadbfplnigmagldckm';
 const execFileAsync = promisify(execFile);
 const here = path.dirname(fileURLToPath(import.meta.url));
+const CORE_BUNDLE_INTEGRITY_RULES = [
+  ['FORBIDDEN_DEBUG_ARTIFACT_NAME', /pw_connect_url/i],
+  ['FORBIDDEN_AUDIT_PATH_LITERAL', /ChatGPT_Conversation_Audit/i],
+  ['HARDCODED_WINDOWS_USER_PATH', /(?<![A-Za-z0-9_])[A-Za-z]:[/\\]{1,2}Users[/\\]{1,2}/i],
+  ['HARDCODED_POSIX_USER_PATH', /\/Users\/[A-Za-z0-9._-]+\//],
+  ['RAW_REQUIRE_FS_WRITE', /require\s*\(\s*['"](?:node:)?fs['"]\s*\)\s*\.\s*(?:writeFileSync|appendFileSync|writeFile|promises\s*\.\s*writeFile)/],
+  ['SUSPICIOUS_FS_WRITE_CONNECT_OR_TOKEN', /(?:writeFileSync|appendFileSync|writeFile)\s*\([^;\n]{0,240}(?:connect|token|relay|pw_|audit|extension|ws:\/\/|chrome-extension:\/\/|\.txt\b)/i],
+];
+
+export function verifyPlaywrightCoreBundle(root) {
+  const base = path.resolve(root || here);
+  const bundlePath = path.join(base, 'node_modules', 'playwright-core', 'lib', 'coreBundle.js');
+  let text;
+  try {
+    text = fs.readFileSync(bundlePath, 'utf8');
+  } catch (error) {
+    if (error?.code === 'ENOENT') {
+      throw new HubError('PLAYWRIGHT_NOT_INSTALLED', 'pinned Playwright runtime is unavailable', {root: base, cause: 'ENOENT'});
+    }
+    throw new HubError('PLAYWRIGHT_CORE_BUNDLE_UNREADABLE', 'cannot read playwright-core coreBundle.js', {cause: brief(error)});
+  }
+  const rules = [];
+  for (const [name, pattern] of CORE_BUNDLE_INTEGRITY_RULES) {
+    if (pattern.test(text)) rules.push(name);
+  }
+  if (rules.length) {
+    throw new HubError('PLAYWRIGHT_CORE_BUNDLE_TAMPERED', 'unauthorized local patch detected in playwright-core coreBundle.js', {rules});
+  }
+  return {ok: true, rules: []};
+}
+
+export function resolvePlaywrightRoot({playwrightRoot = null, stateDir = null, configPaths = null} = {}) {
+  if (typeof playwrightRoot === 'string' && playwrightRoot.trim()) return path.resolve(playwrightRoot.trim());
+  const cliOpt = option('playwright-root', null);
+  if (typeof cliOpt === 'string' && cliOpt.trim()) return path.resolve(cliOpt.trim());
+  if (typeof process.env.FF_PLAYWRIGHT_ROOT === 'string' && process.env.FF_PLAYWRIGHT_ROOT.trim()) {
+    return path.resolve(process.env.FF_PLAYWRIGHT_ROOT.trim());
+  }
+  const candidates = Array.isArray(configPaths) ? configPaths : [
+    ...(stateDir ? [path.join(stateDir, 'config.json'), path.join(path.dirname(stateDir), 'config.json')] : []),
+    path.join(here, 'state', 'hub', 'config.json'),
+    ...(process.env.FF_BRIDGE_ROOT ? [path.join(process.env.FF_BRIDGE_ROOT, 'state', 'hub', 'config.json')] : []),
+    ...(process.env.LOCALAPPDATA ? [path.join(process.env.LOCALAPPDATA, 'FF-Windows-Bridge', 'state', 'hub', 'config.json')] : []),
+  ];
+  for (const file of candidates) {
+    try {
+      const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+      if (typeof data?.playwright_root === 'string' && data.playwright_root.trim()) {
+        return path.resolve(data.playwright_root.trim());
+      }
+    } catch {}
+  }
+  return here;
+}
 
 export class HubError extends Error {
   constructor(code, message = code, details = {}) {
@@ -140,12 +194,16 @@ export async function backgroundChromePreflight({profileDirName, profileBindingF
 
 // Public capability probe: no connection, token read, profile path or profile content
 // in its result. This is eligibility for connection, not live browser acceptance.
-export async function backgroundCapability(preflight = backgroundChromePreflight, runtimeLoader = () => loadPlaywright(here)) {
+export async function backgroundCapability(
+  preflight = backgroundChromePreflight,
+  runtimeLoader = loadPlaywright,
+  playwrightRoot = resolvePlaywrightRoot(),
+) {
   const required = {chrome: MIN_BACKGROUND_CHROME.join('.'), extension: MIN_BACKGROUND_EXTENSION.join('.'),
     playwright: MIN_BACKGROUND_PLAYWRIGHT.join('.'), already_running: true};
   try {
     const verified = await preflight();
-    const runtime = runtimeLoader();
+    const runtime = runtimeLoader(playwrightRoot);
     if (!runtime.backgroundSupported) throw new HubError('BACKGROUND_MODE_UNSUPPORTED');
     return {available: true, live_verified: false, token_checked: false, required,
       chrome_versions: verified.chrome_versions, extension_version: verified.extension_version, playwright_version: runtime.version};
@@ -160,6 +218,7 @@ export async function backgroundCapability(preflight = backgroundChromePreflight
 
 export function loadPlaywright(root) {
   const base = path.resolve(root || here);
+  verifyPlaywrightCoreBundle(base);
   const require = createRequire(path.join(base, 'package.json'));
   try {
     const version = require('playwright-core/package.json').version;
@@ -167,6 +226,7 @@ export function loadPlaywright(root) {
     if (typeof tools?.createBrowserWithInfo !== 'function') throw new Error('extension factory missing');
     return {version, tools, backgroundSupported: versionAtLeast(version, MIN_BACKGROUND_PLAYWRIGHT)};
   } catch (error) {
+    if (error instanceof HubError) throw error;
     throw new HubError('PLAYWRIGHT_NOT_INSTALLED', 'pinned Playwright runtime is unavailable', {root: base, cause: brief(error)});
   }
 }
@@ -275,6 +335,7 @@ export class BrowserHub {
     this.artifactDir = artifactDir;
     this.clock = clock;
     this.tabs = new Map();
+    this._unclaimedPages = new Map();
     this.connection = null;
     this.connecting = null;
     this.generation = 0;
@@ -534,19 +595,81 @@ export class BrowserHub {
     this.stats.disconnects++;
     for (const tab of this.tabs.values()) {
       if (tab.generation !== connection.generation) continue;
-      const droppedWithConnection = tab.state === 'closed' && tab.closed_by_browser_at && this.clock() - tab.closed_by_browser_at < 5000;
+      const droppedWithConnection = tab.state === 'closed' && typeof tab.closed_by_browser_at === 'number' && this.clock() - tab.closed_by_browser_at < 5000;
       if (!['live', 'opening'].includes(tab.state) && !droppedWithConnection) continue;
       tab.state = 'lost';
       tab.lost_at = this.clock();
       tab.page = null;
     }
+    // page.on('close') can fire right before browser.on('disconnected') and erase
+    // the tab from the ledger; re-persist recovered 'lost' records immediately.
     this._persist();
   }
 
+  _safePageUrl(page) {
+    try {
+      const raw = String(page?.url?.() ?? '');
+      if (raw.startsWith(`chrome-extension://${PLAYWRIGHT_EXTENSION_ID}/connect.html`)) {
+        return '[playwright-extension-connect]';
+      }
+      return raw.replace(/([?&](?:token|relayToken|extensionToken)=)[^&\s]+/gi, '$1[redacted]');
+    } catch { return ''; }
+  }
+
   _onUnclaimedPage(connection, page) {
-    // Popups are claimed through their opener (see _wire). Anything else that appears in the
-    // hub's own context without an owner is left alone: the hub never adopts foreign pages.
-    void connection; void page;
+    // Popups are claimed through their opener (see _wire). Pages opened via _openPage are
+    // removed from _unclaimedPages as soon as _wire attaches them. Anything else (such as
+    // target="_blank" rel="noopener" pages) is audited without adopting or closing foreign pages.
+    if (!page || [...this.tabs.values()].some(tab => tab.page === page)) return;
+    const record = {
+      generation: connection?.generation ?? 0,
+      url: this._safePageUrl(page),
+      target_id: null,
+      detected_at: this.clock(),
+      closed: Boolean(page.isClosed?.()),
+      closed_at: null,
+    };
+    this._unclaimedPages.set(page, record);
+    if (this._unclaimedPages.size > 64) {
+      for (const [candidate, entry] of this._unclaimedPages) {
+        if (entry.closed) {
+          this._unclaimedPages.delete(candidate);
+          if (this._unclaimedPages.size <= 64) break;
+        }
+      }
+    }
+    if (typeof page.on === 'function') {
+      page.on('close', () => {
+        const current = this._unclaimedPages.get(page);
+        if (current) {
+          current.closed = true;
+          current.closed_at = this.clock();
+        }
+      });
+      page.on('framenavigated', frame => {
+        const current = this._unclaimedPages.get(page);
+        if (current && typeof page.mainFrame === 'function' && frame === page.mainFrame()) {
+          current.url = this._safePageUrl(page);
+        }
+      });
+    }
+    void this._targetId(connection, page).then(targetId => {
+      const current = this._unclaimedPages.get(page);
+      if (current && targetId) current.target_id = targetId;
+    }).catch(() => {});
+  }
+
+  _unclaimedSummary() {
+    const pages = [...this._unclaimedPages.values()].map(entry => ({
+      generation: entry.generation,
+      url: entry.url,
+      target_id: entry.target_id,
+      detected_at: entry.detected_at,
+      closed: entry.closed,
+      closed_at: entry.closed_at,
+    }));
+    const active = pages.filter(entry => !entry.closed).length;
+    return {active, total_observed: pages.length, pages};
   }
 
   // ---- tabs ----------------------------------------------------------------------------
@@ -575,6 +698,7 @@ export class BrowserHub {
   }
 
   _wire(tab, page) {
+    this._unclaimedPages.delete(page);
     tab.page = page;
     tab.state = 'live';
     // A page that closes on its own is remembered for a moment: when the whole connection drops
@@ -768,6 +892,7 @@ export class BrowserHub {
       tabs: {live: [...this.tabs.values()].filter(tab => tab.state === 'live').length,
         lost: [...this.tabs.values()].filter(tab => tab.state === 'lost').length,
         orphaned: [...this.tabs.values()].filter(tab => tab.state === 'lost' && tab.orphaned).length},
+      unclaimed_pages: this._unclaimedSummary(),
       tab_ledger: {enabled: Boolean(this.ledgerFile), error: this.ledgerError || this.ledgerLoadError,
         recovery_proof: 'exact CDP target id; never URL or title'},
       limits: this.limits, stats: {...this.stats, uptime_ms: at - this.stats.started_at}};
@@ -791,6 +916,7 @@ export class BrowserHub {
       let reattached = false;
       if (!tab.page && tab.state === 'lost') reattached = await this._reattach(tab);
       const page = tab.page;
+      const connection = this.connection;
       if (!page) {
         if (await this._targetGone(tab)) {
           tab.state = 'closed';
@@ -798,41 +924,86 @@ export class BrowserHub {
           this._persist();
           return {tab_id: tab.id, closed: true, page_closed_in_browser: true, was_lost: true, evidence: 'target_absent_in_browser'};
         }
-        // The owning session is ending: its record is dropped so a tab that can no longer be
-        // reached does not hold quota forever. The caller reports and audits it as unconfirmed.
+        // The owning session is ending: its record is dropped only when forget_unconfirmed===true
+        // and open outcome is certain. Otherwise keep it in the ledger so cleanup stays fail-closed.
         const canForget = forget_unconfirmed === true && !tab.open_uncertain;
         if (canForget) { tab.state = 'closed'; this.tabs.delete(tab.id); this._persist(); }
         return {tab_id: tab.id, closed: false, page_closed_in_browser: false, was_lost: true,
           record_dropped: canForget, reason: 'TAB_CLEANUP_UNCONFIRMED'};
       }
-      if (page && !page.isClosed()) {
+      if (!connection || !connection.browser.isConnected()) {
+        tab.state = 'lost';
+        tab.lost_at ??= this.clock();
+        tab.page = null;
+        const canForget = forget_unconfirmed === true && !tab.open_uncertain;
+        if (canForget) { tab.state = 'closed'; this.tabs.delete(tab.id); }
+        this._persist();
+        return {tab_id: tab.id, closed: false, page_closed_in_browser: false, was_lost: true,
+          record_dropped: canForget, reason: 'TAB_CLEANUP_UNCONFIRMED'};
+      }
+      if (!page.isClosed()) {
         try { await page.close(); }
         catch (error) {
+          const stillConnected = this.connection === connection && connection.browser.isConnected();
+          if (!stillConnected) {
+            tab.state = 'lost';
+            tab.lost_at ??= this.clock();
+            tab.page = null;
+            const canForget = forget_unconfirmed === true && !tab.open_uncertain;
+            if (canForget) { tab.state = 'closed'; this.tabs.delete(tab.id); }
+            this._persist();
+            return {tab_id: tab.id, closed: false, page_closed_in_browser: false, was_lost: true,
+              record_dropped: canForget, reason: 'TAB_CLEANUP_UNCONFIRMED'};
+          }
           if (!page.isClosed()) throw new HubError('TAB_CLOSE_FAILED', 'the tab remains owned; inspect before retrying',
             {tab_id: tab.id, cause: brief(error), attempted: true, retry_safe: false});
         }
-        if (!page.isClosed()) throw new HubError('TAB_CLOSE_FAILED', 'the browser did not close the tab', {tab_id: tab.id});
       }
+      // Verify the relay stayed connected AFTER page.close(). If the browser/relay
+      // disconnected during close, local page.isClosed() becomes true without proving
+      // Chrome physically closed the tab — never report false-positive cleanup_verified.
+      const stillConnected = this.connection === connection && connection.browser.isConnected();
+      if (!stillConnected) {
+        tab.state = 'lost';
+        tab.lost_at ??= this.clock();
+        tab.page = null;
+        const canForget = forget_unconfirmed === true && !tab.open_uncertain;
+        if (canForget) { tab.state = 'closed'; this.tabs.delete(tab.id); }
+        this._persist();
+        return {tab_id: tab.id, closed: false, page_closed_in_browser: false, was_lost: true,
+          record_dropped: canForget, reason: 'TAB_CLEANUP_UNCONFIRMED'};
+      }
+      if (!page.isClosed()) throw new HubError('TAB_CLOSE_FAILED', 'the browser did not close the tab', {tab_id: tab.id});
       tab.state = 'closed';
       tab.page = null;
       this.tabs.delete(tab.id);
       this._persist();
-      return {tab_id: tab.id, closed: true, page_closed_in_browser: Boolean(page?.isClosed()), was_lost: !page,
+      return {tab_id: tab.id, closed: true, page_closed_in_browser: true, was_lost: false,
         ...(reattached ? {reattached: true, evidence: 'cdp_target_id'} : {})};
     }, {allowLost: true});
   }
 
-  async tabCloseOwner({owner, forget_unconfirmed}) {
+  async tabCloseOwner({owner, forget_unconfirmed = false}) {
     const results = [];
     for (const tab of this._ownerTabs(owner)) {
       try {
         results.push(await this.tabClose({owner, tab_id: tab.id, forget_unconfirmed}));
       } catch (error) {
+        if (error instanceof HubError && error.code === 'HUB_SHUTDOWN') throw error;
         results.push({tab_id: tab.id, closed: false, page_closed_in_browser: false, reason: error?.code || 'TAB_CLOSE_FAILED'});
       }
     }
-    return {closed: results.filter(tab => tab.page_closed_in_browser).length, tabs: results,
-      unconfirmed: results.filter(tab => !tab.page_closed_in_browser).map(tab => tab.tab_id)};
+    const unconfirmed = results.filter(tab => !tab.page_closed_in_browser).map(tab => tab.tab_id);
+    const errors = results
+      .filter(tab => !tab.page_closed_in_browser)
+      .map(tab => ({tab_id: tab.tab_id, code: tab.reason || 'TAB_CLEANUP_UNCONFIRMED'}));
+    return {
+      closed: results.filter(tab => tab.page_closed_in_browser).length,
+      tabs: results,
+      results,
+      unconfirmed,
+      errors,
+    };
   }
 
   async tabRestore({owner, tab_id}) {
@@ -997,9 +1168,22 @@ export class BrowserHub {
           if (tab.state === 'lost' && !tab.page) {
             errors.push({tab_id: tab.id, code: 'TAB_CLEANUP_UNCONFIRMED'});
           } else if (tab.page && !tab.page.isClosed()) {
-            await tab.page.close().catch(() => {});
-            if (tab.page?.isClosed() || tab.state === 'closed') { tab.state = 'closed'; closed++; }
-            else errors.push({tab_id: tab.id, code: 'TAB_CLOSE_FAILED'});
+            const connBefore = this.connection;
+            const page = tab.page;
+            await page.close().catch(() => {});
+            const stillConnected = Boolean(connBefore && this.connection === connBefore && connBefore.browser.isConnected());
+            if (!stillConnected) {
+              tab.state = 'lost';
+              tab.lost_at ??= this.clock();
+              tab.page = null;
+              errors.push({tab_id: tab.id, code: 'TAB_CLEANUP_UNCONFIRMED'});
+            } else if (page.isClosed()) {
+              tab.state = 'closed';
+              tab.page = null;
+              closed++;
+            } else {
+              errors.push({tab_id: tab.id, code: 'TAB_CLOSE_FAILED'});
+            }
           }
       const connection = this.connection;
       this.connection = null;
@@ -1017,7 +1201,8 @@ export class BrowserHub {
       this._persist();
       // Only pages explicitly registered to an agent are closed. Initial/foreign pages stay.
       if (connection) await connection.browser.close().catch(() => {});
-      return {closed_tabs: closed, errors};
+      const unclaimed = this._unclaimedSummary();
+      return {closed_tabs: closed, errors, unclaimed_pages_active: unclaimed.active, unclaimed_pages_observed: unclaimed.total_observed};
     })();
     return this.shutdownPromise;
   }
@@ -1099,10 +1284,10 @@ async function main() {
   const stateDir = path.resolve(option('state-dir', path.join(here, 'state', 'browser-hub')));
   const profileDirName = option('profile', null);
   const profileBindingFile = path.join(stateDir, 'owner-profile-binding.json');
-  const playwrightRoot = option('playwright-root', process.env.FF_PLAYWRIGHT_ROOT || here);
+  const playwrightRoot = resolvePlaywrightRoot({playwrightRoot: option('playwright-root', null), stateDir});
   if (process.argv.includes('--preflight')) {
     const capability = await backgroundCapability(() => backgroundChromePreflight({profileDirName, profileBindingFile}),
-      () => loadPlaywright(playwrightRoot));
+      loadPlaywright, playwrightRoot);
     process.stdout.write(JSON.stringify(capability) + '\n');
     return;
   }

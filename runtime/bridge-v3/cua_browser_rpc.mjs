@@ -99,12 +99,34 @@ export async function serveBrowserRpc(sidecar, {input = process.stdin, output = 
   await Promise.allSettled([...inFlight]);
 }
 
+function argOption(name, fallback = null) {
+  const idx = process.argv.indexOf(`--${name}`);
+  return idx > 0 && idx + 1 < process.argv.length ? process.argv[idx + 1] : fallback;
+}
+
 async function main() {
-  const engine = await PlaywrightEngine.create();
+  const playwrightRoot = argOption('playwright-root', null);
+  const engine = await PlaywrightEngine.create({playwrightRoot});
   engine.isolatedOnly = process.argv.includes('--isolated-only');
   const sidecar = new BrowserSidecar(engine);
+  let closingAll = null;
+  const closeAllSurfaces = () => {
+    if (!closingAll) {
+      closingAll = Promise.allSettled([...sidecar.surfaces.keys()].map(sid => sidecar.close(sid)));
+    }
+    return closingAll;
+  };
+  const onSignal = () => {
+    void closeAllSurfaces().finally(() => { process.exit(0); });
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
   try { await serveBrowserRpc(sidecar); }
-  finally { await Promise.allSettled([...sidecar.surfaces.keys()].map(sid=>sidecar.close(sid))); }
+  finally {
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+    await closeAllSurfaces();
+  }
 }
 
 const invoked = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

@@ -30,16 +30,20 @@ class OwnerChromeSession:
     """Context-managed Playwright Extension client for Chrome's existing Default profile."""
 
     def __init__(self, client_name: str = "FF Windows Bridge owner Chrome",
-                 profile: str = "Default", timeout: float = TIMEOUT_SECONDS) -> None:
+                 profile: str = "Default", timeout: float = TIMEOUT_SECONDS,
+                 *, background: bool = True) -> None:
         if not re.fullmatch(r"[A-Za-z0-9 ._/-]{4,90}", client_name):
             raise ValueError("CLIENT_NAME_INVALID")
         if not re.fullmatch(r"(Default|Profile [0-9]+)", profile):
             raise ValueError("PROFILE_NAME_INVALID")
         self.client_name = client_name
         self.profile = profile
+        self.background = bool(background)
         self.timeout = min(max(float(timeout), 1.0), 15.0)
         self.process: subprocess.Popen[str] | None = None
         self.surface_id: str | None = None
+        self.last_close_cleanup: dict | None = None
+        self.last_close_error: str | None = None
         self._q: queue.Queue[str] = queue.Queue()
         self._lock = threading.RLock()
         self._counter = 0
@@ -47,6 +51,11 @@ class OwnerChromeSession:
     def __enter__(self) -> "OwnerChromeSession":
         if not RPC_SCRIPT.is_file():
             raise OwnerChromeError("INSTALLED_EXTENSION_RPC_NOT_FOUND")
+        from cua_playwright_integrity import PlaywrightIntegrityError, assert_playwright_integrity
+        try:
+            assert_playwright_integrity(BRIDGE_ROOT, require_present=True)
+        except PlaywrightIntegrityError as exc:
+            raise OwnerChromeError(exc.code) from exc
         env = os.environ.copy()
         env["PLAYWRIGHT_MCP_PROFILE_DIR_NAME"] = self.profile
         self.process = subprocess.Popen(
@@ -75,7 +84,8 @@ class OwnerChromeSession:
         try:
             result = self._call("attach", {
                 "ownerBrowser": True, "ownerTransport": "extension",
-                "createPage": True, "extensionClientName": self.client_name})
+                "createPage": True, "background": self.background,
+                "extensionClientName": self.client_name})
             caps = result.get("capabilities") or {}
             if caps.get("owner_browser") is not True or \
                caps.get("isolated_profile") is not False or \
@@ -170,19 +180,21 @@ class OwnerChromeSession:
         p = self.process
         if p is None:
             return
+        self.last_close_cleanup = None
+        self.last_close_error = None
         try:
             if self.surface_id and p.poll() is None:
                 try:
-                    self._call("close", {"surface_id": self.surface_id})
-                except (OwnerChromeError, OSError):
-                    pass
+                    self.last_close_cleanup = self._call("close", {"surface_id": self.surface_id})
+                except (OwnerChromeError, OSError) as exc:
+                    self.last_close_error = str(exc)
         finally:
             self.surface_id = None
             self.process = None
             try:
                 if p.stdin:
                     p.stdin.close()
-                p.wait(timeout=1.5)
+                p.wait(timeout=2.5)
             except (OSError, subprocess.TimeoutExpired):
                 if p.poll() is None:
                     # Kill only this task-owned PowerShell/Node child tree.

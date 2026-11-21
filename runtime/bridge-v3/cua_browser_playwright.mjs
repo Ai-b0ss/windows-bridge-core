@@ -1,17 +1,67 @@
 import crypto from 'node:crypto';
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
+import {createRequire} from 'node:module';
 import path from 'node:path';
+import {fileURLToPath} from 'node:url';
 import { BrowserSidecarError } from './cua_browser_sidecar.mjs';
+
+const HERE=path.dirname(fileURLToPath(import.meta.url));
 
 const hash=value=>crypto.createHash('sha256').update(String(value)).digest('hex').slice(0,24);
 const EXPLICIT_PAGE_KEYS=['pageIndex','pageUrlContains','pageTitleContains'];
+const CORE_BUNDLE_INTEGRITY_RULES=[
+  ['FORBIDDEN_DEBUG_ARTIFACT_NAME',/pw_connect_url/i],
+  ['FORBIDDEN_AUDIT_PATH_LITERAL',/ChatGPT_Conversation_Audit/i],
+  ['HARDCODED_WINDOWS_USER_PATH',/(?<![A-Za-z0-9_])[A-Za-z]:[/\\]{1,2}Users[/\\]{1,2}/i],
+  ['HARDCODED_POSIX_USER_PATH',/\/Users\/[A-Za-z0-9._-]+\//],
+  ['RAW_REQUIRE_FS_WRITE',/require\s*\(\s*['"](?:node:)?fs['"]\s*\)\s*\.\s*(?:writeFileSync|appendFileSync|writeFile|promises\s*\.\s*writeFile)/],
+  ['SUSPICIOUS_FS_WRITE_CONNECT_OR_TOKEN',/(?:writeFileSync|appendFileSync|writeFile)\s*\([^;\n]{0,240}(?:connect|token|relay|pw_|audit|extension|ws:\/\/|chrome-extension:\/\/|\.txt\b)/i],
+];
+
+export function verifyPlaywrightCoreBundleSync(bundlePath){
+  let text;
+  try{text=fsSync.readFileSync(bundlePath,'utf8');}
+  catch(error){throw new BrowserSidecarError('PLAYWRIGHT_CORE_BUNDLE_UNREADABLE',String(error?.code||error?.message||'unreadable'));}
+  const rules=[];
+  for(const [name,pattern] of CORE_BUNDLE_INTEGRITY_RULES){
+    if(pattern.test(text))rules.push(name);
+  }
+  if(rules.length)throw new BrowserSidecarError('PLAYWRIGHT_CORE_BUNDLE_TAMPERED','unauthorized local patch detected in playwright-core coreBundle.js',{rules});
+  return {ok:true,rules:[]};
+}
+
+function redactTokenMessage(error){
+  let msg=String(error?.message||error||'');
+  const token=process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+  if(token)msg=msg.replaceAll(token,'[redacted]');
+  return msg.replace(/([?&](?:token|relayToken|extensionToken)=)[^&\s]+/gi,'$1[redacted]');
+}
 
 export class PlaywrightEngine {
   constructor(playwright, coreTools=null) { this.pw = playwright; this.coreTools = coreTools; this.frameIds = new WeakMap(); this.pageIds = new WeakMap(); }
   _timeout(value,fallback,cap=30000){ const n=Number(value??fallback); if(!Number.isFinite(n)||n<=0)throw new BrowserSidecarError('TIMEOUT_INVALID','timeout must be a positive finite number'); return Math.min(Math.max(1,Math.trunc(n)),cap); }
   _boundedInteger(value,{fallback,min,max,code,field}){ const n=Number(value??fallback); if(!Number.isFinite(n))throw new BrowserSidecarError(code,`${field} must be a finite number`,{field}); return Math.min(Math.max(Math.trunc(n),min),max); }
   async _bounded(code,timeout,fn){ try{return await fn();}catch(error){ if(error?.name==='TimeoutError'||String(error?.name||'').includes('Timeout'))throw new BrowserSidecarError(code,String(error?.message||error),{timeout_ms:timeout}); throw error; } }
-  static async create() { try { const [playwright,coreBundle]=await Promise.all([import('playwright'),import('playwright-core/lib/coreBundle')]); return new PlaywrightEngine(playwright,coreBundle.tools); } catch(e) { throw new BrowserSidecarError('PLAYWRIGHT_NOT_INSTALLED',String(e?.message||e)); } }
+  static async create({playwrightRoot=null}={}) {
+    try {
+      const root=typeof playwrightRoot==='string'&&playwrightRoot.trim()
+        ? path.resolve(playwrightRoot.trim())
+        : (typeof process.env.FF_PLAYWRIGHT_ROOT==='string'&&process.env.FF_PLAYWRIGHT_ROOT.trim()
+          ? path.resolve(process.env.FF_PLAYWRIGHT_ROOT.trim())
+          : HERE);
+      const req=createRequire(path.join(root,'package.json'));
+      let resolvedBundle=null;
+      try{resolvedBundle=req.resolve('playwright-core/lib/coreBundle');}catch{}
+      if(resolvedBundle)verifyPlaywrightCoreBundleSync(resolvedBundle);
+      const playwright=req('playwright');
+      const coreBundle=req('playwright-core/lib/coreBundle');
+      return new PlaywrightEngine(playwright,coreBundle.tools);
+    } catch(e) {
+      if(e instanceof BrowserSidecarError)throw e;
+      throw new BrowserSidecarError('PLAYWRIGHT_NOT_INSTALLED',String(e?.message||e));
+    }
+  }
   _frameId(frame){ let value=this.frameIds.get(frame); if(!value){ value=`frame-${crypto.randomBytes(6).toString('hex')}`; this.frameIds.set(frame,value); } return value; }
   _pageId(page){ let value=this.pageIds.get(page); if(!value){ value=`page-${crypto.randomBytes(6).toString('hex')}`; this.pageIds.set(page,value); } return value; }
   async _targetId(context,page){ let session=null; try{ session=await context.newCDPSession(page); const info=await session.send('Target.getTargetInfo'); return info?.targetInfo?.targetId?String(info.targetInfo.targetId):null; } catch { return null; } finally { if(session)await session.detach?.().catch(()=>{}); } }
@@ -92,15 +142,98 @@ export class PlaywrightEngine {
     const factory=this.coreTools?.createBrowserWithInfo;
     if(typeof factory!=='function') throw new BrowserSidecarError('OWNER_BROWSER_EXTENSION_RUNTIME_UNAVAILABLE','pinned Playwright Extension factory is unavailable');
     const userDataDir=options.chromeUserDataDir===undefined?undefined:String(options.chromeUserDataDir);
-    const config={extension:true,browser:{browserName:'chromium',launchOptions:{channel:'chrome'},userDataDir}};
+    const background=options.background!==false;
+    const tabGroup=options.tabGroup!==false;
+    const config={
+      extension:true,
+      background,
+      tabGroup,
+      browser:{
+        browserName:'chromium',
+        launchOptions:{channel:'chrome'},
+        contextOptions:{},
+        ...(userDataDir!==undefined?{userDataDir}:{}),
+      },
+    };
+    const clientName=String(options.extensionClientName??'FF Windows Bridge').trim()||'FF Windows Bridge';
+    const clientInfo={cwd:process.cwd(),clientName};
+    const cliOptions={
+      extension:true,
+      browser:'chrome',
+      ...(options.profileDirName?{profileDirName:String(options.profileDirName)}:{}),
+      ...(options.executablePath?{executablePath:String(options.executablePath)}:{}),
+    };
+    const bindTitle=String(options.bindTitle??`${clientName}-${process.pid}`).trim()||`ff-bridge-browser-${process.pid}`;
+    const bindOptions={title:bindTitle,workspaceDir:clientInfo.cwd};
     try {
-      const clientName=String(options.extensionClientName??'FF Windows Bridge').trim()||'FF Windows Bridge';
-      const result=await factory(config,{cwd:process.cwd(),clientName},{extension:true,browser:'chrome'});
+      const result=await factory(config,clientInfo,cliOptions,bindOptions);
       if(!result?.browser) throw new Error('factory returned no browser');
-      return {browser:result.browser,clientName};
+      return {browser:result.browser,clientName,background,endpoint:result.endpoint??null};
     } catch(error) {
-      throw new BrowserSidecarError('OWNER_BROWSER_EXTENSION_ATTACH_FAILED','authorized Playwright Extension transport could not be established',{cause:error?.name??'Error',message:String(error?.message||error||'')});
+      throw new BrowserSidecarError(
+        'OWNER_BROWSER_EXTENSION_ATTACH_FAILED',
+        'authorized Playwright Extension transport could not be established',
+        {
+          cause:error?.name??'Error',
+          message:redactTokenMessage(error),
+          tab_spawned_possible:true,
+          cleanup_confirmed:false,
+          retry_safe:false,
+        },
+      );
     }
+  }
+  async _rollbackExternalAttach({browser=null,context=null,createdPages=[],ownerTransport=null,extensionClientName=null}={}){
+    let pagesClosed=0;
+    let pageCloseFailed=false;
+    const seen=new Set();
+    for(const candidate of createdPages){
+      if(!candidate||seen.has(candidate))continue;
+      seen.add(candidate);
+      try{
+        if(!candidate.isClosed?.()){
+          await candidate.close();
+          pagesClosed++;
+        }
+      }catch{
+        pageCloseFailed=true;
+      }
+    }
+    let connectPagesClosed=0;
+    if(ownerTransport==='extension'&&context&&extensionClientName&&typeof context.pages==='function'){
+      const probe={ownerTransport:'extension',extensionClientName};
+      const matching=context.pages().filter(candidate=>!seen.has(candidate)&&this._isInternalExtensionPage(probe,candidate)&&this._extensionClientNameFromPage(probe,candidate)===extensionClientName);
+      if(matching.length===1&&!matching[0].isClosed?.()){
+        try{
+          await matching[0].close();
+          connectPagesClosed++;
+        }catch{
+          pageCloseFailed=true;
+        }
+      }
+    }
+    let connectionClosed=false;
+    if(browser){
+      if(browser._connection&&typeof browser._connection.close==='function'){
+        try{
+          browser._connection.close();
+          connectionClosed=true;
+        }catch{}
+      }
+      if(!connectionClosed&&typeof browser.close==='function'){
+        try{
+          await browser.close();
+          connectionClosed=true;
+        }catch{}
+      }
+    }
+    return {
+      rollback_attempted:true,
+      owned_pages_closed:pagesClosed,
+      extension_connect_pages_closed:connectPagesClosed,
+      protocol_connection_closed:connectionClosed,
+      cleanup_confirmed:!pageCloseFailed,
+    };
   }
   async attach(options={}) {
     if(this.isolatedOnly){
@@ -121,43 +254,81 @@ export class PlaywrightEngine {
       if(!ownerBrowser) throw new BrowserSidecarError('OWNER_BROWSER_EXTENSION_MODE_INVALID','extension transport requires ownerBrowser=true or ownerMode=daily-driver');
       const extensionConnection=await this._connectOwnerExtension(options);
       const browser=extensionConnection.browser;
-      const context=await this._selectContext(browser,options);
-      const explicit=this._hasExplicitPageSelector(options);
-      const created=!explicit&&options.createPage!==false;
-      let page;
-      let reusedConnectPage=false;
-      if(created){
-        const provisional={ownerTransport:'extension',extensionClientName:extensionConnection.clientName};
-        const connectPage=context.pages().find(candidate=>this._isInternalExtensionPage(provisional,candidate)&&this._extensionClientNameFromPage(provisional,candidate)===extensionConnection.clientName);
-        if(connectPage){
-          try{
-            await connectPage.goto('about:blank',{waitUntil:'domcontentloaded',timeout:2000});
-            page=connectPage;
-            reusedConnectPage=true;
-          }catch{}
+      let context=null;
+      const createdPages=[];
+      try{
+        context=await this._selectContext(browser,options);
+        const explicit=this._hasExplicitPageSelector(options);
+        const created=!explicit&&options.createPage!==false;
+        let page=null;
+        let reusedConnectPage=false;
+        if(created){
+          const provisional={ownerTransport:'extension',extensionClientName:extensionConnection.clientName};
+          const connectPage=context.pages().find(candidate=>this._isInternalExtensionPage(provisional,candidate)&&this._extensionClientNameFromPage(provisional,candidate)===extensionConnection.clientName);
+          const initialUrl=typeof options.url==='string'&&options.url?options.url:'about:blank';
+          if(connectPage&&!connectPage.isClosed?.()){
+            try{
+              if(String(connectPage.url?.()??'')!==initialUrl){
+                await connectPage.goto(initialUrl,{waitUntil:'domcontentloaded',timeout:2000});
+              }
+              page=connectPage;
+              reusedConnectPage=true;
+              createdPages.push(page);
+            }catch{}
+          }
+          if(!page){
+            page=await context.newPage();
+            createdPages.push(page);
+            if(initialUrl!=='about:blank'&&String(page.url?.()??'')!==initialUrl){
+              await page.goto(initialUrl,{waitUntil:'domcontentloaded',timeout:10000});
+            }
+          }
+        }else page=await this._selectPage(context,options);
+        const handle={browser,context,page,ownedBrowser:false,ownerBrowser:true,ownerTransport:'extension',connectionMode:'extension',background:Boolean(extensionConnection.background),extensionClientName:extensionConnection.clientName,ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle);
+        if(created)this._markOwned(handle,page,{created:true});
+        else if(options.claimPage===true&&explicit)this._markOwned(handle,page);
+        else throw new BrowserSidecarError('BROWSER_PAGE_OWNERSHIP_REQUIRED','extension transport requires one newly-created owned page or explicit claim');
+        if(created&&!reusedConnectPage){
+          const connectPages=context.pages().filter(candidate=>candidate!==page&&this._isInternalExtensionPage(handle,candidate)&&this._extensionClientNameFromPage(handle,candidate)===handle.extensionClientName);
+          for(const connectPage of connectPages){ if(!connectPage.isClosed?.()) await connectPage.close().catch(()=>{}); }
         }
-        if(!page)page=await context.newPage();
-      }else page=await this._selectPage(context,options);
-      const handle={browser,context,page,ownedBrowser:false,ownerBrowser:true,ownerTransport:'extension',connectionMode:'extension',extensionClientName:extensionConnection.clientName,ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle);
-      if(created)this._markOwned(handle,page,{created:true});
-      else if(options.claimPage===true&&explicit)this._markOwned(handle,page);
-      else throw new BrowserSidecarError('BROWSER_PAGE_OWNERSHIP_REQUIRED','extension transport requires one newly-created owned page or explicit claim');
-      if(created&&!reusedConnectPage){
-        const connectPages=context.pages().filter(candidate=>candidate!==page&&this._isInternalExtensionPage(handle,candidate)&&this._extensionClientNameFromPage(handle,candidate)===handle.extensionClientName);
-        for(const connectPage of connectPages){ if(!connectPage.isClosed?.()) await connectPage.close().catch(()=>{}); }
+        return handle;
+      }catch(error){
+        const rollback=await this._rollbackExternalAttach({
+          browser,
+          context,
+          createdPages,
+          ownerTransport:'extension',
+          extensionClientName:extensionConnection.clientName,
+        });
+        if(error instanceof BrowserSidecarError){
+          error.details={...(error.details||{}),...rollback};
+        }
+        throw error;
       }
-      return handle;
     }
     if(ownerBrowser&&options.ownerTransport==='playwright-server'){
       const browser=await this._connectOwnerApprovedServer(options);
-      const context=await this._selectContext(browser,options);
-      const explicit=this._hasExplicitPageSelector(options);
-      const page=!explicit&&options.createPage!==false?await this._createBackgroundPage(browser,context):await this._selectPage(context,options);
-      const handle={browser,context,page,ownedBrowser:false,ownerBrowser:true,ownerTransport:'playwright-server',connectionMode:'playwright-server',ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle);
-      if(!explicit&&options.createPage!==false)this._markOwned(handle,page,{created:true});
-      else if(options.claimPage===true&&explicit)this._markOwned(handle,page);
-      else throw new BrowserSidecarError('BROWSER_PAGE_OWNERSHIP_REQUIRED','approved owner transport requires one newly-created owned page or explicit claim');
-      return handle;
+      let context=null;
+      const createdPages=[];
+      try{
+        context=await this._selectContext(browser,options);
+        const explicit=this._hasExplicitPageSelector(options);
+        const willCreate=!explicit&&options.createPage!==false;
+        const page=willCreate?await this._createBackgroundPage(browser,context):await this._selectPage(context,options);
+        if(willCreate)createdPages.push(page);
+        const handle={browser,context,page,ownedBrowser:false,ownerBrowser:true,ownerTransport:'playwright-server',connectionMode:'playwright-server',background:true,ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle);
+        if(willCreate)this._markOwned(handle,page,{created:true});
+        else if(options.claimPage===true&&explicit)this._markOwned(handle,page);
+        else throw new BrowserSidecarError('BROWSER_PAGE_OWNERSHIP_REQUIRED','approved owner transport requires one newly-created owned page or explicit claim');
+        return handle;
+      }catch(error){
+        const rollback=await this._rollbackExternalAttach({browser,context,createdPages,ownerTransport:'playwright-server'});
+        if(error instanceof BrowserSidecarError){
+          error.details={...(error.details||{}),...rollback};
+        }
+        throw error;
+      }
     }
     const endpoint=options.cdpEndpoint??(ownerBrowser?await this._discoverOwnerChromeEndpoint(options):null);
     if(endpoint){
@@ -175,15 +346,27 @@ export class PlaywrightEngine {
         }
         throw error;
       }
-      const context=await this._selectContext(browser,options);
-      const explicit=this._hasExplicitPageSelector(options);
-      const page=ownerBrowser&&!explicit&&options.createPage!==false?await this._createBackgroundPage(browser,context):await this._selectPage(context,options);
-      const handle={browser,context,page,ownedBrowser:false,ownerBrowser,ownerTransport:ownerBrowser?(options.ownerTransport??'chrome-remote-debugging'):null,connectionMode:'cdp',ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle);
-      if(ownerBrowser&&!explicit&&options.createPage!==false) this._markOwned(handle,page,{created:true});
-      else if(options.createPage===true && !explicit) this._markOwned(handle,page,{created:true});
-      else if(options.claimPage===true && explicit) this._markOwned(handle,page);
-      else throw new BrowserSidecarError('BROWSER_PAGE_OWNERSHIP_REQUIRED','external browser pages require explicit selector plus claimPage=true; owner daily-driver mode otherwise creates one background-owned tab');
-      return handle;
+      let context=null;
+      const createdPages=[];
+      try{
+        context=await this._selectContext(browser,options);
+        const explicit=this._hasExplicitPageSelector(options);
+        const willCreate=(ownerBrowser&&!explicit&&options.createPage!==false)||(options.createPage===true&&!explicit);
+        const page=ownerBrowser&&!explicit&&options.createPage!==false?await this._createBackgroundPage(browser,context):await this._selectPage(context,options);
+        if(willCreate)createdPages.push(page);
+        const handle={browser,context,page,ownedBrowser:false,ownerBrowser,ownerTransport:ownerBrowser?(options.ownerTransport??'chrome-remote-debugging'):null,connectionMode:'cdp',background:Boolean(ownerBrowser),ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle);
+        if(ownerBrowser&&!explicit&&options.createPage!==false) this._markOwned(handle,page,{created:true});
+        else if(options.createPage===true && !explicit) this._markOwned(handle,page,{created:true});
+        else if(options.claimPage===true && explicit) this._markOwned(handle,page);
+        else throw new BrowserSidecarError('BROWSER_PAGE_OWNERSHIP_REQUIRED','external browser pages require explicit selector plus claimPage=true; owner daily-driver mode otherwise creates one background-owned tab');
+        return handle;
+      }catch(error){
+        const rollback=await this._rollbackExternalAttach({browser,context,createdPages,ownerTransport:ownerBrowser?(options.ownerTransport??'chrome-remote-debugging'):null});
+        if(error instanceof BrowserSidecarError){
+          error.details={...(error.details||{}),...rollback};
+        }
+        throw error;
+      }
     }
     const launchOptions={headless:options.headless??true,...(options.proxy?{proxy:options.proxy}:{}),...(options.executablePath?{executablePath:String(options.executablePath)}:{}),...(Array.isArray(options.args)?{args:options.args.map(String)}:{})};
     let managedProfile=null;
@@ -205,7 +388,7 @@ export class PlaywrightEngine {
     }
     const handle={browser:context.browser?.()??null,context,page,ownedBrowser:true,headless:launchOptions.headless,managedTemporaryProfile:!options.userDataDir,managedProfile,connectionMode:'persistent',ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle); this._markOwned(handle,page,{created:true}); return handle;
   }
-  async capabilities(h){return {physical_input:false,semantic_dom:true,isolated_profile:!h?.ownerBrowser,cdp_attach:true,iframe_semantics:true,tab_ownership:true,external_browser_close_safe:!h?.ownedBrowser,owner_browser:Boolean(h?.ownerBrowser),owner_transport:h?.ownerTransport??null,owner_attach_approval_pending:false,headless:h?.headless===true,managed_temporary_profile:h?.managedTemporaryProfile===true};}
+  async capabilities(h){return {physical_input:false,semantic_dom:true,isolated_profile:!h?.ownerBrowser,cdp_attach:true,iframe_semantics:true,tab_ownership:true,external_browser_close_safe:!h?.ownedBrowser,owner_browser:Boolean(h?.ownerBrowser),owner_transport:h?.ownerTransport??null,owner_attach_approval_pending:false,background:Boolean(h?.background),headless:h?.headless===true,managed_temporary_profile:h?.managedTemporaryProfile===true};}
   async _mutationSignature(page){
     const signature=[];
     for(const frame of page.frames()){
@@ -558,18 +741,90 @@ export class PlaywrightEngine {
   async close(h){
     if(h.ownedBrowser){ await h.context.close(); if(h.managedProfile)await fs.rm(h.managedProfile,{recursive:true,force:true,maxRetries:10,retryDelay:100}); return {detached:false,closed:true,owned_pages_closed:0,managed_profile_removed:Boolean(h.managedProfile)}; }
     let ownedPagesClosed=0;
-    const extensionConnectPages=h.ownerTransport==='extension'&&h.extensionClientName?h.context.pages().filter(page=>this._isInternalExtensionPage(h,page)&&this._extensionClientNameFromPage(h,page)===h.extensionClientName):[];
-    if(extensionConnectPages.length>1) throw new BrowserSidecarError('OWNER_BROWSER_EXTENSION_CONNECT_PAGE_AMBIGUOUS','multiple extension connect pages matched this surface',{matches:extensionConnectPages.length});
-    if(h.page&&h.createdPages.has(h.page)&&!h.page.isClosed()){ await h.page.close(); ownedPagesClosed++; }
-    for(const page of h.context.pages()){
-      if(page!==h.page&&h.createdPages.has(page)&&!page.isClosed()){ await page.close(); ownedPagesClosed++; }
+    const pageCloseErrors=[];
+    const pagesToClose=[];
+    const seen=new Set();
+    if(h.page&&h.createdPages.has(h.page)){
+      pagesToClose.push(h.page);
+      seen.add(h.page);
     }
+    const currentPages=typeof h.context?.pages==='function'?h.context.pages():[];
+    for(const page of currentPages){
+      if(!seen.has(page)&&h.createdPages.has(page)){
+        pagesToClose.push(page);
+        seen.add(page);
+      }
+    }
+    // Always close owned/created pages BEFORE inspecting connect.html so >=2 connect.html
+    // tabs can never self-block closing our owned pages.
+    for(const page of pagesToClose){
+      if(page.isClosed?.())continue;
+      try{
+        await page.close();
+        ownedPagesClosed++;
+      }catch(error){
+        pageCloseErrors.push({page_id:this._pageId(page),message:redactTokenMessage(error)});
+      }
+    }
+    const remainingPages=typeof h.context?.pages==='function'?h.context.pages():[];
+    const extensionConnectPages=h.ownerTransport==='extension'&&h.extensionClientName
+      ? remainingPages.filter(page=>!seen.has(page)&&this._isInternalExtensionPage(h,page)&&this._extensionClientNameFromPage(h,page)===h.extensionClientName)
+      : [];
     let extensionConnectPagesClosed=0;
-    if(extensionConnectPages.length===1&&!extensionConnectPages[0].isClosed()){ await extensionConnectPages[0].close(); extensionConnectPagesClosed++; }
+    let ambiguousConnectMatches=0;
+    if(extensionConnectPages.length===1){
+      if(!extensionConnectPages[0].isClosed?.()){
+        try{
+          await extensionConnectPages[0].close();
+          extensionConnectPagesClosed++;
+        }catch(error){
+          pageCloseErrors.push({page_id:this._pageId(extensionConnectPages[0]),kind:'extension_connect',message:redactTokenMessage(error)});
+        }
+      }
+    }else if(extensionConnectPages.length>1){
+      ambiguousConnectMatches=extensionConnectPages.length;
+    }
     let protocolConnectionClosed=false;
-    if(h.ownerTransport==='extension'&&h.browser?._connection&&typeof h.browser._connection.close==='function'){
-      h.browser._connection.close();
-      protocolConnectionClosed=true;
+    if(h.ownerTransport==='extension'){
+      if(h.browser?._connection&&typeof h.browser._connection.close==='function'){
+        try{
+          h.browser._connection.close();
+          protocolConnectionClosed=true;
+        }catch{}
+      }
+      if(!protocolConnectionClosed&&typeof h.browser?.close==='function'){
+        try{
+          await h.browser.close();
+          protocolConnectionClosed=true;
+        }catch{}
+      }
+    }
+    if(pageCloseErrors.length>0){
+      throw new BrowserSidecarError(
+        'BROWSER_CLOSE_FAILED',
+        'one or more owned browser pages could not be closed cleanly',
+        {
+          detached:protocolConnectionClosed,
+          owned_pages_closed:ownedPagesClosed,
+          extension_connect_pages_closed:extensionConnectPagesClosed,
+          protocol_connection_closed:protocolConnectionClosed,
+          errors:pageCloseErrors,
+          ...(ambiguousConnectMatches>1?{connect_page_matches:ambiguousConnectMatches}:{}),
+        },
+      );
+    }
+    if(ambiguousConnectMatches>1){
+      throw new BrowserSidecarError(
+        'OWNER_BROWSER_EXTENSION_CONNECT_PAGE_AMBIGUOUS',
+        'multiple extension connect pages matched this surface; owned pages were closed and relay detached',
+        {
+          matches:ambiguousConnectMatches,
+          detached:true,
+          owned_pages_closed:ownedPagesClosed,
+          extension_connect_pages_closed:extensionConnectPagesClosed,
+          protocol_connection_closed:protocolConnectionClosed,
+        },
+      );
     }
     return {detached:true,closed:false,owned_pages_closed:ownedPagesClosed,extension_connect_pages_closed:extensionConnectPagesClosed,protocol_connection_closed:protocolConnectionClosed};
   }

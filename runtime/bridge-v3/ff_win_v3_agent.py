@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import atexit
 import base64
 import ctypes
 import ctypes.wintypes
@@ -2094,10 +2095,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_json(400, {"ok": False, "error_code": exc.code, "message": exc.message, "details": exc.details})
             return
         if self.path == "/shutdown":
+            close_runtime_resources()
             self.send_json(200, {"ok": True})
             threading.Thread(target=self.server.shutdown, daemon=True).start()
             return
         self.send_json(404, {"ok": False, "error_code": "NOT_FOUND"})
+
+
+_SHUTDOWN_HOOKS_LOCK = threading.Lock()
+_SHUTDOWN_HOOKS: list[Any] = []
+
+
+def register_shutdown_hook(hook: Any) -> None:
+    if not callable(hook):
+        return
+    with _SHUTDOWN_HOOKS_LOCK:
+        if hook not in _SHUTDOWN_HOOKS:
+            _SHUTDOWN_HOOKS.append(hook)
+
+
+def close_runtime_resources() -> dict[str, Any]:
+    """Close registered runtime resources (including _CUA_CONTROL_PLANE) gracefully."""
+    closed = 0
+    errors: list[str] = []
+    seen_planes: set[int] = set()
+    with _SHUTDOWN_HOOKS_LOCK:
+        hooks = list(_SHUTDOWN_HOOKS)
+    for hook in hooks:
+        plane_id = getattr(hook, "_plane_id", None)
+        if plane_id is not None:
+            if plane_id in seen_planes:
+                continue
+            seen_planes.add(plane_id)
+        try:
+            hook()
+            closed += 1
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+    for mod_name in ("ff_win_v3_main", "__main__"):
+        mod = sys.modules.get(mod_name)
+        plane = getattr(mod, "_CUA_CONTROL_PLANE", None) if mod is not None else None
+        if plane is not None and id(plane) not in seen_planes and callable(getattr(plane, "close", None)):
+            seen_planes.add(id(plane))
+            try:
+                plane.close()
+                closed += 1
+            except Exception as exc:
+                errors.append(type(exc).__name__)
+    return {"closed": closed, "errors": errors}
+
+
+atexit.register(close_runtime_resources)
 
 
 def _serve_direct(server: http.server.ThreadingHTTPServer) -> None:
@@ -2184,6 +2232,7 @@ def serve(host: str, port: int, also_listen: list[int] | None = None,
             server.server_close()
             _drain_wait()
     finally:
+        close_runtime_resources()
         server.server_close()
         if STATE.drain_private_port is not None:
             _write_peer(None)

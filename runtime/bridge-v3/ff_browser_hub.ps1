@@ -19,13 +19,25 @@ $node = (Get-Command node.exe -ErrorAction Stop).Source
 $hub = Join-Path $PSScriptRoot 'ff_browser_hub.mjs'
 if (-not (Test-Path -LiteralPath $hub -PathType Leaf)) { throw 'BROWSER_HUB_NOT_INSTALLED' }
 
+# Verify pinned Playwright coreBundle.js integrity BEFORE unsealing the DPAPI token.
+$integrityScript = Join-Path $PSScriptRoot 'cua_playwright_integrity.py'
+$python = Get-Command python.exe -ErrorAction SilentlyContinue
+if ((Test-Path -LiteralPath $integrityScript -PathType Leaf) -and $null -ne $python) {
+    $null = & $python.Source $integrityScript --playwright-root $PlaywrightRoot
+    if ($LASTEXITCODE -ne 0) {
+        if ($LASTEXITCODE -eq 2) { throw 'PLAYWRIGHT_CORE_BUNDLE_TAMPERED' }
+        throw "PLAYWRIGHT_INTEGRITY_CHECK_FAILED_$LASTEXITCODE"
+    }
+}
+
 # Check before unsealing the token: on older Chrome even a token-authenticated connect
 # page can take the foreground. Do not launch Chrome or silently fall back to that path.
 $preflightSource = @'
 import {pathToFileURL} from 'node:url';
 import path from 'node:path';
 try {
-  const {backgroundChromePreflight} = await import(pathToFileURL(process.argv[2]).href);
+  const {backgroundChromePreflight, verifyPlaywrightCoreBundle} = await import(pathToFileURL(process.argv[2]).href);
+  verifyPlaywrightCoreBundle(process.argv[5]);
   await backgroundChromePreflight({profileBindingFile: path.join(process.argv[3], 'owner-profile-binding.json'),
     profileDirName: process.argv[4] || undefined});
 } catch (error) {
@@ -33,7 +45,7 @@ try {
   process.exit(3);
 }
 '@
-& $node --input-type=module -e $preflightSource -- ff-background-preflight $hub $StateDir $ProfileDirName
+& $node --input-type=module -e $preflightSource -- ff-background-preflight $hub $StateDir $ProfileDirName $PlaywrightRoot
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Add-Type -AssemblyName System.Security
