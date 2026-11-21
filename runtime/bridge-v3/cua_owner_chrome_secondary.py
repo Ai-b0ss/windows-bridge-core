@@ -1115,6 +1115,7 @@ class OwnerChromeHiddenSecondaryManager:
         profile_dir_name: str | None = None,
         timeout_s: float = 3.0,
         connect_ws: bool = False,
+        allow_new_ws: bool = True,
     ) -> dict[str, Any]:
         """Read-only probe of owner Chrome hidden secondary target eligibility (consent-respecting on HTTP 404)."""
         t0 = time.monotonic()
@@ -1133,19 +1134,37 @@ class OwnerChromeHiddenSecondaryManager:
                             "required when attaching (separate from Hub local standing policy `owner_chrome_hidden_secondary`)"
                         ),
                     )
+                if not allow_new_ws and not already_connected:
+                    self._precheck_local_profile_mismatch(profile_dir_name=target_profile, info=info)
+                    raise OwnerChromeSecondaryError(
+                        "OWNER_CHROME_CDP_NOT_CONNECTED",
+                        "owner Chrome loopback CDP is not already connected; refusing to initiate a new connection in no-interruption mode",
+                        cdp_discovered=True,
+                        connected=False,
+                        discovery_mode=info.get("discovery_mode"),
+                        http_discovery_status=info.get("http_discovery_status"),
+                        chrome_version=info.get("chrome_version"),
+                        execution_started=False,
+                        attempted=False,
+                        retry_safe=True,
+                    )
                 verified = self._ensure_connected(
                     profile_dir_name=target_profile,
                     timeout_s=timeout_s,
                     info=info,
-                    allow_reconnect_on_stale=(connect_ws or not info.get("approval_gated")),
+                    allow_reconnect_on_stale=(connect_ws or (allow_new_ws and not info.get("approval_gated"))),
                 )
-                if not self._targets and not verified.get("approval_gated"):
+                if not self._targets and not verified.get("approval_gated") and allow_new_ws:
                     # Keep legacy HTTP-200 preflight stateless; preserve owner-approved WS-only sessions
-                    # so subsequent open calls reuse the single approved Chrome connection without re-prompting.
+                    # (and existing connected sessions under allow_new_ws=False) so subsequent calls
+                    # reuse the already-connected Chrome session without re-prompting.
                     self._cdp.reset()
+                connected_now = self._cdp.connected() is True
             return {
                 "ok": True,
                 "available": True,
+                "connected": connected_now,
+                "already_connected": already_connected,
                 "cdp_discovered": True,
                 "approval_required": False,
                 "confirmation_required": False,
@@ -1176,10 +1195,13 @@ class OwnerChromeHiddenSecondaryManager:
             with self._lock:
                 if not self._targets and not (self._cdp.connected() is True and exc.code == "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH"):
                     self._cdp.reset()
+                connected_now = self._cdp.connected() is True
             details = dict(exc.details)
             return {
                 "ok": False,
                 "available": False,
+                "connected": connected_now,
+                "already_connected": False,
                 "cdp_discovered": bool(details.get("cdp_discovered", False)),
                 "approval_required": bool(details.get("approval_required", False)),
                 "confirmation_required": bool(details.get("confirmation_required", False)),
@@ -1260,6 +1282,26 @@ class OwnerChromeHiddenSecondaryManager:
             "profile_dir_name": rec["profile_dir_name"],
         }
 
+    def _check_expected_host(self, rec: dict[str, Any], expected_host: Any) -> None:
+        if expected_host is None:
+            return
+        want = str(expected_host).strip().lower().rstrip(".")
+        res = self._eval(rec, "({url:location.href})", timeout_s=3.0)
+        actual_url = str(res.get("url") or "") if isinstance(res, dict) else ""
+        try:
+            actual = (urllib.parse.urlsplit(actual_url).hostname or "").lower().rstrip(".")
+        except ValueError:
+            actual = ""
+        if actual != want:
+            raise OwnerChromeSecondaryError(
+                "TAB_HOST_CHANGED",
+                "the live hidden target changed host; authorize its current address before acting",
+                expected_host=want,
+                actual_host=actual,
+                attempted=False,
+                retry_safe=False,
+            )
+
     def _check_postcondition(self, rec: dict[str, Any], condition: dict[str, Any], timeout_s: float = 8.0) -> bool:
         if not isinstance(condition, dict):
             raise OwnerChromeSecondaryError("POSTCONDITION_REQUIRED", "postcondition dict is required", attempted=False)
@@ -1276,7 +1318,13 @@ class OwnerChromeHiddenSecondaryManager:
             if ctype == "value_equals" and isinstance(condition.get("selector"), str) and isinstance(condition.get("value"), str):
                 expr = (
                     f"(()=>{{const n=document.querySelectorAll({json.dumps(condition['selector'])});"
-                    f"return n.length===1&&n[0].value==={json.dumps(condition['value'])};}})()"
+                    f"return n.length===1&&String(n[0].value??'')==={json.dumps(condition['value'])};}})()"
+                )
+                return self._eval(rec, expr) is True
+            if ctype == "checked_equals" and isinstance(condition.get("selector"), str) and type(condition.get("checked")) is bool:
+                expr = (
+                    f"(()=>{{const n=document.querySelectorAll({json.dumps(condition['selector'])});"
+                    f"return n.length===1&&Boolean(n[0].checked)==={json.dumps(condition['checked'])};}})()"
                 )
                 return self._eval(rec, expr) is True
             if isinstance(condition.get("text_present"), str):
@@ -1285,6 +1333,23 @@ class OwnerChromeHiddenSecondaryManager:
                 return self._eval(rec, f"!(document.body?.innerText||'').includes({json.dumps(condition['text_absent'])})") is True
             if isinstance(condition.get("url_contains"), str):
                 return self._eval(rec, f"location.href.includes({json.dumps(condition['url_contains'])})") is True
+            if isinstance(condition.get("target"), dict) and isinstance(condition["target"].get("selector"), str):
+                sel = condition["target"]["selector"]
+                if condition.get("state") == "absent":
+                    return self._eval(rec, f"document.querySelectorAll({json.dumps(sel)}).length===0") is True
+                if isinstance(condition.get("value"), str):
+                    expr = (
+                        f"(()=>{{const n=document.querySelectorAll({json.dumps(sel)});"
+                        f"return n.length===1&&String(n[0].value??'')==={json.dumps(condition['value'])};}})()"
+                    )
+                    return self._eval(rec, expr) is True
+                if type(condition.get("checked")) is bool:
+                    expr = (
+                        f"(()=>{{const n=document.querySelectorAll({json.dumps(sel)});"
+                        f"return n.length===1&&Boolean(n[0].checked)==={json.dumps(condition['checked'])};}})()"
+                    )
+                    return self._eval(rec, expr) is True
+                return self._eval(rec, f"document.querySelectorAll({json.dumps(sel)}).length===1") is True
             raise OwnerChromeSecondaryError("POSTCONDITION_INVALID", "unsupported postcondition format", attempted=False)
 
         while True:
@@ -1339,6 +1404,7 @@ class OwnerChromeHiddenSecondaryManager:
                 profile_dir_name=args.get("profile_dir_name"),
                 timeout_s=min(timeout, 5.0),
                 connect_ws=bool(args.get("connect_ws", False)),
+                allow_new_ws=bool(args.get("allow_new_ws", True)),
             )
         if op == "status":
             return self.status()
@@ -1568,6 +1634,64 @@ class OwnerChromeHiddenSecondaryManager:
                     time.sleep(0.05)
                 return {"tab_id": rec["tab_id"], "target_id": rec["target_id"], "url": rec["url"], "title": rec["title"], "navigated": True}
 
+            if op == "reload":
+                self._check_expected_host(rec, args.get("expected_host"))
+                reload_token = uuid.uuid4().hex
+                self._eval(rec, f"(()=>{{window.__ffhsec_reload={json.dumps(reload_token)};return true;}})()", timeout_s=3.0)
+                self._cdp.send(
+                    "Page.reload",
+                    {"ignoreCache": bool(args.get("ignore_cache", False))},
+                    session_id=rec["session_id"],
+                    timeout=min(timeout, 15.0),
+                )
+                rec["snapshot"] = None
+                dl = time.monotonic() + min(max(float(args.get("timeout_ms", 10000)) / 1000.0, 1.0), 30.0)
+                reloaded = False
+                while time.monotonic() < dl:
+                    try:
+                        ready = self._eval(
+                            rec,
+                            f"({{rs:document.readyState,url:location.href,title:document.title,reloaded:window.__ffhsec_reload!=={json.dumps(reload_token)}}})",
+                            timeout_s=3.0,
+                        )
+                    except OwnerChromeSecondaryError as exc:
+                        if exc.code in {"SCRIPT_FAILED", "OWNER_CHROME_CDP_REJECTED"}:
+                            time.sleep(0.05)
+                            continue
+                        raise
+                    if isinstance(ready, dict) and ready.get("reloaded") is True and ready.get("rs") in {"interactive", "complete"}:
+                        rec["url"] = str(ready.get("url") or rec["url"])
+                        rec["title"] = str(ready.get("title") or "")
+                        reloaded = True
+                        break
+                    time.sleep(0.05)
+                if not reloaded:
+                    raise OwnerChromeSecondaryError("NAVIGATION_FAILED", "reload did not complete", attempted=True, retry_safe=False)
+                return {
+                    "tab_id": rec["tab_id"],
+                    "target_id": rec["target_id"],
+                    "url": rec["url"],
+                    "title": rec["title"],
+                    "reloaded": True,
+                    "physical_input_used": False,
+                    "route": ROUTE_NAME,
+                }
+
+            if op == "wait_for":
+                self._check_expected_host(rec, args.get("expected_host"))
+                condition = args.get("condition")
+                t_s = min(max(float(args.get("timeout_ms", 5000)) / 1000.0, 0.2), 30.0)
+                ok = self._check_postcondition(rec, condition, timeout_s=t_s)
+                if not ok:
+                    raise OwnerChromeSecondaryError("WAIT_TIMEOUT", "the condition did not become true", retry_safe=True)
+                return {
+                    "tab_id": rec["tab_id"],
+                    "target_id": rec["target_id"],
+                    "satisfied": True,
+                    "url": rec["url"],
+                    "route": ROUTE_NAME,
+                }
+
             if op == "observe":
                 token = uuid.uuid4().hex
                 script = (
@@ -1577,7 +1701,10 @@ class OwnerChromeHiddenSecondaryManager:
                     "return {url:location.href,title:document.title,text:(document.body?.innerText||'').slice(0,16000),"
                     "controls:nodes.map((e,i)=>({ref:String(i),tag:e.tagName.toLowerCase(),type:e.type||'',id:e.id,"
                     "name:e.getAttribute('aria-label')||e.labels?.[0]?.innerText||e.innerText||e.name||'',"
-                    "value:e.value??null,disabled:!!e.disabled}))}})()"
+                    "value:e.isContentEditable?(e.textContent??''):(e.value??null),"
+                    "checked:(e.type==='checkbox'||e.type==='radio')?!!e.checked:null,"
+                    "selected_text:e.tagName==='SELECT'?(e.selectedOptions?.[0]?.textContent?.trim()??null):null,"
+                    "readonly:!!e.readOnly,disabled:!!e.disabled}))}})()"
                 )
                 data = self._eval(rec, script, timeout_s=min(timeout, 10.0))
                 rec["snapshot"] = token
@@ -1588,10 +1715,22 @@ class OwnerChromeHiddenSecondaryManager:
             if op == "read":
                 limit = min(max(int(args.get("max_chars", 32000)), 256), 200000)
                 selector = args.get("selector")
+                if not selector and isinstance(args.get("target"), dict) and isinstance(args["target"].get("selector"), str):
+                    selector = args["target"]["selector"]
                 if isinstance(selector, str) and selector:
                     expr = (
                         f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-                        "return {url:location.href,title:document.title,text:(e?.innerText??e?.textContent??'')};})()"
+                        "if(!e)return {url:location.href,title:document.title,text:''};"
+                        "const tag=String(e.tagName||'').toUpperCase();"
+                        "const typ=String(e.type||'').toLowerCase();"
+                        "if(tag==='INPUT'||tag==='TEXTAREA'){"
+                        "const chk=tag==='INPUT'&&(typ==='checkbox'||typ==='radio');"
+                        "return {url:location.href,title:document.title,text:chk?(e.checked?'checked':'unchecked'):String(e.value??''),"
+                        "value:String(e.value??''),...(chk?{checked:Boolean(e.checked)}:{})};}"
+                        "if(tag==='SELECT'){"
+                        "return {url:location.href,title:document.title,text:String(e.value??''),value:String(e.value??''),"
+                        "selected:[...(e.selectedOptions||[])].map(o=>o.value)};}"
+                        "return {url:location.href,title:document.title,text:(e.innerText??e.textContent??'')};})()"
                     )
                 else:
                     expr = "({url:location.href,title:document.title,text:(document.body?.innerText||'')})"
@@ -1599,6 +1738,7 @@ class OwnerChromeHiddenSecondaryManager:
                 text = str(data.get("text") or "")
                 rec["url"] = str(data.get("url") or rec["url"])
                 rec["title"] = str(data.get("title") or rec["title"])
+                extra = {k: data[k] for k in ("value", "checked", "selected") if k in data}
                 return {
                     "tab_id": rec["tab_id"],
                     "target_id": rec["target_id"],
@@ -1607,37 +1747,84 @@ class OwnerChromeHiddenSecondaryManager:
                     "text": text[:limit],
                     "truncated": len(text) > limit,
                     "route": ROUTE_NAME,
+                    **extra,
                 }
 
             if op == "act":
                 if args.get("foreground") is True:
                     raise OwnerChromeSecondaryError("FOREGROUND_ROUTE_REQUIRED", "never falls back to foreground", attempted=False)
+                self._check_expected_host(rec, args.get("expected_host"))
                 operation = str(args.get("operation") or args.get("action") or "")
-                if operation not in {"fill", "click", "select"}:
+                if operation not in {"fill", "click", "select", "check", "uncheck", "press"}:
                     raise OwnerChromeSecondaryError("ACTION_INVALID", f"unsupported action: {operation}", attempted=False)
-                value = str(args.get("value") or "")
-                if len(value) > 16000:
-                    raise OwnerChromeSecondaryError("ACTION_INVALID", "value too long", attempted=False)
+                raw_value = args.get("value")
+                if operation == "select" and isinstance(raw_value, list):
+                    select_values = [str(item) for item in raw_value]
+                    if not select_values or sum(len(item) for item in select_values) > 16000:
+                        raise OwnerChromeSecondaryError("ACTION_INVALID", "invalid select values", attempted=False)
+                    value_payload: Any = select_values
+                else:
+                    value = str("" if raw_value is None else raw_value)
+                    if len(value) > 16000:
+                        raise OwnerChromeSecondaryError("ACTION_INVALID", "value too long", attempted=False)
+                    value_payload = value
+                key = args.get("key")
+                if operation == "press" and (not isinstance(key, str) or not key or len(key) > 64):
+                    raise OwnerChromeSecondaryError("KEY_REQUIRED", "press requires a non-empty key string", attempted=False)
                 condition = args.get("postcondition")
                 if condition is not None and not isinstance(condition, dict):
                     raise OwnerChromeSecondaryError("POSTCONDITION_INVALID", "postcondition must be a dict", attempted=False)
 
+                target = args.get("target") if isinstance(args.get("target"), dict) else {}
                 selector = args.get("selector")
-                if isinstance(args.get("target"), dict) and isinstance(args["target"].get("selector"), str):
-                    selector = args["target"]["selector"]
+                if not selector and isinstance(target.get("selector"), str):
+                    selector = target["selector"]
+                snap = args.get("snapshot")
+                ref = args.get("ref") if args.get("ref") is not None else target.get("ref")
+                target_id_attr = target.get("id")
+                target_name_attr = target.get("name")
+                target_label = target.get("label")
 
-                if selector:
+                has_explicit_target = bool(
+                    selector or ref is not None or target_id_attr or target_name_attr or target_label
+                )
+                if operation == "press" and not has_explicit_target:
+                    locate_js = "const e=document.activeElement||document.body;if(!e)return {error:'TARGET_NOT_FOUND'};"
+                elif selector:
                     if not isinstance(selector, str) or len(selector) > 512:
                         raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid selector", attempted=False)
                     locate_js = (
                         f"const nodes=document.querySelectorAll({json.dumps(selector)});"
                         "if(nodes.length===0)return {error:'TARGET_NOT_FOUND'};"
                         "if(nodes.length>1)return {error:'TARGET_AMBIGUOUS'};"
-                        "const e=nodes[0];if(!e.isConnected||e.disabled)return {error:'TARGET_STALE'};"
+                        "const e=nodes[0];if(!e.isConnected)return {error:'TARGET_STALE'};"
+                        "if(e.disabled)return {error:'TARGET_DISABLED'};"
+                    )
+                elif isinstance(target_id_attr, str) and target_id_attr:
+                    locate_js = (
+                        f"const e=document.getElementById({json.dumps(target_id_attr)});"
+                        "if(!e)return {error:'TARGET_NOT_FOUND'};"
+                        "if(e.disabled)return {error:'TARGET_DISABLED'};"
+                    )
+                elif isinstance(target_name_attr, str) and target_name_attr:
+                    locate_js = (
+                        f"const nodes=[...document.getElementsByName({json.dumps(target_name_attr)})];"
+                        "if(nodes.length===0)return {error:'TARGET_NOT_FOUND'};"
+                        "if(nodes.length>1)return {error:'TARGET_AMBIGUOUS'};"
+                        "const e=nodes[0];if(e.disabled)return {error:'TARGET_DISABLED'};"
+                    )
+                elif isinstance(target_label, str) and target_label:
+                    locate_js = (
+                        f"const wantLabel={json.dumps(target_label.strip())};"
+                        "const nodes=[...document.querySelectorAll('input,textarea,select,button,[contenteditable=true]')].filter(el=>{"
+                        "const al=(el.getAttribute('aria-label')||'').trim();"
+                        "const lt=[...(el.labels||[])].map(l=>(l.innerText||l.textContent||'').trim());"
+                        "return al===wantLabel||lt.includes(wantLabel);});"
+                        "if(nodes.length===0)return {error:'TARGET_NOT_FOUND'};"
+                        "if(nodes.length>1)return {error:'TARGET_AMBIGUOUS'};"
+                        "const e=nodes[0];if(e.disabled)return {error:'TARGET_DISABLED'};"
                     )
                 else:
-                    snap = args.get("snapshot")
-                    ref = args.get("ref")
                     if not isinstance(snap, str) or rec.get("snapshot") != snap or not isinstance(ref, str) or not re.fullmatch(r"[0-9]{1,3}", ref):
                         raise OwnerChromeSecondaryError("TARGET_STALE", "stale snapshot or invalid ref", attempted=False)
                     locate_js = (
@@ -1645,24 +1832,110 @@ class OwnerChromeHiddenSecondaryManager:
                         f"const e=s.nodes[{ref}];if(!e||!e.isConnected||e.disabled)return {{error:'TARGET_STALE'}};"
                     )
 
+                expected_host = args.get("expected_host")
+                host_guard_js = ""
+                if expected_host is not None:
+                    want_host = str(expected_host).strip().lower().rstrip(".")
+                    host_guard_js = (
+                        f"const curHost=(location.hostname||'').toLowerCase().replace(/\\.+$/,'');"
+                        f"if(curHost!=={json.dumps(want_host)})return {{error:'TAB_HOST_CHANGED',actual_host:curHost}};"
+                    )
+
+                dom_click_js = (
+                    "const box=e.getBoundingClientRect();"
+                    "const init={bubbles:true,cancelable:true,composed:true,view:window,button:0,"
+                    "clientX:box.left+box.width/2,clientY:box.top+box.height/2};"
+                    "for(const [t,c] of [['pointerover','PointerEvent'],['mouseover','MouseEvent'],['pointerdown','PointerEvent'],['mousedown','MouseEvent']])"
+                    "if(typeof window[c]==='function')e.dispatchEvent(new window[c](t,{...init,buttons:1}));"
+                    "if(typeof e.focus==='function')e.focus({preventScroll:true});"
+                    "for(const [t,c] of [['pointerup','PointerEvent'],['mouseup','MouseEvent']])"
+                    "if(typeof window[c]==='function')e.dispatchEvent(new window[c](t,init));"
+                    "e.click();"
+                )
+
                 action_js = {
                     "fill": (
-                        "if(e.type==='file'||!['INPUT','TEXTAREA'].includes(e.tagName))return {error:'ACTION_INVALID'};"
-                        "const setter=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(e),'value')?.set;"
-                        f"if(setter)setter.call(e,{json.dumps(value)});else e.value={json.dumps(value)};"
-                        "e.dispatchEvent(new Event('input',{bubbles:true}));"
-                        "e.dispatchEvent(new Event('change',{bubbles:true}));"
+                        "if(e.readOnly)return {error:'TARGET_NOT_EDITABLE'};"
+                        "const tag=e.tagName;"
+                        "const typ=String(e.type||'').toLowerCase();"
+                        "const badInput=['button','submit','reset','image','checkbox','radio','file','hidden'].includes(typ);"
+                        "if((tag==='INPUT'&&badInput)||(!['INPUT','TEXTAREA'].includes(tag)&&!e.isContentEditable))"
+                        "return {error:'TARGET_NOT_EDITABLE'};"
+                        "if(typeof e.focus==='function')e.focus({preventScroll:true});"
+                        f"const val={json.dumps(value_payload)};"
+                        "if(e.isContentEditable){e.textContent=val;}else{"
+                        "const proto=tag==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype;"
+                        "const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;"
+                        "if(setter)setter.call(e,val);else e.value=val;}"
+                        "const ie=typeof InputEvent==='function'?new InputEvent('input',{bubbles:true,composed:true,inputType:'insertText',data:val}):new Event('input',{bubbles:true,composed:true});"
+                        "e.dispatchEvent(ie);e.dispatchEvent(new Event('change',{bubbles:true}));"
+                        "const detail={mode:'dom-value-setter'};"
                     ),
-                    "click": "e.click();",
+                    "click": dom_click_js + "const detail={mode:'dom-click'};",
                     "select": (
-                        "if(e.tagName!=='SELECT')return {error:'ACTION_INVALID'};"
-                        f"e.value={json.dumps(value)};e.dispatchEvent(new Event('change',{{bubbles:true}}));"
+                        "if(e.tagName!=='SELECT')return {error:'TARGET_NOT_SELECT'};"
+                        f"const rawVals={json.dumps(value_payload)};"
+                        "const wanted=Array.isArray(rawVals)?rawVals.map(String):[String(rawVals)];"
+                        "if(!wanted.length||(!e.multiple&&wanted.length>1))return {error:'ACTION_INVALID'};"
+                        "const opts=[...e.options];const matched=[];"
+                        "for(const w of wanted){const opt=opts.find(o=>!o.disabled&&o.value===w)||opts.find(o=>!o.disabled&&String(o.textContent||'').trim()===w);"
+                        "if(!opt)return {error:'OPTION_NOT_FOUND'};matched.push(opt);}"
+                        "if(typeof e.focus==='function')e.focus({preventScroll:true});"
+                        "if(e.multiple){const picked=new Set(matched);for(const o of opts)o.selected=picked.has(o);}"
+                        "else{for(const o of opts)o.selected=(o===matched[0]);e.value=matched[0].value;}"
+                        "e.dispatchEvent(new Event('input',{bubbles:true,composed:true}));"
+                        "e.dispatchEvent(new Event('change',{bubbles:true}));"
+                        "const detail={mode:'dom-select',selected:[...(e.selectedOptions||opts.filter(o=>o.selected))].map(o=>o.value)};"
+                    ),
+                    "check": (
+                        "const tag=e.tagName;const typ=String(e.type||'').toLowerCase();"
+                        "const role=String(e.getAttribute?.('role')||'').toLowerCase();"
+                        "const isNative=tag==='INPUT'&&(typ==='checkbox'||typ==='radio');"
+                        "const isAria=['checkbox','radio','switch'].includes(role);"
+                        "if(!isNative&&!isAria)return {error:'TARGET_NOT_EDITABLE'};"
+                        "const cur=isNative?Boolean(e.checked):e.getAttribute('aria-checked')==='true';"
+                        "if(!cur){" + dom_click_js + "}"
+                        "const after=isNative?Boolean(e.checked):e.getAttribute('aria-checked')==='true';"
+                        "if(!after)return {error:'ACTION_NO_EFFECT',attempted:true};"
+                        "const detail={mode:'dom-check',checked:true};"
+                    ),
+                    "uncheck": (
+                        "const tag=e.tagName;const typ=String(e.type||'').toLowerCase();"
+                        "const role=String(e.getAttribute?.('role')||'').toLowerCase();"
+                        "if((tag==='INPUT'&&typ==='radio')||role==='radio')return {error:'TARGET_NOT_EDITABLE'};"
+                        "const isNative=tag==='INPUT'&&typ==='checkbox';"
+                        "const isAria=['checkbox','switch'].includes(role);"
+                        "if(!isNative&&!isAria)return {error:'TARGET_NOT_EDITABLE'};"
+                        "const cur=isNative?Boolean(e.checked):e.getAttribute('aria-checked')==='true';"
+                        "if(cur){" + dom_click_js + "}"
+                        "const after=isNative?Boolean(e.checked):e.getAttribute('aria-checked')==='true';"
+                        "if(after)return {error:'ACTION_NO_EFFECT',attempted:true};"
+                        "const detail={mode:'dom-check',checked:false};"
+                    ),
+                    "press": (
+                        f"const k={json.dumps(key or '')};"
+                        "const kinit={key:k,code:k.length===1?'Key'+k.toUpperCase():k,bubbles:true,cancelable:true,composed:true};"
+                        "const proceed=e.dispatchEvent(new KeyboardEvent('keydown',kinit));"
+                        "e.dispatchEvent(new KeyboardEvent('keyup',kinit));"
+                        "let detail='dispatched';"
+                        "if(!proceed){detail='prevented_by_page';}"
+                        "else if(k==='Enter'&&e.tagName!=='TEXTAREA'&&e.form&&typeof e.form.requestSubmit==='function'){"
+                        "const isSub=(e.tagName==='BUTTON'&&(e.type||'submit')==='submit')||(e.tagName==='INPUT'&&['submit','image'].includes(String(e.type||'').toLowerCase()));"
+                        "if(isSub)e.form.requestSubmit(e);else e.form.requestSubmit();detail='form_submitted';}"
                     ),
                 }[operation]
+                url_before = rec["url"]
                 rec["snapshot"] = None
-                outcome = self._eval(rec, "(()=>{" + locate_js + action_js + "return {acted:true,url:location.href,title:document.title};})()", timeout_s=min(timeout, 10.0))
+                outcome = self._eval(
+                    rec,
+                    "(()=>{" + host_guard_js + locate_js + action_js + "return {acted:true,url:location.href,title:document.title,detail:detail};})()",
+                    timeout_s=min(timeout, 10.0),
+                )
                 if not isinstance(outcome, dict) or outcome.get("error"):
-                    raise OwnerChromeSecondaryError(str((outcome or {}).get("error") or "ACTION_FAILED"), attempted=False, retry_safe=False)
+                    err_code = str((outcome or {}).get("error") or "ACTION_FAILED")
+                    was_attempted = bool((outcome or {}).get("attempted", False))
+                    extra_err = {k: v for k, v in (outcome or {}).items() if k not in {"error", "attempted"}}
+                    raise OwnerChromeSecondaryError(err_code, attempted=was_attempted, retry_safe=False, **extra_err)
                 rec["url"] = str(outcome.get("url") or rec["url"])
                 rec["title"] = str(outcome.get("title") or rec["title"])
                 verified = True
@@ -1675,15 +1948,21 @@ class OwnerChromeHiddenSecondaryManager:
                     "acted": True,
                     "verified": verified,
                     "action": operation,
+                    "detail": outcome.get("detail"),
                     "tab_id": rec["tab_id"],
                     "target_id": rec["target_id"],
                     "url": rec["url"],
+                    "url_before": url_before,
+                    "url_after": rec["url"],
+                    "navigated": url_before != rec["url"],
                     "title": rec["title"],
+                    "trusted_input": False,
                     "physical_input_used": False,
                     "route": ROUTE_NAME,
                 }
 
             if op == "evaluate":
+                self._check_expected_host(rec, args.get("expected_host"))
                 expr = args.get("expression")
                 if not isinstance(expr, str) or not expr or len(expr) > 32768:
                     raise OwnerChromeSecondaryError("SCRIPT_INVALID", "invalid expression", attempted=False)

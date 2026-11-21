@@ -73,6 +73,51 @@ credentials нужен явный `session_resume`; старые credentials о�
 с `version:1, enabled:true`. Выключенный/повреждённый флаг даёт отказ без запуска;
 сам адаптер флаг не создаёт. Потерянный запрос после старта не повторяется.
 
+## Чтение сайта без прерывания (`site_read`)
+
+Для сценария «прочитать конкретный сайт без прерывания владельца и без запросов»
+предусмотрена read-only операция `site_read` (в MCP, Hub RPC, `/agent/v1` при
+scope `owner_chrome_hidden` и локальном CLI `ff_hub.py site-read`):
+
+- **Через MCP (`ff-universal-hub`):**
+  1. Проверка готовности без UI и без создания pending-запросов:
+     `{"op":"route_plan","args":{"surface":"browser","capability":"background_tab_read","url":"https://<site-host>/<path>","visibility":"background_tab"}}`
+     (для строгой невидимости укажите `"visibility":"strict_invisible"` или `"strict_invisibility":true`).
+  2. Выполнение read-only чтения с автоматическим открытием, проверкой хоста после редиректа, чтением (`read_mode: "read"|"observe"|"snapshot"`) и закрытием своей вкладки/цели в `finally`:
+     `{"op":"site_read","task_id":"<unique task>","request_key":"site-read-0001","args":{"command":"read","url":"https://<site-host>/<path>","visibility":"background_tab","read_mode":"read"}}`.
+- **Через пользовательский CLI:**
+  ```text
+  python ff_hub.py --state-dir <Bridge root>/state/hub site-read --url https://<site-host>/<path> --visibility background_tab --mode read
+  python ff_hub.py --state-dir <Bridge root>/state/hub site-read --url https://<site-host>/<path> --strict-invisibility --plan-only
+  ```
+  Если подходящего уже авторизованного и подключённого провайдера нет, CLI сразу
+  возвращает код выхода `2` и один JSON-отчёт возможностей (`NO_ELIGIBLE_NO_INTERRUPTION_PROVIDER`)
+  без открытия сессии, без UI и без pending-запросов. При успехе (`0`) выполняется
+  чтение и закрываются как вкладка/цель (`teardown.cleanup_verified`), так и временная
+  сессия (`session_cleanup.cleanup_verified`).
+
+Режим `strict_invisible` никогда не подставляет видимую фоновую вкладку
+`owner_chrome_extension` (`VISIBLE_TAB_SUBSTITUTION_FORBIDDEN`). FF Browser Companion
+`0.1.1` поддерживает только `downloads` и `nativeMessaging` и никогда не выбирается
+для чтения страниц.
+
+## Фоновые операции с формами в собственных вкладках
+
+Для заполнения, редактирования, сохранения и перезагрузки форм в уже авторизованных
+собственных вкладках без foreground-ввода и без изменения политики доступа:
+
+1. Проверьте готовность провайдера без UI и без pending-запросов:
+   `{"op":"route_plan","args":{"surface":"browser","capability":"background_tab_form","url":"https://<site-host>/<path>","visibility":"background_tab"}}`
+   (или `"visibility":"strict_invisible"` для исключительно невидимой цели `owner_chrome_hidden`).
+2. В рамках сессии (`session_open`) работайте со своей вкладкой через `owner_chrome_hidden` или `browser`:
+   - `open` (с `request_key`), `observe` / `snapshot`, `read`;
+   - `act` с `request_key`: `fill`, `select`, `check`, `uncheck`, `click`, `press` (с `postcondition`, `foreground: true` запрещён);
+   - для проверки без дублирования отправки после обрыва вызывайте `request_status` с тем же `request_key`; повтор того же ключа с тем же payload возвращает `deduplicated: true` без повторного нажатия;
+   - `reload` (с `request_key`) и повторные `wait_for` / `read` / `observe` для независимой проверки сохранённых данных;
+   - закрытие только своей вкладки и `session_close` с проверкой `cleanup_verified: true`, `resources_retained: 0`.
+
+Операция `site_read` остаётся строго read-only и не принимает мутирующие аргументы форм.
+
 ## Файлы и терминал
 
 `files` поддерживает `read`, `stat`, `write`, абсолютный `path`, UTF-8 до 1 MiB.

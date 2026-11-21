@@ -144,7 +144,14 @@ export function backgroundExtensionPreflight({userDataDir, profileDirName} = {})
     if (versions.some(version => !versionAtLeast(version, MIN_BACKGROUND_EXTENSION)))
       throw new HubError('BACKGROUND_EXTENSION_UNSUPPORTED', 'the selected extension does not support background mode',
         {required: MIN_BACKGROUND_EXTENSION.join('.'), versions});
-    return {profile_dir_name: profile, user_data_dir: root, extension_version: versions[0]};
+    const declaredPerms = records.map(record => record.manifest?.permissions).filter(Array.isArray);
+    if (declaredPerms.length && declaredPerms.some(perms =>
+        !perms.includes('tabs') || (!perms.includes('debugger') && !perms.includes('scripting'))))
+      throw new HubError('BACKGROUND_EXTENSION_PERMISSIONS_INSUFFICIENT',
+        'the selected extension manifest does not declare tab and page read/automation permissions');
+    const extensionPermissions = declaredPerms.length ? [...new Set(declaredPerms.flat().map(String))].sort() : null;
+    return {profile_dir_name: profile, user_data_dir: root, extension_version: versions[0],
+      ...(extensionPermissions ? {extension_permissions: extensionPermissions} : {})};
   }
   throw new HubError('BACKGROUND_EXTENSION_UNVERIFIED', 'no verified Playwright extension in the selected profile');
 }
@@ -261,7 +268,9 @@ export function extensionConnector({playwrightRoot, profileDirName, clientName =
       {playwright: runtime.version, required: MIN_BACKGROUND_PLAYWRIGHT.join('.')});
   let binding = null;
   return {
-    describe: () => ({transport: 'playwright-extension', playwright: runtime.version, background,
+    describe: () => ({transport: 'playwright-extension', extension_id: PLAYWRIGHT_EXTENSION_ID,
+      playwright: runtime.version, background, activates_tab: !background,
+      read_supported: true, form_operations_supported: true, ownership_supported: true,
       hidden_secondary_window_supported: false, visible_tab_strip: true,
       owner_profile: binding?.profile || profileDirName || 'last-used', profile_pinned: Boolean(binding), isolated_profile: false}),
     async connect() {
@@ -322,8 +331,11 @@ function domPress(element, key) {
   const init = {key, code: key.length === 1 ? `Key${key.toUpperCase()}` : key, bubbles: true, cancelable: true, composed: true};
   const proceed = target.dispatchEvent(new KeyboardEvent('keydown', init));
   target.dispatchEvent(new KeyboardEvent('keyup', init));
-  if (proceed && key === 'Enter' && target.form && typeof target.form.requestSubmit === 'function') {
-    target.form.requestSubmit();
+  if (proceed && key === 'Enter' && target.tagName !== 'TEXTAREA' && target.form && typeof target.form.requestSubmit === 'function') {
+    const isSubmitter = (target.tagName === 'BUTTON' && (target.type || 'submit') === 'submit') ||
+      (target.tagName === 'INPUT' && ['submit', 'image'].includes(String(target.type || '').toLowerCase()));
+    if (isSubmitter) target.form.requestSubmit(target);
+    else target.form.requestSubmit();
     return 'form_submitted';
   }
   return proceed ? 'dispatched' : 'prevented_by_page';
@@ -346,6 +358,34 @@ function domFill(element, value) {
   element.dispatchEvent(new view.InputEvent('input', {bubbles: true, composed: true, inputType: 'insertText', data: value}));
   element.dispatchEvent(new view.Event('change', {bubbles: true}));
   return {mode: 'dom-value-setter'};
+}
+
+function domSelect(element, rawValues) {
+  const view = element.ownerDocument.defaultView;
+  const isSelect = (view?.HTMLSelectElement && element instanceof view.HTMLSelectElement) || element.tagName === 'SELECT';
+  if (!isSelect) return {error: 'TARGET_NOT_SELECT'};
+  const wanted = Array.isArray(rawValues) ? rawValues.map(String) : [String(rawValues ?? '')];
+  if (!wanted.length || (!element.multiple && wanted.length > 1)) return {error: 'ACTION_INVALID'};
+  const options = [...element.options];
+  const matched = [];
+  for (const val of wanted) {
+    const opt = options.find(o => !o.disabled && o.value === val) ||
+      options.find(o => !o.disabled && String(o.textContent || '').trim() === val);
+    if (!opt) return {error: 'OPTION_NOT_FOUND'};
+    matched.push(opt);
+  }
+  if (typeof element.focus === 'function') element.focus({preventScroll: true});
+  if (element.multiple) {
+    const picked = new Set(matched);
+    for (const opt of options) opt.selected = picked.has(opt);
+  } else {
+    for (const opt of options) opt.selected = opt === matched[0];
+    element.value = matched[0].value;
+  }
+  element.dispatchEvent(new view.Event('input', {bubbles: true, composed: true}));
+  element.dispatchEvent(new view.Event('change', {bubbles: true}));
+  const selected = [...(element.selectedOptions || options.filter(o => o.selected))].map(o => o.value);
+  return {mode: 'dom-select', selected};
 }
 
 export class BrowserHub {
@@ -1083,6 +1123,29 @@ export class BrowserHub {
     });
   }
 
+  async reload({owner, tab_id, timeout_ms, expected_host}) {
+    const tab = this._live(owner, tab_id);
+    return this._serial(tab, async () => {
+      this._checkHost(tab.page, expected_host);
+      const timeout = Math.min(Math.max(Number(timeout_ms ?? 30000), 1000), 120000);
+      try {
+        await tab.page.reload({waitUntil: 'domcontentloaded', timeout});
+      } catch (error) {
+        throw new HubError('NAVIGATION_FAILED', 'reload did not complete', {
+          cause: brief(error), url: tab.url, attempted: true, retry_safe: false,
+        });
+      }
+      tab.url = tab.page.url();
+      tab.title = await tab.page.title().catch(() => '');
+      this._persist();
+      return {
+        ...this._describe(tab),
+        reloaded: true,
+        visibility: await tab.page.evaluate(() => document.visibilityState).catch(() => null),
+      };
+    });
+  }
+
   async snapshot({owner, tab_id, max_chars}) {
     const tab = this._live(owner, tab_id);
     return this._serial(tab, async () => {
@@ -1102,11 +1165,43 @@ export class BrowserHub {
     const tab = this._live(owner, tab_id);
     return this._serial(tab, async () => {
       const limit = Math.min(Math.max(Number(max_chars ?? 60000), 100), 400000);
-      const text = target
-        ? await (await this._locate(tab, target)).evaluate(element => element.innerText ?? element.textContent ?? '')
-        : await tab.page.evaluate(() => document.body?.innerText ?? '');
+      let text = '';
+      let extra = {};
+      if (target) {
+        const raw = await (await this._locate(tab, target)).evaluate(element => {
+          const tag = String(element.tagName || '').toUpperCase();
+          const type = String(element.type || '').toLowerCase();
+          if (tag === 'INPUT' || tag === 'TEXTAREA') {
+            const isCheckable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');
+            return {
+              text: isCheckable ? (element.checked ? 'checked' : 'unchecked') : String(element.value ?? ''),
+              value: String(element.value ?? ''),
+              ...(isCheckable ? {checked: Boolean(element.checked)} : {}),
+            };
+          }
+          if (tag === 'SELECT') {
+            const selected = [...(element.selectedOptions || [])].map(o => o.value);
+            return {
+              text: String(element.value ?? ''),
+              value: String(element.value ?? ''),
+              selected,
+            };
+          }
+          return {text: String(element.innerText ?? element.textContent ?? '')};
+        });
+        if (typeof raw === 'string') {
+          text = raw;
+        } else if (raw && typeof raw === 'object') {
+          text = String(raw.text ?? '');
+          if ('value' in raw) extra.value = raw.value;
+          if ('checked' in raw) extra.checked = raw.checked;
+          if ('selected' in raw) extra.selected = raw.selected;
+        }
+      } else {
+        text = String(await tab.page.evaluate(() => document.body?.innerText ?? '') ?? '');
+      }
       return {tab_id: tab.id, url: tab.page.url(), title: await tab.page.title().catch(() => ''),
-        truncated: text.length > limit, text: text.slice(0, limit)};
+        truncated: text.length > limit, text: text.slice(0, limit), ...extra};
     });
   }
 
@@ -1132,11 +1227,33 @@ export class BrowserHub {
           detail = await locator.evaluate(domFill, String(value ?? ''));
           if (detail?.error) throw new HubError(detail.error, 'the target cannot be filled through DOM input', {attempted: false});
         }
-        else if (action === 'select') detail = await locator.selectOption(Array.isArray(value) ? value.map(String) : String(value), {timeout: 10000});
+        else if (action === 'select') {
+          detail = await locator.evaluate(domSelect, value);
+          if (detail?.error) throw new HubError(detail.error, 'the target cannot be selected through DOM input', {attempted: false});
+        }
         else if (action === 'check' || action === 'uncheck') {
           const want = action === 'check';
+          const checkable = await locator.evaluate(element => {
+            const tag = String(element.tagName || '').toUpperCase();
+            const type = String(element.type || '').toLowerCase();
+            if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {
+              return {ok: true, radio: type === 'radio'};
+            }
+            const role = String(element.getAttribute?.('role') || '').toLowerCase();
+            if (['checkbox', 'radio', 'switch'].includes(role)) {
+              return {ok: true, radio: role === 'radio'};
+            }
+            return {ok: false, radio: false};
+          });
+          if (checkable && typeof checkable === 'object') {
+            if (!checkable.ok)
+              throw new HubError('TARGET_NOT_EDITABLE', 'the target is not a checkbox, radio, or switch', {attempted: false});
+            if (!want && checkable.radio)
+              throw new HubError('TARGET_NOT_EDITABLE', 'a radio input cannot be unchecked directly', {attempted: false});
+          }
           if ((await locator.isChecked()) !== want) await locator.evaluate(domClick);
           if ((await locator.isChecked()) !== want) throw new HubError('ACTION_NO_EFFECT', 'the control did not change state', {attempted: true});
+          detail = {mode: 'dom-check', checked: want};
         } else if (action === 'press') {
           if (typeof key !== 'string' || !key) throw new HubError('KEY_REQUIRED');
           detail = locator ? await locator.evaluate(domPress, key) : await page.evaluate(k => {
@@ -1144,7 +1261,13 @@ export class BrowserHub {
             const init = {key: k, bubbles: true, cancelable: true, composed: true};
             const proceed = el.dispatchEvent(new KeyboardEvent('keydown', init));
             el.dispatchEvent(new KeyboardEvent('keyup', init));
-            if (proceed && k === 'Enter' && el.form?.requestSubmit) { el.form.requestSubmit(); return 'form_submitted'; }
+            if (proceed && k === 'Enter' && el.tagName !== 'TEXTAREA' && el.form?.requestSubmit) {
+              const isSubmitter = (el.tagName === 'BUTTON' && (el.type || 'submit') === 'submit') ||
+                (el.tagName === 'INPUT' && ['submit', 'image'].includes(String(el.type || '').toLowerCase()));
+              if (isSubmitter) el.form.requestSubmit(el);
+              else el.form.requestSubmit();
+              return 'form_submitted';
+            }
             return proceed ? 'dispatched' : 'prevented_by_page';
           }, key);
         } else throw new HubError('ACTION_UNSUPPORTED', 'use click, fill, select, check, uncheck or press', {action});
@@ -1266,6 +1389,7 @@ export class BrowserHub {
       case 'tab_close_owner': return this.tabCloseOwner(args);
       case 'tab_restore': return this.tabRestore(args);
       case 'navigate': return this.navigate(args);
+      case 'reload': return this.reload(args);
       case 'snapshot': return this.snapshot(args);
       case 'read': return this.read(args);
       case 'act': return this.act(args);

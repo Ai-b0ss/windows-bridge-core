@@ -162,6 +162,46 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
 | **Дополнительный изолированный:** `managed_browser` / `private_browser` (`persistent_playwright` / `private_cdp`) | Отдельный изолированный/персистентный профиль агента для задач без сессии владельца | **Нет** (`satisfies_owner_profile_auth: false`) | **Нет** (headless / Win32 Private Desktop) | **Запрещён** (`isolated_substitution_forbidden: true`) |
 | **Явный видимый extension:** `browser` (`owner_chrome_extension` / `ff_browser_hub.mjs`) | Работа через Playwright Chrome Extension в видимой группе вкладок Chrome | **Да** (через расширение Chrome) | **Да** (`visible_tab_strip: true`, `hidden_secondary_window_supported: false`) | **Запрещён** (`OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT`) |
 
+### 4.4 Пользовательский режим чтения сайта без прерывания (`site_read`) и ограничения доступности
+
+Для чтения конкретного запрошенного URL (`http`/`https`) **только для чтения и без прерывания владельца** предусмотрен единый пользовательский маршрут `site_read` (Hub RPC/MCP `op: "site_read"`, планирование `route_plan(capability="background_tab_read", url=...)`, локальный CLI `ff_hub.py site-read --url <url>` и `/agent/v1` для scope `owner_chrome_hidden`):
+
+1. **Только уже авторизованные и подключённые поддерживаемые провайдеры:**
+   - Проверка выполняется до любого UI, запуска браузера, нового WebSocket-рукопожатия (`allow_new_ws=false`) и создания pending-запросов Hub (`pending_request_created: false`).
+   - Все существующие разрешения и настройки сохраняются неизменными: маршрут никогда не выполняет авто-одобрение, обход проверок, изменение настроек Chrome, добавление stealth-режимов или извлечение cookies/учётных данных/токенов сессии.
+   - Мутирующие и запрещённые аргументы (`act`, `evaluate`, `foreground`, `auto_approve`, `stealth`, `extract_cookies`, `copy_profile` и др.) отклоняются fail-closed (`SITE_READ_ARG_FORBIDDEN`).
+2. **Строгое разделение видимости запроса:**
+   - **Обычная фоновая вкладка без запросов пользователю (`visibility: "background_tab"`, `strict_invisibility: false`):** сначала проверяет уже подключённый `owner_chrome_profile1_hidden_secondary`, а при его недоступности может выбрать `owner_chrome_extension` **только если подтверждены все 5 условий**: локальная политика Hub (`browser_own_tabs` + `read_diagnose`), активное подключение (`connected=true`, `stopping=false`, `circuit_open=false`), открытие в фоне без активации (`background=true`, `activates_tab=false`, `isolated_profile=false`), подтверждённое чтение и совместимый манифест расширения (исключая downloads-only), а также доказуемое владение вкладками (`tab_ledger.enabled=true` без ошибок и корректные лимиты).
+   - **Строгая невидимость (`visibility: "strict_invisible"` или `strict_invisibility: true`):** допускает исключительно windowless-цель `owner_chrome_profile1_hidden_secondary`; видимая фоновая вкладка `owner_chrome_extension` **никогда не подставляется** (`VISIBLE_TAB_SUBSTITUTION_FORBIDDEN`).
+3. **Единый понятный результат при отсутствии подходящего провайдера:**
+   - Если ни один поддерживаемый провайдер не готов, `site_read` немедленно возвращает **один** структурированный результат возможностей (`schema: "ff-no-interruption-site-read-v1"`, `error_code: "NO_ELIGIBLE_NO_INTERRUPTION_PROVIDER"`, `providers`, `excluded_providers`, `actionable_next_steps`, `ui_triggered: false`, `prompts_triggered: false`, `pending_request_created: false`) до любого UI или pending-запроса.
+4. **Оставшиеся ограничения доступности (честные границы):**
+   - **Отсутствие подключения без диалога при закрытом соединении:** в Chrome 158+ с `chrome://inspect/#remote-debugging` (HTTP 404 `/json/version`) маршрут `owner_chrome_profile1_hidden_secondary` требует как локальный site-scoped grant Hub (Рубеж 1), так и уже одобренное активное loopback CDP WebSocket-соединение (Рубеж 2); если WebSocket ещё не открыт, `site_read` не инициирует подключение и не вызывает нативный диалог Chrome.
+   - **Предварительно подключённый relay для `owner_chrome_extension`:** выбор `owner_chrome_extension` возможен только при уже запущенном и подключённом в фоне `ff_browser_hub.mjs` (Chrome `>= 158.0.8127.2`, Playwright Extension `>= 0.5.0`, Playwright `1.65.1`, исправный `tab-ledger.json`, разрешённые классы Hub). Такой провайдер добавляет неактивную вкладку в видимую полосу вкладок Chrome (`visible_tab_strip: true`), поэтому непригоден для `strict_invisible`.
+   - **FF Browser Companion `0.1.1`:** фактический манифест содержит только `downloads` и `nativeMessaging`; расширение не умеет открывать вкладки или читать страницы (`COMPANION_DOWNLOADS_AND_NATIVE_MESSAGING_ONLY`).
+   - **Неуправляемые сторонние расширения (например, сторонние браузерные расширения ИИ-ассистентов):** не управляются брокером Hub, не дают доказуемого владения, неактивации и очистки (`PROVIDER_UNMANAGED_NO_BROKER_OWNERSHIP`) и никогда не перехватываются.
+   - **Изолированные профили (`managed_browser` / `private_browser`):** не наследуют авторизацию профиля Chrome владельца (`ISOLATED_PROFILE_SUBSTITUTION_FORBIDDEN`) и не подставляются молча.
+   - **Контекст профиля и редиректы:** смена `defaultBrowserContextId` в многопрофильном Chrome приводит к отказу `OWNER_CHROME_PROFILE_CONTEXT_MISMATCH`; перенаправление страницы на хост вне действующего разрешения приводит к отказу `REDIRECT_HOST_NOT_GRANTED` с сокрытием содержимого (`content_withheld: true`) и гарантированным закрытием вкладки/цели.
+   - **Потеря подтверждения закрытия:** при разрыве связи во время закрытия запись владения удерживается fail-closed (`cleanup_verified: false`, `resources_retained: 1`) и никогда не списывается как закрытая.
+
+### 4.5 Фоновые операции с формами в уже авторизованных собственных вкладках (`background_tab_form`)
+
+Для заполнения, редактирования, сохранения и перезагрузки веб-форм **без foreground-взаимодействия и без изменения политики доступа** используются штатные stateful API Hub (`owner_chrome_hidden` для строго невидимых целей `owner_chrome_profile1_hidden_secondary` или `browser` для фоновых вкладок `owner_chrome_extension`) после планирования `route_plan(surface="browser", capability="background_tab_form", url=..., visibility="background_tab"|"strict_invisible")`:
+
+1. **Поддерживаемые фоновые операции DOM (`trusted_input: false`, `physical_input_used: false`):**
+   - `act`: `fill` (ввод/замена текста в редактируемых `<input>`, `<textarea>`, `[contenteditable=true]`, отказ `TARGET_NOT_EDITABLE` для `readOnly` и нередактируемых типов), `select` (чисто DOM-выбор опций `<select>` с проверкой существования опции `OPTION_NOT_FOUND` без нативного Playwright `selectOption`), `check` / `uncheck` (флажки, переключатели, radio с запретом `uncheck` для radio), `click` (DOM pointer/mouse/click без активации окна/вкладки), `press` (DOM `KeyboardEvent` `keydown`/`keyup`, `Enter` отправляет форму через `form.requestSubmit()` ровно один раз и не отправляет форму из `<textarea>`).
+   - `reload` (журналируемая мутация с обязательным `request_key`, проверкой текущего хоста `TAB_HOST_CHANGED` до перезагрузки, ожиданием реального коммита перезагрузки и `bringToFront = 0`).
+   - `wait_for`, `observe` / `snapshot`, `read` (чтение `.value` и `checked` у полей формы после перезагрузки для независимой верификации сохранённых данных).
+2. **Защита от дублирования отправки и сохранность фокуса:**
+   - Каждая мутация (`open`, `navigate`, `reload`, `act`, `close`) требует стабильного `request_key` (`REQUEST_KEY_REQUIRED`); повтор того же ключа с тем же payload возвращает кэшированный ответ (`deduplicated: true`) без повторного нажатия/отправки; повтор ключа с другим payload отклоняется fail-closed (`REQUEST_KEY_REUSED`); после потери ответа используется `request_status` (`automatic_replay: false`).
+   - Все операции выполняются строго в собственной вкладке/цели сессии (`RESOURCE_NOT_OWNED` для чужих агентов), отклоняют `foreground: true` (`FOREGROUND_ROUTE_REQUIRED`) и проверяют текущий живой хост перед действием и перезагрузкой (`TAB_HOST_CHANGED`).
+   - Никакие политики Hub (`policy.json`) и разрешения браузера/расширений не изменяются; `site_read` остаётся строго read-only (`SITE_READ_ARG_FORBIDDEN`).
+3. **Ограничения доступности фоновых форм:**
+   - Требуется уже авторизованный и подключённый провайдер (`owner_chrome_profile1_hidden_secondary` или `owner_chrome_extension` при `visibility="background_tab"`).
+   - События являются DOM-уровня (`isTrusted: false`); сайты, требующие аппаратных событий ввода (`isTrusted: true`), нативных файловых диалогов, перетаскивания (drag-and-drop), canvas-взаимодействия, CAPTCHA, MFA или UAC, не обходятся и требуют остановки либо отдельного согласованного маршрута.
+   - `owner_chrome_extension` добавляет неактивную вкладку в видимую полосу вкладок (`visible_tab_strip: true`) и не подставляется при `strict_invisibility: true`; `owner_chrome_profile1_hidden_secondary` не поддерживает `screenshot` (`HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED`).
+   - Chrome ограничивает таймеры и `requestAnimationFrame` в фоновых вкладках (`background_tab_timers`); формы, завязанные на видимый кадр анимации, могут не завершать перерисовку в фоне.
+
 ---
 
 ## 5. Шаг 4 — Согласованная очистка устаревшего debug-патча Playwright и ротация токена (ТОЛЬКО с подтверждения владельца)

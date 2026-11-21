@@ -16,6 +16,7 @@ import {
   BrowserHub,
   HubError,
   backgroundCapability,
+  backgroundExtensionPreflight,
   extensionConnector,
   loadPlaywright,
   resolvePlaywrightRoot,
@@ -756,5 +757,274 @@ test('extension transport declares visible_tab_strip=true, hidden_secondary_wind
   } finally {
     if (prevToken === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
     else process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = prevToken;
+  }
+});
+
+test('backgroundExtensionPreflight rejects downloads-only manifests and extensionConnector declares non-activation flags', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'ff-ext-manifest-check-'));
+  const extId = 'mmlmfjhmonkocbjadbfplnigmagldckm';
+  try {
+    fs.mkdirSync(path.join(root, 'Default'), {recursive: true});
+    // Downloads-only permissions (like FF Browser Companion 0.1.1) MUST fail closed!
+    fs.writeFileSync(path.join(root, 'Default', 'Secure Preferences'), JSON.stringify({
+      extensions: {
+        settings: {
+          [extId]: {state: 1, manifest: {version: '0.6.0', permissions: ['downloads', 'nativeMessaging']}},
+        },
+      },
+    }));
+    assert.throws(
+      () => backgroundExtensionPreflight({userDataDir: root, profileDirName: 'Default'}),
+      error => error instanceof HubError && error.code === 'BACKGROUND_EXTENSION_PERMISSIONS_INSUFFICIENT',
+    );
+
+    // Playwright Extension 0.6.0 actual manifest permissions pass cleanly
+    fs.writeFileSync(path.join(root, 'Default', 'Secure Preferences'), JSON.stringify({
+      extensions: {
+        settings: {
+          [extId]: {
+            state: 1,
+            manifest: {
+              version: '0.6.0',
+              permissions: ['debugger', 'activeTab', 'tabs', 'tabGroups', 'storage'],
+              host_permissions: ['<all_urls>'],
+            },
+          },
+        },
+      },
+    }));
+    const verified = backgroundExtensionPreflight({userDataDir: root, profileDirName: 'Default'});
+    assert.equal(verified.extension_version, '0.6.0');
+    assert.deepEqual(verified.extension_permissions, ['activeTab', 'debugger', 'storage', 'tabGroups', 'tabs']);
+
+    const extConn = extensionConnector({
+      runtimeLoader: () => ({version: '1.65.1', backgroundSupported: true, tools: {createBrowserWithInfo: async () => ({})}}),
+      background: true,
+    });
+    const desc = extConn.describe();
+    assert.equal(desc.background, true);
+    assert.equal(desc.activates_tab, false);
+    assert.equal(desc.read_supported, true);
+    assert.equal(desc.form_operations_supported, true);
+    assert.equal(desc.ownership_supported, true);
+    assert.equal(desc.visible_tab_strip, true);
+    assert.equal(desc.hidden_secondary_window_supported, false);
+  } finally {
+    fs.rmSync(root, {recursive: true, force: true});
+  }
+});
+
+test('BrowserHub background form operations use pure DOM select/fill/check/press and support host-guarded reload without bringToFront', async () => {
+  let bringToFrontCalls = 0;
+  let nativeInputCalls = 0;
+  let reloadCalls = 0;
+  let submitCount = 0;
+
+  class MiniEvent {
+    constructor(type, init = {}) {
+      this.type = type;
+      this.bubbles = Boolean(init.bubbles);
+      this.cancelable = Boolean(init.cancelable);
+      this.composed = Boolean(init.composed);
+      this.key = init.key;
+      this.data = init.data;
+      this.defaultPrevented = false;
+    }
+    preventDefault() { if (this.cancelable) this.defaultPrevented = true; }
+  }
+  class MiniInputElement {
+    constructor(type, value = '', {readOnly = false, checked = false, form = null} = {}) {
+      this.tagName = 'INPUT';
+      this.type = type;
+      this._value = value;
+      this.readOnly = readOnly;
+      this.checked = checked;
+      this.disabled = false;
+      this.form = form;
+      this.events = [];
+      this.focused = 0;
+    }
+    get value() { return this._value; }
+    set value(v) { this._value = String(v); }
+    focus() { this.focused++; }
+    scrollIntoView() {}
+    getBoundingClientRect() { return {left: 0, top: 0, width: 100, height: 24}; }
+    dispatchEvent(ev) { this.events.push(ev.type); return !ev.defaultPrevented; }
+    click() {
+      this.events.push('click');
+      if (this.type === 'checkbox') this.checked = !this.checked;
+      if (this.type === 'radio') this.checked = true;
+    }
+    getAttribute() { return null; }
+  }
+  class MiniTextAreaElement extends MiniInputElement {
+    constructor(value = '', opts = {}) {
+      super('textarea', value, opts);
+      this.tagName = 'TEXTAREA';
+    }
+  }
+  class MiniSelectElement {
+    constructor(optionValues) {
+      this.tagName = 'SELECT';
+      this.multiple = false;
+      this.disabled = false;
+      this.options = optionValues.map((val, idx) => ({value: val, textContent: val.toUpperCase(), disabled: false, selected: idx === 0}));
+      this.value = optionValues[0];
+      this.events = [];
+      this.focused = 0;
+    }
+    get selectedOptions() { return this.options.filter(o => o.selected); }
+    focus() { this.focused++; }
+    dispatchEvent(ev) { this.events.push(ev.type); return !ev.defaultPrevented; }
+  }
+
+  const fakeWindow = {
+    HTMLInputElement: MiniInputElement,
+    HTMLTextAreaElement: MiniTextAreaElement,
+    HTMLSelectElement: MiniSelectElement,
+    Event: MiniEvent,
+    InputEvent: MiniEvent,
+    KeyboardEvent: MiniEvent,
+    MouseEvent: MiniEvent,
+    PointerEvent: MiniEvent,
+  };
+  const fakeForm = {
+    requestSubmit() { submitCount++; },
+  };
+  const titleInput = new MiniInputElement('text', 'old', {form: fakeForm});
+  const notesArea = new MiniTextAreaElement('memo', {form: fakeForm});
+  const prioritySel = new MiniSelectElement(['low', 'medium', 'high']);
+  const notifyChk = new MiniInputElement('checkbox', 'on', {checked: false, form: fakeForm});
+  const modeRadio = new MiniInputElement('radio', 'final', {checked: false, form: fakeForm});
+  const roInput = new MiniInputElement('text', 'LOCKED', {readOnly: true, form: fakeForm});
+  for (const el of [titleInput, notesArea, prioritySel, notifyChk, modeRadio, roInput]) {
+    el.ownerDocument = {defaultView: fakeWindow};
+  }
+  const elements = {
+    '#title': titleInput,
+    '#notes': notesArea,
+    '#priority': prioritySel,
+    '#notify': notifyChk,
+    '#mode': modeRadio,
+    '#ro': roInput,
+  };
+
+  class DomMockPage extends EventEmitter {
+    constructor() {
+      super();
+      this._url = 'http://127.0.0.1:41234/form';
+      this._closed = false;
+    }
+    isClosed() { return this._closed; }
+    url() { return this._url; }
+    mainFrame() { return this; }
+    async title() { return 'Synthetic Form'; }
+    async bringToFront() { bringToFrontCalls++; }
+    async goto(u) { this._url = u; this.emit('framenavigated', this); }
+    async reload() { reloadCalls++; this.emit('framenavigated', this); }
+    async close() { this._closed = true; this.emit('close'); }
+    async evaluate(fn) {
+      if (String(fn).includes('visibilityState')) return 'hidden';
+      return `title=${titleInput.value}`;
+    }
+    locator(selector) {
+      const el = elements[selector];
+      return {
+        count: async () => (el ? 1 : 0),
+        isVisible: async () => Boolean(el),
+        isEnabled: async () => Boolean(el && !el.disabled),
+        isChecked: async () => Boolean(el?.checked),
+        inputValue: async () => String(el?.value ?? ''),
+        selectOption: async () => { nativeInputCalls++; return []; },
+        click: async () => { nativeInputCalls++; },
+        fill: async () => { nativeInputCalls++; },
+        evaluate: async (fn, arg) => {
+          const prevWindow = globalThis.window;
+          const prevKb = globalThis.KeyboardEvent;
+          globalThis.window = fakeWindow;
+          globalThis.KeyboardEvent = MiniEvent;
+          try {
+            return fn(el, arg);
+          } finally {
+            if (prevWindow === undefined) delete globalThis.window; else globalThis.window = prevWindow;
+            if (prevKb === undefined) delete globalThis.KeyboardEvent; else globalThis.KeyboardEvent = prevKb;
+          }
+        },
+      };
+    }
+  }
+
+  const page = new DomMockPage();
+  const browser = new MockBrowser([]);
+  const ctx = makeMockContext([]);
+  ctx.nextPage = page;
+  browser._contexts = [ctx];
+  const hub = new BrowserHub({
+    describe: () => ({transport: 'playwright-extension', background: true, activates_tab: false, read_supported: true, form_operations_supported: true, ownership_supported: true, isolated_profile: false}),
+    async connect() { return {browser, context: ctx}; },
+  });
+
+  try {
+    const tab = await hub.tabOpen({owner: 'form-agent', url: 'http://127.0.0.1:41234/form'});
+    // Pure DOM select (never calls native selectOption!)
+    const selRes = await hub.act({
+      owner: 'form-agent', tab_id: tab.tab_id, action: 'select',
+      target: {selector: '#priority'}, value: 'high', expected_host: '127.0.0.1',
+    });
+    assert.deepEqual(selRes.detail, {mode: 'dom-select', selected: ['high']});
+    assert.equal(prioritySel.value, 'high');
+    assert.deepEqual(prioritySel.events, ['input', 'change']);
+    assert.equal(nativeInputCalls, 0);
+
+    // Nonexistent select option fails closed with OPTION_NOT_FOUND
+    await assert.rejects(
+      hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'select', target: {selector: '#priority'}, value: 'nonexistent', expected_host: '127.0.0.1'}),
+      error => error instanceof HubError && error.code === 'OPTION_NOT_FOUND' && error.details.attempted === false,
+    );
+
+    // Fill readOnly fails closed; fill text succeeds and read returns live .value
+    await assert.rejects(
+      hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'fill', target: {selector: '#ro'}, value: 'x', expected_host: '127.0.0.1'}),
+      error => error instanceof HubError && error.code === 'TARGET_NOT_EDITABLE',
+    );
+    await hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'fill', target: {selector: '#title'}, value: 'Updated Title', expected_host: '127.0.0.1'});
+    const readTitle = await hub.read({owner: 'form-agent', tab_id: tab.tab_id, target: {selector: '#title'}});
+    assert.equal(readTitle.text, 'Updated Title');
+    assert.equal(readTitle.value, 'Updated Title');
+
+    // Check checkbox, uncheck radio refused fail-closed
+    await hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'check', target: {selector: '#notify'}, expected_host: '127.0.0.1'});
+    assert.equal(notifyChk.checked, true);
+    await hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'check', target: {selector: '#mode'}, expected_host: '127.0.0.1'});
+    assert.equal(modeRadio.checked, true);
+    await assert.rejects(
+      hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'uncheck', target: {selector: '#mode'}, expected_host: '127.0.0.1'}),
+      error => error instanceof HubError && error.code === 'TARGET_NOT_EDITABLE',
+    );
+
+    // Press Enter on textarea does NOT submit; press Enter on input submits once
+    const taPress = await hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'press', target: {selector: '#notes'}, key: 'Enter', expected_host: '127.0.0.1'});
+    assert.equal(taPress.detail, 'dispatched');
+    assert.equal(submitCount, 0);
+    const inPress = await hub.act({owner: 'form-agent', tab_id: tab.tab_id, action: 'press', target: {selector: '#title'}, key: 'Enter', expected_host: '127.0.0.1'});
+    assert.equal(inPress.detail, 'form_submitted');
+    assert.equal(submitCount, 1);
+
+    // Host-guarded reload works without bringToFront and rejects host drift
+    const rel = await hub.dispatch('reload', {owner: 'form-agent', tab_id: tab.tab_id, expected_host: '127.0.0.1'});
+    assert.equal(rel.reloaded, true);
+    assert.equal(rel.visibility, 'hidden');
+    assert.equal(reloadCalls, 1);
+
+    page._url = 'http://evil.invalid/phish';
+    await assert.rejects(
+      hub.dispatch('reload', {owner: 'form-agent', tab_id: tab.tab_id, expected_host: '127.0.0.1'}),
+      error => error instanceof HubError && error.code === 'TAB_HOST_CHANGED' && error.details.attempted === false,
+    );
+    assert.equal(reloadCalls, 1);
+    assert.equal(bringToFrontCalls, 0);
+    assert.equal(nativeInputCalls, 0);
+  } finally {
+    await hub.shutdown();
   }
 });

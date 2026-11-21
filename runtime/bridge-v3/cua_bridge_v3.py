@@ -562,12 +562,17 @@ class CuaBridgeControlPlane:
         return self._app_resolver
 
     def _companion_health(self) -> dict[str, Any]:
+        scope = {
+            "supported_capabilities": ["downloads", "nativeMessaging"],
+            "browser_page_reader": False,
+            "page_read_supported": False,
+        }
         try:
             capabilities = self._browser_companion().capabilities()
             compatible = capabilities.get("protocol_version") == 1 and capabilities.get("downloads") is True
-            return {"running": True, "compatible": bool(compatible), "capabilities": capabilities}
+            return {"running": True, "compatible": bool(compatible), "capabilities": capabilities, **scope}
         except CompanionError as exc:
-            return {"running": False, "compatible": False, "error_code": exc.code}
+            return {"running": False, "compatible": False, "error_code": exc.code, **scope}
 
     def dispatch(self, args: Mapping[str, Any]) -> dict[str, Any]:
         command = str(args.get("command") or "")

@@ -280,6 +280,11 @@ class HubStore:
             row = self._session_row(session_id)
             return bool(row and row["entry_grant_id"] and row["state"] == "active")
 
+    def entry_grant_id(self, session_id: str) -> str | None:
+        with self._lock:
+            row = self._session_row(session_id)
+            return str(row["entry_grant_id"]) if row and row["entry_grant_id"] else None
+
     def expire_sessions(self, *, session_id: str | None = None,
                         retain_kinds: Any = (), state: str = "expired") -> list[dict]:
         """Sessions silent for longer than the orphan window: close them, return what they held."""

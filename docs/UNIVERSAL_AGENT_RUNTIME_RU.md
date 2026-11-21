@@ -542,3 +542,125 @@ Bridge RPC -> Hub -> BrowserManager -> Playwright Extension -> Chrome 158.
 Bridge и Chrome сохранены. Тест намеренно не выдаёт эту приёмку за
 production deployment: в рабочей установке feature flag остаётся
 выключенным до безопасного окна обновления.
+
+
+## Checkpoint 21 ноября 2026: пользовательское чтение сайта без прерывания (`site_read`), аудит манифестов и синтетическая проверка
+
+### Аудит фактических манифестов (строго read-only, без изменения прав)
+
+- **`FF Browser Companion` (`runtime/bridge-v3/browser_companion/manifest.json`, версия `0.1.1`):**
+  декларирует только `permissions: ["downloads", "nativeMessaging"]` без `host_permissions`
+  (в `service_worker.js` реализованы только `health`, `capabilities`, `download.*`).
+  Не умеет открывать вкладки или читать страницы; во всех точках обнаружения
+  (`inspect_companion_manifest`, `route_plan`, `site_read`, `agent_workflows`,
+  `capabilities`, `cua_bridge_v3._companion_health`) явно публикуется с
+  `browser_page_reader: false`, `page_read_supported: false` и исключается с кодом
+  `COMPANION_DOWNLOADS_AND_NATIVE_MESSAGING_ONLY`.
+- **`Playwright Extension` (проверено в read-only режиме по манифесту установленного профиля: `0.6.0`, требование Hub `>= 0.5.0` и Chrome `>= 158.0.8127.2`):**
+  декларирует `permissions: ["activeTab", "debugger", "storage", "tabGroups", "tabs"]` и
+  `host_permissions: ["<all_urls>"]`. Поддерживается через `ff_browser_hub.mjs`
+  (`owner_chrome_extension`) только для обычного запроса фоновой вкладки
+  (`visibility: "background_tab"`, `visible_tab_strip: true`, `hidden_secondary_window_supported: false`).
+  В `ff_browser_hub.mjs` добавлена проверка прав манифеста (`BACKGROUND_EXTENSION_PERMISSIONS_INSUFFICIENT`
+  при отсутствии `tabs` или `debugger`/`scripting`) и явная декларация `activates_tab: !background`,
+  `read_supported: true`, `ownership_supported: true`.
+- **Сторонние расширения ИИ-ассистентов в Chrome:** не управляются брокером Hub,
+  не дают доказуемого владения, неактивации и очистки; исключаются с кодом
+  `PROVIDER_UNMANAGED_NO_BROKER_OWNERSHIP` и никогда не перехватываются.
+- **Изолированные профили (`managed_browser` / `private_browser`):** не наследуют
+  авторизованные сессии Chrome владельца и никогда не подставляются молча
+  (`ISOLATED_PROFILE_SUBSTITUTION_FORBIDDEN`).
+
+### Реализация в исходниках
+
+- `runtime/bridge-v3/cua_owner_chrome_secondary.py`: параметр `allow_new_ws: bool = True`
+  в `preflight` (при `allow_new_ws=False` не открывается новый WebSocket и не вызывается
+  диалог Chrome; возвращается `OWNER_CHROME_CDP_APPROVAL_REQUIRED` или
+  `OWNER_CHROME_CDP_NOT_CONNECTED`).
+- `runtime/bridge-v3/ff_browser_routes.py`: `inspect_companion_manifest`,
+  `validate_site_read_url`, `normalize_visibility_mode`, `evaluate_no_interruption_site_read`
+  и поддержка `capability="background_tab_read"` в `route_plan`.
+  Строго различает `visibility="background_tab"` и `visibility="strict_invisible"` /
+  `strict_invisibility=true` (при строгой невидимости `owner_chrome_extension` всегда
+  отклоняется с `VISIBLE_TAB_SUBSTITUTION_FORBIDDEN`). При отсутствии готового провайдера
+  возвращает **один** структурированный результат возможностей
+  (`NO_ELIGIBLE_NO_INTERRUPTION_PROVIDER`, `ui_triggered: false`,
+  `prompts_triggered: false`, `pending_request_created: false`) до любого UI или pending-запроса.
+- `runtime/bridge-v3/ff_hub.py`, `ff_hub_store.py`, `ff_hub_mcp.py`, `ff_agent_entry.py`,
+  `cua_agent_workflows.py`, `cua_bridge_v3.py`: операция `site_read` (только чтение,
+  allowlist/blocklist аргументов, запрет мутаций/stealth/извлечения cookies/авто-одобрения,
+  проверка хоста после редиректа `REDIRECT_HOST_NOT_GRANTED` с сокрытием тела ответа,
+  обязательный teardown в `finally` с fail-closed удержанием неподтверждённого закрытия),
+  пользовательский CLI `ff_hub.py site-read` (выход `2` без открытия сессии при отсутствии
+  провайдера, выход `0` после verified teardown), схема MCP `hub` и `/agent/v1` scope
+  `owner_chrome_hidden`.
+
+### Результаты синтетических и регрессионных испытаний
+
+| Проверка | Результат | Подтверждённые факты |
+| --- | --- | --- |
+| `tests/test_no_interruption_site_read.py` (5 тестов) | **PASS (5/5)** | Аудит фактического `manifest.json` Companion 0.1.1; отказ подмены видимой вкладки при `strict_invisibility=true`; проверка всех 5 критериев провайдера (`authorized`, `connected`, `background_open_without_activation`, `read_access`, `ownership`); 1 результат `NO_ELIGIBLE_NO_INTERRUPTION_PROVIDER` с `0` UI, `0` WS, `0` pending-запросов; блокировка запрещённых аргументов; **2 последовательные задачи + verified teardown** на синтетических loopback HTML-страницах через реальный Node `ff_browser_hub.mjs` (`bring_to_front_calls=0`, пустой `tab-ledger.json`, чужая вкладка владельца не тронута, блокировка cross-host редиректа, fail-closed удержание при обрыве во время закрытия) и через синтетический Chrome 158 HTTP-404 loopback CDP (`1` переиспользованный WS, `0` утекших targets, мгновенный отзыв grant); проверка MCP Adapter, `/agent/v1` scoped entry и пользовательского CLI `ff_hub.py site-read` |
+| `python -X utf8 -m unittest discover -s tests -p "test_*.py"` | **PASS (787/787, skipped=4)** | Включая `test_manifest_matches_git.py` (**313** bundled source files, точное совпадение LF SHA-256 с Git index), `test_skill_contract.py`, `test_agent_workflows.py`, `test_browser_routes.py`, `test_owner_chrome_permission_ux.py` |
+| `python -X utf8 tests/integration/isolated_rpc_smoke.py` | **PASS (22/22)** | `all_passed: true`, изолированный агент на случайном порту, `no_user_desktop: true` |
+| `node --test tests/test_ff_browser_hub.mjs tests/test_p0_browser_hub_mjs.mjs tests/test_browser_companion.mjs` | **PASS (54/54, skipped=1)** | Включая новый тест отказа downloads-only манифеста в `backgroundExtensionPreflight` и флагов неактивации в `extensionConnector.describe()`; 1 skip — ожидаемый пропуск локального `pw165` root |
+| `node tests/test_cua_browser_iframe_verify.mjs` | **PASS (8/8)** | Верификация main/child frame URL и fail-closed отказов |
+
+### Оставшиеся ограничения доступности и границы checkpoint
+
+- **Нет развёртывания и изменений на живом контуре:** все правки внесены и проверены
+  исключительно в исходниках на синтетических страницах; установленный runtime Bridge/Hub,
+  политики `state/hub/policy.json`, настройки Chrome и права живых расширений **не изменялись**.
+- **Ожидание предварительного подключения провайдера:** без уже открытого и одобренного
+  соединения (активного loopback CDP WebSocket для `owner_chrome_profile1_hidden_secondary`
+  либо уже подключённого в фоне `ff_browser_hub.mjs` для `owner_chrome_extension`) маршрут
+  `site_read` намеренно отказывает без UI и без авто-подключения, возвращая один
+  информативный отчёт возможностей.
+- **Видимая полоса вкладок у `owner_chrome_extension`:** даже при неактивной фоновой
+  вкладке расширение добавляет вкладку в полосу вкладок Chrome (`visible_tab_strip: true`),
+  поэтому никогда не удовлетворяет требованиям `strict_invisible`.
+- **Двойной рубеж согласия Chrome 158+:** в режиме `chrome://inspect/#remote-debugging`
+  (HTTP 404 `/json/version`) локальный grant Hub не отключает нативный диалог Chrome при
+  первичном открытии WebSocket; для полностью невидимой работы без диалогов требуется
+  заранее установленное владельцем соединение и единый ожидаемый профиль
+  (`OWNER_CHROME_PROFILE_CONTEXT_MISMATCH` при несовпадении профиля).
+- **Отсутствие live acceptance в этом checkpoint:** живое испытание с настоящей
+  авторизованной страницей в Chrome владельца не выполнялось (намеренно, без вмешательства
+  в живой профиль и расширения).
+
+
+## Checkpoint 21 ноября 2026 (продолжение): фоновые операции с формами в собственных вкладках и `form-regression-fixture`
+
+### Реализованные фоновые операции с формами (поверх staged `site_read`, без изменения политики доступа и без foreground-ввода)
+
+- **`runtime/bridge-v3/ff_browser_hub.mjs` (`owner_chrome_extension` / Hub `browser`):**
+  - Чисто DOM-реализация `domSelect` для `<select>` (одиночный и множественный выбор по `value` или тексту опции с отказом `OPTION_NOT_FOUND` до изменения DOM и событиями `input`/`change`) вместо нативного Playwright `locator.selectOption()`, который мог ждать `requestAnimationFrame` в фоновой вкладке.
+  - Усилена обработка `check`/`uncheck` (валидация чекбоксов/radio/ARIA-переключателей до клика, запрет `uncheck` для `radio` с `TARGET_NOT_EDITABLE`), `domPress` (`Enter` в `<textarea>` не отправляет форму; на полях/кнопках вызывается единичный `form.requestSubmit()`), `read` для полей `<input>`/`<textarea>`/`<select>` (возврат актуального `.value` и `checked`).
+  - Добавлена операция `reload` с проверкой владения вкладкой, проверкой живого хоста `expected_host` (`TAB_HOST_CHANGED` до перезагрузки), обновлением URL/title в `tab-ledger.json` и нулевыми вызовами `bringToFront()`.
+  - `extensionConnector.describe()` публикует `form_operations_supported: true`.
+- **`runtime/bridge-v3/cua_owner_chrome_secondary.py` (`owner_chrome_profile1_hidden_secondary` / Hub `owner_chrome_hidden`):**
+  - Добавлена проверка живого хоста `_check_expected_host` (`TAB_HOST_CHANGED` при клиентском редиректе на неавторизованный хост) перед `act`, `evaluate`, `reload` и `wait_for`, а также атомарная проверка хоста внутри JS-выражения `act`.
+  - Добавлены операции `reload` (CDP `Page.reload` с уникальным sentinel `window.__ffhsec_reload` для доказательства реального коммита перезагрузки) и `wait_for` (`WAIT_TIMEOUT`, поддержка `checked_equals` и совместимого формата `{target: {selector}, value, checked, state}`).
+  - Расширен `act`: полный набор фоновых DOM-операций `fill`, `click`, `select`, `check`, `uncheck`, `press` (с поддержкой `selector`, `snapshot`+`ref`, `target: {selector|ref|id|name|label}`, отказом `TARGET_NOT_EDITABLE` на `readOnly`/нередактируемых полях, `TARGET_DISABLED`, `OPTION_NOT_FOUND`, `KEY_REQUIRED`, `FOREGROUND_ROUTE_REQUIRED`, `trusted_input: false`, `physical_input_used: false`).
+  - Расширены `observe` (`checked`, `readonly`, `selected_text`, `contenteditable`) и `read` (чтение `.value`/`checked`/`selected` у элементов формы).
+- **`runtime/bridge-v3/ff_browser_routes.py`, `ff_hub.py`, `ff_hub_mcp.py`, `ff_agent_entry.py`, `cua_agent_workflows.py`:**
+  - Планировщик `route_plan(surface="browser", capability="background_tab_form", url=..., visibility="background_tab"|"strict_invisible")` (`schema: "ff-no-interruption-background-form-v1"`): проверяет только уже авторизованные и подключённые провайдеры без UI, без pending-запросов, без изменения `policy.json` и без подмены видимой вкладки при `strict_invisibility=true`; FF Browser Companion `0.1.1` исключается (`COMPANION_DOWNLOADS_AND_NATIVE_MESSAGING_ONLY`).
+  - В `ff_hub.py` операция `reload` подключена к журналированию `request_key` (идемпотентность без дублирования) в обоих маршрутах (`browser` и `owner_chrome_hidden`), `wait_for` добавлена в `owner_chrome_hidden`, обновлены `capabilities`, MCP-схема `ff_hub_mcp.py`, `/agent/v1` (`OWNER_CHROME_HIDDEN_COMMANDS`) и `cua_agent_workflows.py`. Операция `site_read` сохранена строго read-only (`SITE_READ_ARG_FORBIDDEN`).
+
+### Зафиксированные тесты и доказательства (`form-regression-fixture`)
+
+| Проверка | Результат | Подтверждённые факты и доказательства |
+| --- | --- | --- |
+| `python -X utf8 -m unittest tests/test_background_form_operations.py -v` (4 теста) | **PASS (4/4)** | 1) `route_plan(capability="background_tab_form")`: строгая изоляция `strict_invisible`, исключение Companion `0.1.1`, `0` pending-запросов, неизменный SHA-256 `policy.json`, `site_read` остаётся строго read-only. 2) Изоляция владения (`RESOURCE_NOT_OWNED`), запрет `foreground=true` (`FOREGROUND_ROUTE_REQUIRED`), обязательный `request_key` на `act`/`reload`, валидация контролов (`TARGET_NOT_EDITABLE`, `TARGET_DISABLED`, `OPTION_NOT_FOUND`, `KEY_REQUIRED`), отказ при смене хоста (`TAB_HOST_CHANGED`). 3) **Два последовательных сценария fill/edit/save + reload** против синтетической локальной loopback-формы через реальный Node `ff_browser_hub.mjs` (`browser` через `Hub.dispatch` и MCP `Adapter`): WF1 (fill/select/check/click save + повтор того же `request_key` -> `deduplicated: true` + `request_status` + `REQUEST_KEY_REUSED` + `reload` + чтение `rev=1`) и WF2 (чтение данных WF1, edit/select/uncheck/radio/Enter в textarea без отправки/Enter в input save + dedupe + `reload` + чтение `rev=2`); подтверждены ровно **2** отправки на сервере (`0` дублей), `bring_to_front_calls=0`, `native_input_calls=0`, чужая вкладка владельца не закрыта и `blur_count=0`, пустой `tab-ledger.json`, неизменный SHA-256 `policy.json`. 4) **Два последовательных сценария fill/edit/save + reload** через **реальный изолированный Chrome 158** на отдельном Win32 private desktop (`CreateDesktopW`, временный `user_data_dir`, HTTP-404 `DevToolsActivePort` WS-прокси, без доступа к живым аккаунтам и настройкам) через `owner_chrome_hidden` (`Hub.dispatch`, MCP `Adapter`, `/agent/v1`): реальный Chromium DOM/JS/`fetch`/`Page.reload`, `snapshot`+`ref`, ровно **2** отправки на сервере (`0` дублей при повторе ключа и при `reload`), live `TAB_HOST_CHANGED` при клиентском асинхронном редиректе на `localhost`, реальный Win32 мониторинг (`GetForegroundWindow()` без изменений, `new_hwnds=[]`, `any_visible=false`, `any_taskbar=false`), фокус основной вкладки владельца `/owner-active` сохранён (`activeId="owner-draft"`, `blur_count=0`, `visibility_change_count=0`, черновик не тронут), чистый `session_close` (`cleanup_verified=true`, `resources_retained=0`, `0` утекших target в Chrome), неизменный SHA-256 `policy.json` |
+| `node --test tests/test_ff_browser_hub.mjs tests/test_p0_browser_hub_mjs.mjs tests/test_browser_companion.mjs` | **PASS (55/55, skipped=1)** | Включая новый тест чистого DOM `domSelect`/`domFill`/`domPress`/`check`/`uncheck` и host-guarded `reload` без `bringToFront` и с `nativeInputCalls=0`; 1 skip — ожидаемый пропуск локального `pw165` root |
+| `node tests/test_cua_browser_iframe_verify.mjs` | **PASS (8/8)** | Верификация main/child frame URL и fail-closed отказов |
+| `python -X utf8 tests/integration/isolated_rpc_smoke.py` | **PASS (22/22)** | `all_passed: true`, изолированный агент на случайном порту, `no_user_desktop: true` |
+| `python -X utf8 -m unittest discover -s tests -p "test_*.py"` | **PASS (791/791, skipped=4)** | Включая `test_manifest_matches_git.py` (**314** bundled source files, точное совпадение LF SHA-256 с Git index), `test_background_form_operations.py` (4/4), `test_no_interruption_site_read.py` (5/5), `test_cdp_discovery_repair.py`, `test_owner_chrome_permission_ux.py`, `test_browser_routes.py`, `test_agent_workflows.py`, `test_skill_contract.py` |
+
+### Ограничения доступности (honest limits)
+
+- **Без доступа к живым аккаунтам, без изменения прав браузера и без деплоя:** все испытания проведены исключительно в исходниках против локальной синтетической loopback-формы (`127.0.0.1`) с временными изолированными профилями/state; живой Chrome владельца, живые пользовательские аккаунты, `state/hub/policy.json`, права расширений и установленный боевой runtime **не затрагивались и не разворачивались**.
+- **Предварительно авторизованная и подключённая среда:** операции с формами работают только на собственных вкладках уже авторизованных и подключённых маршрутов Hub (`owner_chrome_hidden` с действующим grant `owner_chrome_hidden_secondary` и одобренным loopback CDP WebSocket либо `browser` с запущенным `ff_browser_hub.mjs` и `browser_own_tabs`); при отсутствии готового провайдера `route_plan(capability="background_tab_form")` отказывает без UI, без pending-запросов и без изменения policy.
+- **Границы DOM-ввода (`trusted_input: false`):** фоновые операции отправляют DOM-события без физического ввода; формы, требующие аппаратного `isTrusted: true` ввода, нативных диалогов выбора файлов ОС, drag-and-drop, canvas-виджетов, CAPTCHA, MFA или UAC, не поддерживаются фоновым режимом.
+- **Ограничения видимости и рендеринга:** `owner_chrome_extension` добавляет неактивную вкладку в полосу вкладок (`visible_tab_strip: true`) и никогда не удовлетворяет `strict_invisible`; `owner_chrome_profile1_hidden_secondary` работает без OS-окна (`windowless: true`), но не поддерживает `screenshot` (`HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED`); Chrome ограничивает таймеры и `requestAnimationFrame` в фоновых вкладках (`background_tab_timers`).
+- **Разделение ответственности при `reload`:** при перезагрузке обычной страницы (`GET` / `fetch`-форма / PRG) `reload` не повторяет POST; если же сторонний сайт использует классическую HTML-форму POST без PRG (Post-Redirect-Get), браузерная перезагрузка самого POST-документа зависит от семантики сервера сайта, поэтому клиент должен проверять URL/состояние до повторной перезагрузки.
+- **Отсутствие локального `pw165` root в этой ветке:** 1 Node-тест изолированного Playwright 1.65.1 пропущен (`pw165 root not available`); живой Playwright Extension relay с настоящим профилем владельца намеренно не запускался в этом checkpoint.

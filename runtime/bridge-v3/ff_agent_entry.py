@@ -21,7 +21,7 @@ SCHEMA = "ff-agent-entry-v1"
 BASE_OPS = {"capabilities", "route_plan", "session_open", "session_status",
             "session_heartbeat", "session_close", "request_status", "task_cancel", "audit_read"}
 SCOPES = {
-    "owner_chrome_hidden": {"owner_chrome_hidden"},
+    "owner_chrome_hidden": {"owner_chrome_hidden", "site_read"},
     "private_browser": {"private_browser", "managed_browser"},
     "private_app": {"app_discover", "app_open", "app_windows", "app_observe",
                     "app_find", "app_act", "app_capture", "app_document", "app_close"},
@@ -31,8 +31,9 @@ SCOPES = {
 BROWSER_COMMANDS = ("open", "info", "close", "tabs", "tab_open", "tab_close", "navigate",
                     "observe", "snapshot", "read", "act", "upload", "download_prepare", "download_read", "screenshot")
 READ_ONLY = {"info", "tabs", "observe", "snapshot", "read", "download_read", "screenshot"}
-OWNER_CHROME_HIDDEN_COMMANDS = ("preflight", "status", "open", "list", "navigate", "observe", "read", "act", "screenshot", "close")
-OWNER_CHROME_HIDDEN_READ_ONLY = {"preflight", "status", "list", "observe", "read", "screenshot"}
+OWNER_CHROME_HIDDEN_COMMANDS = ("preflight", "status", "open", "list", "navigate", "reload", "observe", "read", "act", "wait_for", "screenshot", "close")
+OWNER_CHROME_HIDDEN_READ_ONLY = {"preflight", "status", "list", "observe", "read", "wait_for", "screenshot"}
+SITE_READ_COMMANDS = ("plan", "read")
 MUTATIONS = {"session_close", "task_cancel", "resource_claim", "resource_release", "app_open", "app_act", "app_close"}
 FORBIDDEN_BROWSER_ARGS = frozenset({"route", "foreground", "headless", "profile_dir"})
 FORBIDDEN_OWNER_CHROME_HIDDEN_ARGS = frozenset({
@@ -331,7 +332,10 @@ def route_plan(
     hub: object | None = None,
     capability: str = "dom",
     prefer: str | None = None,
-    profile_dir_name: str = "Profile 1",
+    profile_dir_name: str | None = None,
+    url: str | None = None,
+    visibility: str | None = None,
+    strict_invisibility: bool | None = None,
 ) -> dict:
     from ff_browser_routes import route_plan as live_route_plan
     return live_route_plan(
@@ -341,6 +345,9 @@ def route_plan(
         capability=capability,
         prefer=prefer,
         profile_dir_name=profile_dir_name,
+        url=url,
+        visibility=visibility,
+        strict_invisibility=strict_invisibility,
     )
 
 
@@ -429,6 +436,7 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op == "capabilities":
         return {"schema": SCHEMA, "http_path": ENTRY_PATH, "mcp_transport": "stdio",
                 "operations": sorted(operations),
+                "site_read_commands": list(SITE_READ_COMMANDS) if "site_read" in operations else [],
                 "owner_chrome_hidden_commands": list(OWNER_CHROME_HIDDEN_COMMANDS) if "owner_chrome_hidden" in operations else [],
                 "browser_commands": list(BROWSER_COMMANDS) if "private_browser" in operations else [],
                 "managed_browser_commands": list(BROWSER_COMMANDS) if "managed_browser" in operations else [],
@@ -447,13 +455,22 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
                 "foreground_fallback": False, "automatic_mutation_replay": False}
     if op == "route_plan":
         default_profile = getattr(getattr(hub, "owner_chrome_secondary", None), "profile_dir_name", None) or "Profile 1"
+        explicit_profile = args.get("profile_dir_name")
         return route_plan(
             scope,
             args.get("surface", "browser"),
             hub=hub,
             capability=args.get("capability", "dom"),
             prefer=args.get("prefer"),
-            profile_dir_name=str(args.get("profile_dir_name") or default_profile),
+            profile_dir_name=str(explicit_profile) if explicit_profile is not None else (
+                None if args.get("capability") in {
+                    "background_tab_read", "owner_background_tab_read", "no_interruption_site_read",
+                    "background_tab_form", "owner_background_tab_form", "no_interruption_form",
+                } else default_profile
+            ),
+            url=args.get("url"),
+            visibility=args.get("visibility"),
+            strict_invisibility=args.get("strict_invisibility"),
         )
     if op == "session_open":
         if args:
@@ -462,6 +479,10 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op == "audit_read":
         args = {**args, "task_id": scope["task_id"]}
     command = args.get("command")
+    if op == "site_read":
+        sr_cmd = "read" if command is None else command
+        if sr_cmd not in SITE_READ_COMMANDS or FORBIDDEN_OWNER_CHROME_HIDDEN_ARGS & args.keys():
+            raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)
     if op == "owner_chrome_hidden" and (
             command not in OWNER_CHROME_HIDDEN_COMMANDS or FORBIDDEN_OWNER_CHROME_HIDDEN_ARGS & args.keys()):
         raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)

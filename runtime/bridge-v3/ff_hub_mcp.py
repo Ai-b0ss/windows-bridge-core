@@ -32,7 +32,7 @@ MCP_ADAPTER_VERSION = "1.1.0"
 PUBLIC = {"capabilities", "hub_status", "route_plan"}
 OPS = PUBLIC | {"session_open", "session_resume", "session_heartbeat", "session_status", "session_close", "task_cancel",
                 "resource_claim", "resource_release", "resource_list", "permission_check", "permission_describe",
-                "owner_chrome_hidden", "browser", "private_browser", "managed_browser", "app_discover", "app_open", "app_windows", "app_observe", "app_find",
+                "site_read", "owner_chrome_hidden", "browser", "private_browser", "managed_browser", "app_discover", "app_open", "app_windows", "app_observe", "app_find",
                 "app_act", "app_capture", "app_document", "app_close", "files", "terminal", "request_status",
                 "audit_read"}
 _PRIVATE_RESULT_KEYS = frozenset({"session_secret", "resume_token", "_mcp_owner", "_mcp_pending"})
@@ -42,6 +42,8 @@ TOOL = {
     "description": (
         "Shared FF Hub: call capabilities or route_plan first, then session_open with a unique task_id. "
         "Primary owner-auth browser route is owner_chrome_hidden (owner_chrome_profile1_hidden_secondary: windowless hidden target inside already-running owner Chrome Profile 1 via loopback CDP; inherits auth with zero cookie copying and zero visible side effects; fail-closed if CDP or Profile 1 default context is unavailable — NEVER silently substitute an isolated profile). "
+        "For a no-interruption read-only site read using only already authorized and connected supported providers, use site_read (or route_plan capability='background_tab_read' with url and visibility='background_tab'|'strict_invisible'): distinguishes ordinary non-activating background tabs from strict invisibility (never substitutes a visible tab when strict invisibility is requested), reports one actionable capability result before any UI or pending request when no provider is eligible, and closes owned tabs deterministically. FF Browser Companion 0.1.1 only supports downloads and Native Messaging (never a browser page reader). "
+        "For supported background form operations on already authorized owned tabs without foreground interaction or policy changes, plan with route_plan capability='background_tab_form' and drive owned tabs through owner_chrome_hidden or browser (open, observe/snapshot, act: fill|click|select|check|uncheck|press, wait_for, reload, read, close) with a stable request_key for every mutation to prevent duplicate submission. "
         "Optional isolated mode (no owner auth): managed_browser or private_browser. "
         "Explicit visible-tab extension mode: browser (adds tabs to owner Chrome tab strip; hidden secondary window unsupported). "
         "Use a stable request_key for mutations. After a lost reply call request_status with the same key; "
@@ -73,11 +75,15 @@ TOOL = {
                 "type": "object",
                 "description": "Operation-specific arguments (command, url, tab_id, profile_dir_name, browser_id, profile_id, app, path, argv, etc.).",
                 "properties": {
-                    "command": {"type": "string", "description": "Sub-command for owner_chrome_hidden/browser/managed_browser/private_browser/files/terminal/app_document."},
+                    "command": {"type": "string", "description": "Sub-command for site_read/owner_chrome_hidden/browser/managed_browser/private_browser/files/terminal/app_document (including reload and wait_for on owned browser tabs)."},
                     "surface": {"type": "string", "enum": ["browser", "app"], "description": "Target surface for route_plan."},
-                    "capability": {"type": "string", "description": "Requested capability for route_plan (owner_profile_hidden, dom, extension_bridge, download)."},
+                    "capability": {"type": "string", "description": "Requested capability for route_plan (background_tab_read, background_tab_form, owner_profile_hidden, dom, extension_bridge, download)."},
                     "prefer": {"type": "string", "description": "Optional preferred route name for route_plan."},
-                    "profile_dir_name": {"type": "string", "description": "Owner Chrome profile directory name (e.g. 'Default' or 'Profile 1') for owner_chrome_hidden/route_plan."},
+                    "visibility": {"type": "string", "enum": ["background_tab", "strict_invisible"], "description": "Target visibility for site_read/route_plan: ordinary non-activating background_tab vs strict_invisible (never substitutes visible tabs)."},
+                    "strict_invisibility": {"type": "boolean", "description": "When true, requires a fully invisible windowless target and forbids substituting a visible browser tab."},
+                    "read_mode": {"type": "string", "enum": ["read", "observe", "snapshot"], "description": "Read-only capture mode for site_read (read, observe, snapshot)."},
+                    "max_chars": {"type": "integer", "minimum": 100, "maximum": 400000, "description": "Maximum text characters returned by site_read/read/snapshot."},
+                    "profile_dir_name": {"type": "string", "description": "Owner Chrome profile directory name (e.g. 'Default' or 'Profile 1') for site_read/owner_chrome_hidden/route_plan."},
                     "connect_ws": {"type": "boolean", "description": "For owner_chrome_hidden preflight: actively attach via loopback CDP WebSocket (requires Hub policy grant and Chrome confirmation dialog if prompted)."},
                     "host": {"type": "string", "description": "Optional concrete target hostname (e.g. 'example.com') for site-scoped owner_chrome_hidden preflight connect_ws."},
                     "viewport": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}}, "description": "Emulated {width, height} viewport for owner_chrome_hidden open."},
@@ -89,13 +95,17 @@ TOOL = {
                     "profile_name": {"type": "string", "description": "Alias for profile_id on optional isolated managed_browser/private_browser open."},
                     "persistent_profile": {"type": "boolean", "description": "Persist optional isolated profile across browser restarts."},
                     "action": {"type": "string", "description": "DOM action (click, fill, select, check, uncheck, press)."},
-                    "operation": {"type": "string", "description": "DOM operation alias (fill, click, select) for owner_chrome_hidden/private_browser act."},
+                    "operation": {"type": "string", "description": "DOM operation alias (fill, click, select, check, uncheck, press) for owner_chrome_hidden/private_browser act."},
                     "selector": {"type": "string", "description": "CSS selector for owner_chrome_hidden read/act."},
                     "ref": {"type": "string", "description": "Snapshot element ref for observe/act."},
                     "snapshot": {"type": "string", "description": "Snapshot token from observe."},
                     "target": {"type": "object", "additionalProperties": True, "description": "Element locator or permission target object."},
                     "value": {"description": "Action value for fill/select."},
+                    "key": {"type": "string", "description": "Key name for background DOM press action (e.g. Enter, Escape, Tab)."},
+                    "condition": {"type": "object", "additionalProperties": True, "description": "Observable condition object for browser/owner_chrome_hidden wait_for."},
                     "postcondition": {"type": "object", "additionalProperties": True, "description": "Observable postcondition for browser/app act."},
+                    "timeout_ms": {"type": "number", "description": "Bounded operation timeout in milliseconds for navigate/reload/act/wait_for."},
+                    "ignore_cache": {"type": "boolean", "description": "Optional cache-bypass flag for owner_chrome_hidden reload."},
                     "app": {"type": "string", "description": "Catalog app ID, alias or path for app_discover/app_open."},
                     "app_id": {"type": "string", "description": "Owned private desktop app identifier."},
                     "hwnd": {"type": "integer", "description": "Owned window handle on the private desktop."},
@@ -348,7 +358,8 @@ class Adapter:
         if "request_key" in params and key is not None and (not isinstance(key, str) or not 8 <= len(key) <= 200):
             raise HubError("REQUEST_KEY_INVALID", execution_started=False)
         if op in PUBLIC:
-            result = public_result(self._send(op, args))
+            send_args = {**args, "agent_id": self.agent} if (op == "route_plan" and "agent_id" not in args) else args
+            result = public_result(self._send(op, send_args))
             if op == "capabilities":
                 operations = {name: spec for name, spec in result.get("operations", {}).items() if name in OPS}
                 operations["session_open"] = {"session": False, "args": {"note": "str?"}}

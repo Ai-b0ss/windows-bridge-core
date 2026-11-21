@@ -1,6 +1,8 @@
 # FF Browser Companion
 
-Companion связывает загрузки Chrome с локальным Windows Bridge через Native Messaging. Расширение использует разрешения `downloads` и `nativeMessaging`. Для работы со страницей, DOM и вкладками используются соответствующие маршруты Bridge.
+Companion связывает загрузки Chrome с локальным Windows Bridge через Native Messaging. По фактическому манифесту версии `0.1.1` (`runtime/bridge-v3/browser_companion/manifest.json`) расширение запрашивает **только** разрешения `downloads` и `nativeMessaging` (без `tabs`, `scripting`, `debugger` и `host_permissions`).
+
+**Важная граница возможностей:** FF Browser Companion **не является** средством открытия вкладок, чтения веб-страниц или заполнения/отправки форм (`browser_page_reader: false`, `page_read_supported: false`, `tab_open_supported: false`). Он никогда не рекламируется и не выбирается как провайдер чтения страниц или фоновых форм в `route_plan`, `site_read`, `agent_workflows` или диагностике Bridge. Для чтения страниц и фоновых операций с формами используются исключительно поддерживаемые маршруты Hub (`owner_chrome_profile1_hidden_secondary` для строго невидимой работы или `owner_chrome_extension` для обычной фоновой вкладки без активации, только при подтверждённой авторизации, соединении, чтении и владении).
 
 ## Диагностика соединения
 

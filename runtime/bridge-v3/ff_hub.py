@@ -43,10 +43,22 @@ from cua_owner_chrome_secondary import (
     OwnerChromeHiddenSecondaryManager,
     OwnerChromeSecondaryError,
     ROUTE_NAME as OWNER_CHROME_HIDDEN_ROUTE,
+    validate_profile_dir_name,
     valid_url as valid_owner_chrome_url,
 )
 from ff_agent_entry import ENTRY_PATH, SCHEMA as ENTRY_SCHEMA, EntryArtifacts, EntryAuthority, entry_call
-from ff_browser_routes import RouteAffinityStore, route_plan as live_route_plan
+from ff_browser_routes import (
+    BACKGROUND_TAB_FORM_CAPABILITIES,
+    BACKGROUND_TAB_READ_CAPABILITIES,
+    OWNER_CHROME_ROUTE,
+    SUPPORTED_BACKGROUND_FORM_ACTIONS,
+    RouteAffinityStore,
+    evaluate_no_interruption_site_read,
+    inspect_companion_manifest,
+    normalize_visibility_mode,
+    route_plan as live_route_plan,
+    validate_site_read_url,
+)
 from ff_hub_permissions import RISK_CLASSES, PermissionError_, Policy, _clean_host_pattern
 from ff_hub_secrets import SecretError, Vault
 from ff_hub_store import HubError, HubStore, ORPHAN_TTL_SECONDS, RESOURCE_KINDS, SESSION_TTL_SECONDS
@@ -59,6 +71,18 @@ MAX_HIDDEN_SESSIONS = 6
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MANAGED_BROWSER_OPEN_ARGS = ("url", "sticky", "profile_id", "profile_name", "profile_dir", "persistent_profile")
 PRIVATE_BROWSER_OPEN_ARGS = ("profile_id", "profile_name", "persistent_profile")
+SITE_READ_ALLOWED_ARGS = frozenset({
+    "command", "url", "visibility", "strict_invisibility",
+    "read_mode", "selector", "max_chars", "profile_dir_name", "timeout_ms",
+})
+SITE_READ_FORBIDDEN_ARGS = frozenset({
+    "foreground", "act", "action", "operation", "click", "fill", "type", "press",
+    "evaluate", "expression", "script", "auto_approve", "bypass_permissions",
+    "grant_access", "change_chrome_settings", "stealth", "extract_cookies",
+    "extract_credentials", "copy_profile", "new_window", "newWindow",
+    "window_state", "windowState", "spawn_new_process", "second_process",
+    "user_data_dir", "cdp_endpoint",
+})
 
 
 def default_state_dir() -> Path:
@@ -662,6 +686,14 @@ class Hub:
             if command == "navigate":
                 self._permit(session, "browser_own_tabs", {"host": urllib.parse.urlsplit(str(args.get("url") or "")).hostname or ""}, action="browser.navigate")
                 result = self.browser.call("navigate", {**base, "url": args.get("url"), "timeout_ms": args.get("timeout_ms")})
+            elif command == "reload":
+                expected_host = urllib.parse.urlsplit(str(resource["meta"].get("url") or "")).hostname or ""
+                self._permit(session, "browser_own_tabs", {"host": expected_host}, action="browser.reload")
+                result = self.browser.call("reload", {
+                    **base,
+                    **({"timeout_ms": args["timeout_ms"]} if "timeout_ms" in args else {}),
+                    "expected_host": expected_host,
+                })
             elif command in {"snapshot", "read", "wait_for", "screenshot"}:
                 self._permit(session, "read_diagnose", action=f"browser.{command}")
                 result = self.browser.call(command, {**base, **{key: args[key] for key in
@@ -683,7 +715,7 @@ class Hub:
                                                          "expected_host": urllib.parse.urlsplit(str(resource["meta"].get("url") or "")).hostname or ""})
             else:
                 raise HubError("BROWSER_COMMAND_UNSUPPORTED", command=command,
-                               commands=["status", "open", "list", "navigate", "snapshot", "read", "act", "wait_for",
+                               commands=["status", "open", "list", "navigate", "reload", "snapshot", "read", "act", "wait_for",
                                          "screenshot", "evaluate", "restore", "close"])
         except HubError as exc:
             if exc.code == "TAB_NOT_FOUND":
@@ -836,11 +868,11 @@ class Hub:
             return result
         if command == "screenshot":
             return self._call_owner_chrome_secondary("screenshot", base)
-        if command not in {"navigate", "observe", "read", "act", "evaluate"}:
+        if command not in {"navigate", "reload", "observe", "read", "act", "wait_for", "evaluate"}:
             raise HubError(
                 "OWNER_CHROME_HIDDEN_COMMAND_UNSUPPORTED",
                 command=command,
-                commands=["preflight", "status", "open", "list", "navigate", "observe", "read", "act", "evaluate", "screenshot", "close"],
+                commands=["preflight", "status", "open", "list", "navigate", "reload", "observe", "read", "act", "wait_for", "evaluate", "screenshot", "close"],
                 execution_started=False,
             )
         if command == "navigate":
@@ -853,12 +885,518 @@ class Hub:
         self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action=f"owner_chrome_hidden.{command}")
         if command == "evaluate":
             self._permit(session, "browser_script", {"host": host}, action="owner_chrome_hidden.evaluate")
-        payload = {**base, **{k: v for k, v in args.items() if k not in {"command", "tab_id", "target_id"}}}
+        payload = {**base, **{k: v for k, v in args.items() if k not in {"command", "tab_id", "target_id", "expected_host"}}}
+        if command in {"reload", "act", "wait_for", "evaluate"} and host:
+            payload["expected_host"] = host
         result = self._call_owner_chrome_secondary(command, payload)
         new_url = result.get("url_after") or result.get("url")
         if isinstance(new_url, str) and new_url and new_url != resource["meta"].get("url"):
             self.store.update_resource_meta(resource["resource_id"], {**resource["meta"], "url": new_url})
         return result
+
+    # ---- user-facing no-interruption read-only site workflow ------------------------------
+    def _scope_for_session(self, session: dict) -> dict[str, Any]:
+        scope: dict[str, Any] = {"agent_id": session["agent_id"], "task_id": session["task_id"]}
+        grant_id = self.store.entry_grant_id(session["session_id"])
+        if grant_id:
+            row = self.entry_authority._row(grant_id)
+            scopes = set(filter(None, row["scopes"].split(","))) if row else set()
+            scope["scopes"] = scopes
+        return scope
+
+    def _host_allowed_for_provider(self, agent_id: str, provider: str, host: str) -> bool:
+        if not host:
+            return False
+        if provider == OWNER_CHROME_HIDDEN_ROUTE:
+            return self.policy.decide(agent_id, "owner_chrome_hidden_secondary", {"host": host}).get("decision") == "allow"
+        if provider == OWNER_CHROME_ROUTE:
+            return (
+                self.policy.decide(agent_id, "browser_own_tabs", {"host": host}).get("decision") == "allow"
+                and self.policy.decide(agent_id, "read_diagnose", {"host": host}).get("decision") == "allow"
+            )
+        return False
+
+    def _site_read(self, session: dict, args: dict, *, request_key: Any = None) -> dict:
+        """Read-only, no-interruption workflow for a specifically requested site.
+
+        Uses only already authorized and connected supported providers, distinguishes
+        ordinary non-activating background tabs from strict invisibility, preserves
+        all permissions, and reports one actionable capability result before any UI
+        or pending permission request if no eligible provider exists.
+        """
+        forbidden = SITE_READ_FORBIDDEN_ARGS & args.keys()
+        if forbidden:
+            raise HubError(
+                "SITE_READ_ARG_FORBIDDEN",
+                "mutating, foreground, stealth, bypass, or credential-access arguments are forbidden in read-only site_read",
+                forbidden_args=sorted(forbidden),
+                execution_started=False,
+            )
+        unknown = set(args) - SITE_READ_ALLOWED_ARGS
+        if unknown:
+            raise HubError(
+                "ARGS_INVALID",
+                "unsupported argument for site_read",
+                unknown_args=sorted(unknown),
+                execution_started=False,
+            )
+        raw_command = args.get("command")
+        command = "read" if raw_command is None else str(raw_command)
+        if command not in {"plan", "read"}:
+            raise HubError(
+                "SITE_READ_COMMAND_UNSUPPORTED",
+                "site_read only supports 'plan' and 'read'",
+                command=command,
+                commands=["plan", "read"],
+                execution_started=False,
+            )
+        validated_url, host = validate_site_read_url(args.get("url"))
+        vis_mode, strict_inv = normalize_visibility_mode(
+            visibility=args.get("visibility"),
+            strict_invisibility=args.get("strict_invisibility"),
+        )
+        raw_mode = args.get("read_mode")
+        read_mode = "read" if raw_mode is None else str(raw_mode)
+        if read_mode not in {"read", "observe", "snapshot"}:
+            raise HubError(
+                "ARGS_INVALID",
+                "read_mode must be 'read', 'observe', or 'snapshot'",
+                field="read_mode",
+                execution_started=False,
+            )
+        max_chars = args.get("max_chars", 60000)
+        if type(max_chars) is not int or not 100 <= max_chars <= 400000:
+            raise HubError(
+                "ARGS_INVALID",
+                "max_chars must be an integer between 100 and 400000",
+                field="max_chars",
+                execution_started=False,
+            )
+        selector = args.get("selector")
+        if selector is not None and (not isinstance(selector, str) or not selector.strip() or len(selector) > 512):
+            raise HubError(
+                "ARGS_INVALID",
+                "selector must be a short non-empty CSS selector string",
+                field="selector",
+                execution_started=False,
+            )
+        profile_dir_name = args.get("profile_dir_name")
+        if profile_dir_name is not None:
+            try:
+                profile_dir_name = validate_profile_dir_name(profile_dir_name)
+            except OwnerChromeSecondaryError as exc:
+                raise HubError(exc.code, exc.message, execution_started=False, **exc.details) from None
+        timeout_ms = args.get("timeout_ms")
+        if timeout_ms is not None and (
+            type(timeout_ms) not in (int, float) or not math.isfinite(timeout_ms) or not 1000 <= timeout_ms <= 120000
+        ):
+            raise HubError(
+                "ARGS_INVALID",
+                "timeout_ms must be between 1000 and 120000",
+                field="timeout_ms",
+                execution_started=False,
+            )
+
+        scope = self._scope_for_session(session)
+        plan = evaluate_no_interruption_site_read(
+            scope,
+            validated_url,
+            hub=self,
+            visibility=vis_mode,
+            strict_invisibility=strict_inv,
+            profile_dir_name=profile_dir_name,
+        )
+        if command == "plan":
+            self.store.audit(
+                "site_read_plan",
+                agent_id=session["agent_id"],
+                task_id=session["task_id"],
+                session_id=session["session_id"],
+                host=host,
+                visibility=vis_mode,
+                strict_invisibility=strict_inv,
+                selected_provider=plan["selected_provider"],
+            )
+            return plan
+        if plan["selected_provider"] is None:
+            self.store.audit(
+                "site_read_ineligible",
+                agent_id=session["agent_id"],
+                task_id=session["task_id"],
+                session_id=session["session_id"],
+                host=host,
+                visibility=vis_mode,
+                strict_invisibility=strict_inv,
+                error_code=plan["error_code"],
+            )
+            return plan
+
+        owner = self._owner(session)
+
+        def execute_read() -> dict:
+            live_plan = evaluate_no_interruption_site_read(
+                scope,
+                validated_url,
+                hub=self,
+                visibility=vis_mode,
+                strict_invisibility=strict_inv,
+                profile_dir_name=profile_dir_name,
+            )
+            provider = live_plan["selected_provider"]
+            if provider is None:
+                raise HubError(
+                    "NO_ELIGIBLE_NO_INTERRUPTION_PROVIDER",
+                    live_plan["summary"],
+                    retry_safe=True,
+                    execution_started=False,
+                    **{k: v for k, v in live_plan.items() if k != "message"},
+                )
+
+            if provider == OWNER_CHROME_HIDDEN_ROUTE:
+                effective_profile = profile_dir_name or getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
+                tab_id: str | None = None
+                target_id: str | None = None
+                resource: dict | None = None
+                content: dict[str, Any] | None = None
+                redirect_blocked_host: str | None = None
+                teardown: dict[str, Any] = {
+                    "closed": False,
+                    "cleanup_verified": False,
+                    "target_closed_in_browser": False,
+                    "primary_window_untouched": True,
+                    "resources_retained": 0,
+                }
+                try:
+                    tab = self._call_owner_chrome_secondary(
+                        "open",
+                        {"owner": owner, "url": validated_url, "profile_dir_name": effective_profile},
+                    )
+                    tab_id = str(tab["tab_id"])
+                    target_id = tab.get("target_id")
+                    resource = self.store.claim(
+                        session,
+                        "owner_chrome_hidden_target",
+                        tab_id,
+                        meta={
+                            "url": tab.get("url") or validated_url,
+                            "target_id": target_id,
+                            "profile_dir_name": tab.get("profile_dir_name") or effective_profile,
+                            "route": OWNER_CHROME_HIDDEN_ROUTE,
+                        },
+                    )
+                    opened_url = str(tab.get("url") or validated_url)
+                    opened_host = _extract_url_host(opened_url)
+                    if opened_host and opened_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, opened_host):
+                        redirect_blocked_host = opened_host
+                    else:
+                        if read_mode in {"observe", "snapshot"}:
+                            content = self._call_owner_chrome_secondary("observe", {"owner": owner, "tab_id": tab_id})
+                        else:
+                            read_args: dict[str, Any] = {"owner": owner, "tab_id": tab_id, "max_chars": max_chars}
+                            if selector is not None:
+                                read_args["selector"] = selector
+                            content = self._call_owner_chrome_secondary("read", read_args)
+                        final_url = str(content.get("url") or opened_url)
+                        final_host = _extract_url_host(final_url)
+                        if final_host and final_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, final_host):
+                            redirect_blocked_host = final_host
+                            content = None
+                finally:
+                    if tab_id is not None:
+                        try:
+                            close_res = self._call_owner_chrome_secondary("close", {"owner": owner, "tab_id": tab_id})
+                            closed_ok = close_res.get("closed") is True and close_res.get("target_closed_in_browser") is True
+                            if closed_ok and resource is not None:
+                                self.store.release(session, resource_id=resource["resource_id"])
+                            this_retained = int(any(
+                                item["key"] == tab_id
+                                for item in self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target")
+                            ))
+                            teardown = {
+                                "closed": closed_ok,
+                                "cleanup_verified": closed_ok and this_retained == 0,
+                                "target_closed_in_browser": bool(close_res.get("target_closed_in_browser")),
+                                "primary_window_untouched": bool(close_res.get("primary_window_untouched", True)),
+                                "resources_retained": this_retained,
+                                **({"error_code": close_res.get("error_code")} if not closed_ok and close_res.get("error_code") else {}),
+                            }
+                        except HubError as exc:
+                            this_retained = int(any(
+                                item["key"] == tab_id
+                                for item in self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target")
+                            ))
+                            teardown = {
+                                "closed": False,
+                                "cleanup_verified": False,
+                                "target_closed_in_browser": False,
+                                "primary_window_untouched": True,
+                                "resources_retained": this_retained,
+                                "error_code": exc.code,
+                            }
+
+                if redirect_blocked_host is not None:
+                    self.store.audit(
+                        "site_read_redirect_blocked",
+                        agent_id=session["agent_id"],
+                        task_id=session["task_id"],
+                        session_id=session["session_id"],
+                        provider=provider,
+                        requested_host=host,
+                        final_host=redirect_blocked_host,
+                        cleanup_verified=teardown["cleanup_verified"],
+                    )
+                    return {
+                        "schema": "ff-no-interruption-site-read-v1",
+                        "ok": False,
+                        "eligible": False,
+                        "executed": True,
+                        "read_only": True,
+                        "provider": provider,
+                        "hub_op": "owner_chrome_hidden",
+                        "visibility_requested": vis_mode,
+                        "strict_invisibility": strict_inv,
+                        "actual_visibility": "strict_invisible",
+                        "visible_tab_strip": False,
+                        "windowless": True,
+                        "tab_activated": False,
+                        "prompts_triggered": False,
+                        "pending_request_created": False,
+                        "requested_url": validated_url,
+                        "requested_host": host,
+                        "final_host": redirect_blocked_host,
+                        "error_code": "REDIRECT_HOST_NOT_GRANTED",
+                        "content_withheld": True,
+                        "teardown": teardown,
+                        "permissions_preserved": True,
+                        "chrome_settings_modified": False,
+                        "credentials_extracted": False,
+                    }
+
+                assert content is not None
+                out: dict[str, Any] = {
+                    "schema": "ff-no-interruption-site-read-v1",
+                    "ok": True,
+                    "eligible": True,
+                    "executed": True,
+                    "read_only": True,
+                    "provider": provider,
+                    "hub_op": "owner_chrome_hidden",
+                    "visibility_requested": vis_mode,
+                    "strict_invisibility": strict_inv,
+                    "actual_visibility": "strict_invisible",
+                    "visible_tab_strip": False,
+                    "windowless": True,
+                    "tab_activated": False,
+                    "prompts_triggered": False,
+                    "pending_request_created": False,
+                    "requested_url": validated_url,
+                    "final_url": content.get("url") or validated_url,
+                    "host": host,
+                    "title": content.get("title") or "",
+                    "read_mode": read_mode,
+                    "text": content.get("text") or "",
+                    "truncated": bool(content.get("truncated", False)),
+                    **({"controls": content.get("controls", [])} if "controls" in content else {}),
+                    "ownership": {
+                        "owner": owner,
+                        "tab_id": tab_id,
+                        "target_id": target_id,
+                        "verified": True,
+                    },
+                    "teardown": teardown,
+                    "permissions_preserved": True,
+                    "chrome_settings_modified": False,
+                    "credentials_extracted": False,
+                }
+                self.store.audit(
+                    "site_read_completed",
+                    agent_id=session["agent_id"],
+                    task_id=session["task_id"],
+                    session_id=session["session_id"],
+                    provider=provider,
+                    host=host,
+                    visibility=vis_mode,
+                    cleanup_verified=teardown["cleanup_verified"],
+                )
+                return out
+
+            if provider == OWNER_CHROME_ROUTE:
+                if strict_inv:
+                    raise HubError(
+                        "VISIBLE_TAB_SUBSTITUTION_FORBIDDEN",
+                        "visible tab provider cannot be used when strict invisibility is requested",
+                        execution_started=False,
+                        retry_safe=False,
+                    )
+                tab_id = None
+                resource = None
+                tab_meta: dict[str, Any] = {}
+                content = None
+                redirect_blocked_host = None
+                teardown = {
+                    "closed": False,
+                    "cleanup_verified": False,
+                    "page_closed_in_browser": False,
+                    "primary_window_untouched": True,
+                    "resources_retained": 0,
+                }
+                try:
+                    try:
+                        tab = self.browser.call("tab_open", {"owner": owner, "url": validated_url})
+                    except HubError as exc:
+                        if exc.details.get("cleanup_failed") and isinstance(exc.details.get("tab_id"), str):
+                            self.store.claim(session, "browser_tab", exc.details["tab_id"], meta={"url": validated_url})
+                        raise
+                    tab_meta = dict(tab)
+                    tab_id = str(tab["tab_id"])
+                    resource = self.store.claim(
+                        session,
+                        "browser_tab",
+                        tab_id,
+                        meta={"url": tab.get("url") or validated_url},
+                    )
+                    opened_url = str(tab.get("url") or validated_url)
+                    opened_host = _extract_url_host(opened_url)
+                    if opened_host and opened_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, opened_host):
+                        redirect_blocked_host = opened_host
+                    else:
+                        if read_mode in {"snapshot", "observe"}:
+                            content = self.browser.call("snapshot", {"owner": owner, "tab_id": tab_id, "max_chars": max_chars})
+                        else:
+                            read_args = {"owner": owner, "tab_id": tab_id, "max_chars": max_chars}
+                            if selector is not None:
+                                read_args["target"] = {"selector": selector}
+                            content = self.browser.call("read", read_args)
+                        final_url = str(content.get("url") or opened_url)
+                        final_host = _extract_url_host(final_url)
+                        if final_host and final_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, final_host):
+                            redirect_blocked_host = final_host
+                            content = None
+                finally:
+                    if tab_id is not None:
+                        try:
+                            close_res = self.browser.call("tab_close", {"owner": owner, "tab_id": tab_id, "forget_unconfirmed": False})
+                            closed_ok = close_res.get("page_closed_in_browser") is True
+                            if closed_ok and resource is not None:
+                                self.store.release(session, resource_id=resource["resource_id"])
+                            this_retained = int(any(
+                                item["key"] == tab_id
+                                for item in self.store.resources(session_id=session["session_id"], kind="browser_tab")
+                            ))
+                            teardown = {
+                                "closed": closed_ok,
+                                "cleanup_verified": closed_ok and this_retained == 0,
+                                "page_closed_in_browser": bool(close_res.get("page_closed_in_browser")),
+                                "primary_window_untouched": True,
+                                "resources_retained": this_retained,
+                                **({"error_code": close_res.get("reason") or "TAB_CLEANUP_UNCONFIRMED"} if not closed_ok else {}),
+                            }
+                        except HubError as exc:
+                            this_retained = int(any(
+                                item["key"] == tab_id
+                                for item in self.store.resources(session_id=session["session_id"], kind="browser_tab")
+                            ))
+                            teardown = {
+                                "closed": False,
+                                "cleanup_verified": False,
+                                "page_closed_in_browser": False,
+                                "primary_window_untouched": True,
+                                "resources_retained": this_retained,
+                                "error_code": exc.code,
+                            }
+
+                if redirect_blocked_host is not None:
+                    self.store.audit(
+                        "site_read_redirect_blocked",
+                        agent_id=session["agent_id"],
+                        task_id=session["task_id"],
+                        session_id=session["session_id"],
+                        provider=provider,
+                        requested_host=host,
+                        final_host=redirect_blocked_host,
+                        cleanup_verified=teardown["cleanup_verified"],
+                    )
+                    return {
+                        "schema": "ff-no-interruption-site-read-v1",
+                        "ok": False,
+                        "eligible": False,
+                        "executed": True,
+                        "read_only": True,
+                        "provider": provider,
+                        "hub_op": "browser",
+                        "visibility_requested": vis_mode,
+                        "strict_invisibility": strict_inv,
+                        "actual_visibility": "background_tab",
+                        "visible_tab_strip": True,
+                        "windowless": False,
+                        "tab_activated": False,
+                        "prompts_triggered": False,
+                        "pending_request_created": False,
+                        "requested_url": validated_url,
+                        "requested_host": host,
+                        "final_host": redirect_blocked_host,
+                        "error_code": "REDIRECT_HOST_NOT_GRANTED",
+                        "content_withheld": True,
+                        "teardown": teardown,
+                        "permissions_preserved": True,
+                        "chrome_settings_modified": False,
+                        "credentials_extracted": False,
+                    }
+
+                assert content is not None
+                out = {
+                    "schema": "ff-no-interruption-site-read-v1",
+                    "ok": True,
+                    "eligible": True,
+                    "executed": True,
+                    "read_only": True,
+                    "provider": provider,
+                    "hub_op": "browser",
+                    "visibility_requested": vis_mode,
+                    "strict_invisibility": strict_inv,
+                    "actual_visibility": "background_tab",
+                    "visible_tab_strip": True,
+                    "windowless": False,
+                    "tab_activated": False,
+                    "document_visibility": content.get("visibility"),
+                    "prompts_triggered": False,
+                    "pending_request_created": False,
+                    "requested_url": validated_url,
+                    "final_url": content.get("url") or validated_url,
+                    "host": host,
+                    "title": content.get("title") or "",
+                    "read_mode": read_mode,
+                    **({"snapshot": content.get("snapshot") or "", "format": content.get("format")}
+                       if "snapshot" in content else {"text": content.get("text") or ""}),
+                    "truncated": bool(content.get("truncated", False)),
+                    "ownership": {
+                        "owner": owner,
+                        "tab_id": tab_id,
+                        "durable_identity": bool(tab_meta.get("durable_identity")),
+                        "verified": True,
+                    },
+                    "teardown": teardown,
+                    "permissions_preserved": True,
+                    "chrome_settings_modified": False,
+                    "credentials_extracted": False,
+                }
+                self.store.audit(
+                    "site_read_completed",
+                    agent_id=session["agent_id"],
+                    task_id=session["task_id"],
+                    session_id=session["session_id"],
+                    provider=provider,
+                    host=host,
+                    visibility=vis_mode,
+                    cleanup_verified=teardown["cleanup_verified"],
+                )
+                return out
+
+            raise HubError("PROVIDER_UNSUPPORTED", provider=provider, execution_started=False)
+
+        if request_key is not None:
+            return self.store.journal_execute(session, request_key, "site_read", args, execute_read)
+        return execute_read()
 
     # ---- GUI applications on a private desktop -------------------------------------------
     def _hidden_session(self, session: dict, create: bool) -> Any:
@@ -1496,11 +2034,31 @@ class Hub:
                 "primary_owner_auth": OWNER_CHROME_HIDDEN_ROUTE,
                 "primary_owner_auth_op": "owner_chrome_hidden",
                 "primary_owner_auth_requires_cdp_and_default_context": True,
+                "no_interruption_site_read_op": "site_read",
+                "no_interruption_visibility_modes": ["background_tab", "strict_invisible"],
+                "strict_invisibility_forbids_visible_tab_substitution": True,
+                "background_form_operations": {
+                    "route_plan_capability": "background_tab_form",
+                    "supported_hub_ops": ["owner_chrome_hidden", "browser"],
+                    "supported_actions": list(SUPPORTED_BACKGROUND_FORM_ACTIONS),
+                    "reload_supported": True,
+                    "wait_for_supported": True,
+                    "request_key_deduplication": True,
+                    "foreground_fallback": False,
+                    "policy_modified": False,
+                },
                 "optional_isolated_mode": "isolated_hidden_browser",
                 "optional_isolated_ops": ["managed_browser", "private_browser"],
                 "optional_isolated_satisfies_owner_auth": False,
                 "owner_chrome_visible_tab_op": "browser",
                 "owner_chrome_visible_tab_hidden_secondary_supported": False,
+                "companion_scope": {
+                    "name": "FF Browser Companion",
+                    "manifest_version": inspect_companion_manifest().get("manifest_version"),
+                    "permissions": inspect_companion_manifest().get("permissions"),
+                    "browser_page_reader": False,
+                    "page_read_supported": False,
+                },
                 "isolated_substitution_forbidden": True,
                 "silent_playwright_fallback": False,
             },
@@ -1518,15 +2076,42 @@ class Hub:
             ],
             "operations": {
                 "capabilities": {"session": False}, "hub_status": {"session": False},
-                "route_plan": {"session": False, "args": {"surface": "browser|app", "capability": "owner_profile_hidden|dom|extension_bridge|download?", "prefer": "str?", "profile_dir_name": "str?"}},
+                "route_plan": {"session": False, "args": {"surface": "browser|app", "capability": "background_tab_read|background_tab_form|owner_profile_hidden|dom|extension_bridge|download?", "prefer": "str?", "profile_dir_name": "str?", "url": "str?", "visibility": "background_tab|strict_invisible?", "strict_invisibility": "bool?"}},
                 "session_open": {"session": False, "args": {"agent_id": "str", "task_id": "str", "resume_token": "str?"}},
+                "site_read": {
+                    "read_only": True,
+                    "no_interruption": True,
+                    "commands": ["plan", "read"],
+                    "args": {
+                        "command": "plan|read?",
+                        "url": "http(s)://...",
+                        "visibility": "background_tab|strict_invisible?",
+                        "strict_invisibility": "bool?",
+                        "read_mode": "read|observe|snapshot?",
+                        "selector": "css selector?",
+                        "max_chars": "100..400000?",
+                        "profile_dir_name": "str?",
+                    },
+                    "provider_selection": (
+                        "Uses only already authorized and connected supported providers; never triggers user prompts "
+                        "or creates pending Hub requests on ineligibility; distinguishes ordinary background_tab from "
+                        "strict_invisible (never substitutes visible tab when strict invisibility is requested); "
+                        "FF Browser Companion 0.1.1 is downloads/nativeMessaging only and never a browser page reader."
+                    ),
+                },
                 "owner_chrome_hidden": {
                     "route": OWNER_CHROME_HIDDEN_ROUTE,
                     "primary_owner_auth": True,
-                    "mutating": "open/navigate/act/evaluate/close",
+                    "mutating": "open/navigate/reload/act/evaluate/close",
                     "request_key_required": True,
                     "risk_class": "owner_chrome_hidden_secondary",
-                    "commands": ["preflight", "status", "open", "list", "navigate", "observe", "read", "act", "evaluate", "screenshot", "close"],
+                    "commands": ["preflight", "status", "open", "list", "navigate", "reload", "observe", "read", "act", "wait_for", "evaluate", "screenshot", "close"],
+                    "act": {
+                        "operation": "fill|click|select|check|uncheck|press",
+                        "target": "{selector}|{ref,snapshot}|{id}|{name}|{label}",
+                        "postcondition": "{type:text_includes|url_equals|url_contains|value_equals|checked_equals}|{text_present}|{text_absent}|{url_contains}|{target,value|checked|state}",
+                        "foreground": "unsupported here; use the existing guarded Bridge desktop route",
+                    },
                     "consent_gates": {
                         "hub_policy": "Gate 1: local owner standing grant for owner_chrome_hidden_secondary (supports site-scoped --hosts <host>, --ttl, and immediate `ff_hub.py grant revoke <grant_id>`); checked before any Chrome connection",
                         "chrome_remote_debugging_dialog": "Gate 2: Chrome's native browser confirmation dialog on loopback WebSocket attach when /json/version returns HTTP 404 (kWithApprovalOnly); separate from Hub policy and never clicked automatically",
@@ -1564,9 +2149,9 @@ class Hub:
                 "permission_describe": {},
                 "secret_list": {}, "secret_use": {"mutating": True, "risk_class": "secret_use",
                                                    "args": {"name": "str", "use": "http|process", "request": "{...}"}},
-                "browser": {"mutating": "open/navigate/act/evaluate/restore/close", "risk_class": "browser_own_tabs",
+                "browser": {"mutating": "open/navigate/reload/act/evaluate/restore/close", "risk_class": "browser_own_tabs",
                             "explicit_owner_chrome_only": True,
-                            "commands": ["status", "open", "list", "navigate", "snapshot", "read", "act", "wait_for",
+                            "commands": ["status", "open", "list", "navigate", "reload", "snapshot", "read", "act", "wait_for",
                                          "screenshot", "evaluate", "restore", "close"],
                             "act": {"action": "click|fill|select|check|uncheck|press",
                                     "target": "{ref}|{selector}|{role,name}|{label}|{text}",
@@ -1720,15 +2305,25 @@ class Hub:
             scope = {"agent_id": args.get("agent_id"), "task_id": args.get("task_id")}
             if request.get("session_id") and request.get("session_secret"):
                 sess = self.store.authenticate(request.get("session_id"), request.get("session_secret"))
-                scope = {"agent_id": sess["agent_id"], "task_id": sess["task_id"]}
+                scope = self._scope_for_session(sess)
             default_profile = getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
+            cap = str(args.get("capability") or "dom")
+            explicit_profile = args.get("profile_dir_name")
+            resolved_profile = (
+                str(explicit_profile)
+                if explicit_profile is not None
+                else (None if cap in (BACKGROUND_TAB_READ_CAPABILITIES | BACKGROUND_TAB_FORM_CAPABILITIES) else default_profile)
+            )
             return live_route_plan(
                 scope,
                 surface=str(args.get("surface") or "browser"),
                 hub=self,
-                capability=str(args.get("capability") or "dom"),
+                capability=cap,
                 prefer=args.get("prefer"),
-                profile_dir_name=str(args.get("profile_dir_name") or default_profile),
+                profile_dir_name=resolved_profile,
+                url=args.get("url"),
+                visibility=args.get("visibility"),
+                strict_invisibility=args.get("strict_invisibility"),
             )
         if op == "hub_shutdown_idle":
             with self._hidden_lock:
@@ -1849,12 +2444,14 @@ class Hub:
                                  status=out.get("status", out.get("exit_code")))
                 return out
             return journaled(run)
+        if op == "site_read":
+            return self._site_read(session, args, request_key=request_key)
         if op == "browser":
-            if args.get("command") in {"open", "navigate", "act", "evaluate", "restore", "close"}:
+            if args.get("command") in {"open", "navigate", "reload", "act", "evaluate", "restore", "close"}:
                 return journaled(lambda: self._browser(session, args))
             return self._browser(session, args)
         if op == "owner_chrome_hidden":
-            if args.get("command") in {"open", "navigate", "act", "evaluate", "close"}:
+            if args.get("command") in {"open", "navigate", "reload", "act", "evaluate", "close"}:
                 return journaled(lambda: self._owner_chrome_hidden(session, args))
             return self._owner_chrome_hidden(session, args)
         if op == "files":
@@ -2264,6 +2861,20 @@ def main(argv: list[str] | None = None) -> int:
     cat_enroll.add_argument("--require-signed", action="store_true")
     cat_enroll.add_argument("--note", default="")
     catalog.add_parser("revoke").add_argument("--app-id", required=True)
+    site_read = commands.add_parser(
+        "site-read",
+        help="no-interruption read-only site workflow using only already authorized and connected providers",
+    )
+    site_read.add_argument("--url", required=True, help="concrete http(s) site URL to read")
+    site_read.add_argument("--agent", default="owner-cli", help="agent identity checked against existing Hub policy")
+    site_read.add_argument("--task", default=None, help="optional task id for the read-only session")
+    site_read.add_argument("--visibility", choices=["background_tab", "strict_invisible"], default=None)
+    site_read.add_argument("--strict-invisibility", action="store_true", help="require a windowless invisible target; never substitute a visible tab")
+    site_read.add_argument("--mode", choices=["read", "observe", "snapshot"], default="read")
+    site_read.add_argument("--selector", default=None)
+    site_read.add_argument("--max-chars", type=int, default=60000)
+    site_read.add_argument("--profile", default=None, help="optional explicit Chrome profile dir name")
+    site_read.add_argument("--plan-only", action="store_true", help="check provider eligibility without opening a session or tab")
     options = parser.parse_args(argv)
     state_dir = getattr(options, "serve_state_dir", None) or options.state_dir or default_state_dir()
     split = lambda text: [item.strip() for item in text.split(",") if item.strip()]
@@ -2395,6 +3006,53 @@ def main(argv: list[str] | None = None) -> int:
                                note=options.note))
             else:
                 show({"revoked": vault.revoke(options.name)})
+        elif options.command == "site-read":
+            client = HubClient(state_dir, timeout=60.0)
+            vis_arg = options.visibility
+            strict_arg = True if options.strict_invisibility else None
+            plan_args: dict[str, Any] = {
+                "surface": "browser",
+                "capability": "background_tab_read",
+                "agent_id": options.agent,
+                "url": options.url,
+            }
+            if vis_arg is not None:
+                plan_args["visibility"] = vis_arg
+            if strict_arg is not None:
+                plan_args["strict_invisibility"] = strict_arg
+            if options.profile is not None:
+                plan_args["profile_dir_name"] = options.profile
+            plan = client.call("route_plan", plan_args)
+            capability_result = plan.get("no_interruption_site_read") or plan
+            if options.plan_only or not capability_result.get("eligible"):
+                show(capability_result)
+                return 0 if capability_result.get("eligible") else 2
+            task_id = options.task or f"site-read-{_secrets.token_hex(6)}"
+            client.call("session_open", {"agent_id": options.agent, "task_id": task_id, "note": "site-read CLI"})
+            read_payload: dict[str, Any] = {
+                "command": "read",
+                "url": options.url,
+                "read_mode": options.mode,
+                "max_chars": options.max_chars,
+            }
+            if vis_arg is not None:
+                read_payload["visibility"] = vis_arg
+            if strict_arg is not None:
+                read_payload["strict_invisibility"] = strict_arg
+            if options.selector is not None:
+                read_payload["selector"] = options.selector
+            if options.profile is not None:
+                read_payload["profile_dir_name"] = options.profile
+            session_cleanup: dict[str, Any] | None = None
+            try:
+                result = client.call("site_read", read_payload, request_key=f"site-read-{_secrets.token_hex(8)}")
+            finally:
+                try:
+                    session_cleanup = client.call("session_close", {}, request_key=f"site-close-{_secrets.token_hex(8)}")
+                except Exception as close_exc:
+                    session_cleanup = {"closed": False, "cleanup_verified": False, "error": getattr(close_exc, "code", type(close_exc).__name__)}
+            show({**result, "session_cleanup": session_cleanup})
+            return 0 if result.get("ok") else 2
         elif options.command == "catalog":
             from ff_app_catalog import AppCatalog
             cat = AppCatalog(state_dir)
