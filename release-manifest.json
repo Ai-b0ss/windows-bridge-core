@@ -534,7 +534,7 @@
     "tests/integration/two_agent_isolated_rpc_smoke.py": "04f961e3c50659a94becb910bb929e7b6ce43cf7534118e60ad9a8385f2bf315",
     "tests/integration/two_agents_desktop.py": "6d7c1fbd7f7e48a077b12b66b3f0d1beed1077a61172f6e526cb42ca9ec8b53a",
     "tests/sidecar_observed_change.test.mjs": "c945208702e98fdd2b6eb9b7a0d21096118ce950dfe41d69d1575f7ee59d6a75",
-    "tests/test_agent_entry.py": "a4ee243ef260e74f46bf0f6e49cf02b446cb6d423b886a487e1e5e27b7798ddf",
+    "tests/test_agent_entry.py": "fcff9b8ac5508530aa592219ec70088dcffedcc35cdb8135c46abad2f10a7e57",
     "tests/test_agent_workflows.py": "05ab2d4c0789c17336fa8b1f3f7dfdd6857ddb2f77148c599d825ab5ddd11e7a",
     "tests/test_antigravity_headless_task.py": "c49ab21327d8249fcb2623b20a3a6d861a638a24fdf68b3fb18f83c82b3ba8ed",
     "tests/test_app_catalog.py": "8e32f6c142ac947ff9038387d96bd61d883fafb3fedcd266986ff3107beb3d45",
