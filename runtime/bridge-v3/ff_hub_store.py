@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import secrets
 import sqlite3
 import threading
@@ -69,14 +70,20 @@ def _ident(value: Any, field: str) -> str:
     return value
 
 
+def _positive_ttl(value: Any, default: float) -> float:
+    if type(value) in (int, float) and math.isfinite(value) and value > 0:
+        return float(value)
+    return float(default)
+
+
 class HubStore:
     def __init__(self, path: str | Path, *, clock: Callable[[], float] = time.time,
                  session_ttl: float = SESSION_TTL_SECONDS, orphan_ttl: float = ORPHAN_TTL_SECONDS):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.clock = clock
-        self.session_ttl = session_ttl
-        self.orphan_ttl = orphan_ttl
+        self.session_ttl = _positive_ttl(session_ttl, SESSION_TTL_SECONDS)
+        self.orphan_ttl = _positive_ttl(orphan_ttl, ORPHAN_TTL_SECONDS)
         self.boot_id = uuid.uuid4().hex
         self._lock = threading.RLock()
         self._running: set[str] = set()
@@ -101,7 +108,13 @@ class HubStore:
                               json.dumps(detail, ensure_ascii=False, sort_keys=True, default=str)[:8000]))
 
     def read_audit(self, *, agent_id: str | None = None, task_id: str | None = None, limit: int = 100) -> list[dict]:
-        limit = max(1, min(int(limit), 1000))
+        if type(limit) is not int:
+            raise HubError("ARGS_INVALID", "limit must be an integer", field="limit")
+        if agent_id is not None and not isinstance(agent_id, str):
+            raise HubError("ARGS_INVALID", field="agent_id")
+        if task_id is not None and not isinstance(task_id, str):
+            raise HubError("ARGS_INVALID", field="task_id")
+        limit = max(1, min(limit, 1000))
         query, params = "SELECT * FROM audit", []
         clauses = [(name, value) for name, value in (("agent_id", agent_id), ("task_id", task_id)) if value]
         if clauses:
@@ -129,6 +142,8 @@ class HubStore:
         evidence of identity: another caller can guess an agent_id/task_id.
         """
         agent_id, task_id = _ident(agent_id, "agent_id"), _ident(task_id, "task_id")
+        if note is not None and not isinstance(note, str):
+            raise HubError("ARGS_INVALID", "note must be a string", field="note", execution_started=False)
         now = self.clock()
         with self._lock:
             previous = self._db.execute(
@@ -145,11 +160,13 @@ class HubStore:
                     if row["state"] == "active":
                         self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (now, row["session_id"]))
                     return {"session_id": row["session_id"], "state": row["state"], "reused": True,
-                            "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
+                            "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl,
+                            "orphan_ttl_seconds": self.orphan_ttl}
                 if supersede_inactive_entry and entry_grant_id and row["entry_grant_id"] and row["state"] != "active":
                     adopt_previous = False
                     continue
-                token_ok = (not entry_grant_id and not row["entry_grant_id"] and isinstance(resume_token, str)
+                token_ok = (not entry_grant_id and not row["entry_grant_id"]
+                            and isinstance(resume_token, str) and bool(resume_token)
                             and secrets.compare_digest(row["resume_hash"], _hash(resume_token)))
                 if not token_ok:
                     raise HubError("SESSION_ACTIVE_ELSEWHERE",
@@ -174,17 +191,20 @@ class HubStore:
                                      (now, row["session_id"]))
                 self._db.execute("COMMIT")
             except BaseException:
-                self._db.execute("ROLLBACK")
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
                 raise
         self.audit("session_open", agent_id=agent_id, task_id=task_id, session_id=session_id,
                    resumed_from=[row["session_id"] for row in previous], adopted_resources=adopted,
                    entry_grant_id=entry_grant_id)
         if entry_grant_id:
             return {"session_id": session_id, "state": "active", "reused": False,
-                    "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
+                    "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl,
+                    "orphan_ttl_seconds": self.orphan_ttl}
         return {"session_id": session_id, "session_secret": secret, "resume_token": resume,
                 "agent_id": agent_id, "task_id": task_id, "resumed": bool(previous), "adopted_resources": adopted,
-                "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl}
+                "heartbeat_seconds": self.session_ttl / 3, "session_ttl_seconds": self.session_ttl,
+                "orphan_ttl_seconds": self.orphan_ttl}
 
     def authenticate(self, session_id: Any, secret: Any, *, allow_closed: bool = False, touch: bool = True) -> dict:
         if not isinstance(session_id, str) or not isinstance(secret, str):
@@ -199,8 +219,15 @@ class HubStore:
                 self._db.execute("UPDATE sessions SET last_seen_at=? WHERE session_id=?", (self.clock(), session_id))
         return {"session_id": session_id, "agent_id": row["agent_id"], "task_id": row["task_id"]}
 
-    def close_session(self, session_id: str, *, state: str = "closed") -> list[dict]:
-        """End a session and return the resources it still held, for the caller to clean up."""
+    def close_session(self, session_id: str, *, state: str = "closed",
+                      retain_kinds: Any = (), retain_resource_ids: Any = ()) -> list[dict]:
+        """End a session and return the resources it still held, for the caller to clean up.
+
+        Resources whose kind is in retain_kinds or whose resource_id is in retain_resource_ids
+        stay in state='held' so ownership survives crashes or unconfirmed physical cleanup.
+        """
+        retained_kinds = set(retain_kinds or ())
+        retained_ids = set(retain_resource_ids or ())
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
@@ -212,11 +239,12 @@ class HubStore:
                     ).fetchall()
                 ]
                 now = self.clock()
-                if held:
-                    self._db.execute(
-                        "UPDATE resources SET state='released', released_at=? WHERE session_id=? AND state='held'",
-                        (now, session_id),
-                    )
+                for item in held:
+                    if item["kind"] not in retained_kinds and item["resource_id"] not in retained_ids:
+                        self._db.execute(
+                            "UPDATE resources SET state='released', released_at=? WHERE resource_id=? AND state='held'",
+                            (now, item["resource_id"]),
+                        )
                 self._db.execute(
                     "UPDATE sessions SET state=?, closed_at=? WHERE session_id=? AND state='active'",
                     (state, now, session_id),
@@ -251,7 +279,8 @@ class HubStore:
             row = self._session_row(session_id)
             return bool(row and row["entry_grant_id"] and row["state"] == "active")
 
-    def expire_sessions(self, *, session_id: str | None = None) -> list[dict]:
+    def expire_sessions(self, *, session_id: str | None = None,
+                        retain_kinds: Any = (), state: str = "expired") -> list[dict]:
         """Sessions silent for longer than the orphan window: close them, return what they held."""
         expired = []
         with self._lock:
@@ -262,7 +291,7 @@ class HubStore:
                 params += (session_id,)
             rows = self._db.execute(query, params).fetchall()
             for row in rows:
-                held = self.close_session(row["session_id"])
+                held = self.close_session(row["session_id"], state=state, retain_kinds=retain_kinds)
                 expired.append({"session_id": row["session_id"], "agent_id": row["agent_id"],
                                 "task_id": row["task_id"], "resources": held})
         for item in expired:
@@ -283,7 +312,7 @@ class HubStore:
     def claim(self, session: dict, kind: str, key: str, *, mode: str = "exclusive",
               meta: dict | None = None, wait_seconds: float = 0.0,
               check_access: Callable | None = None) -> dict:
-        if kind not in RESOURCE_KINDS:
+        if not isinstance(kind, str) or kind not in RESOURCE_KINDS:
             raise HubError("RESOURCE_KIND_INVALID", kinds=sorted(RESOURCE_KINDS))
         if mode not in {"exclusive", "shared"}:
             raise HubError("RESOURCE_MODE_INVALID")
@@ -299,15 +328,24 @@ class HubStore:
                 self._db.execute("BEGIN IMMEDIATE")
                 try:
                     blockers = []
+                    own_row = None
                     for row in self._holders(kind, key):
                         if row["session_id"] == session["session_id"]:
                             if row["mode"] == mode:
                                 self._db.execute("COMMIT")
                                 return {**self._resource(row), "already_held": True}
+                            own_row = row
                             continue
                         if mode == "exclusive" or row["mode"] == "exclusive":
                             blockers.append(row)
                     if not blockers:
+                        if own_row is not None:
+                            updated_meta = json.dumps(meta, ensure_ascii=False, default=str) if meta is not None else own_row["meta"]
+                            self._db.execute("UPDATE resources SET mode=?, meta=? WHERE resource_id=?",
+                                             (mode, updated_meta, own_row["resource_id"]))
+                            self._db.execute("COMMIT")
+                            row = self._db.execute("SELECT * FROM resources WHERE resource_id=?", (own_row["resource_id"],)).fetchone()
+                            return {**self._resource(row), "already_held": True}
                         resource_id = "res-" + uuid.uuid4().hex
                         self._db.execute(
                             "INSERT INTO resources(resource_id,kind,key,mode,session_id,agent_id,task_id,state,created_at,meta)"
@@ -332,6 +370,12 @@ class HubStore:
 
     def release(self, session: dict, *, resource_id: str | None = None, kind: str | None = None,
                 key: str | None = None) -> dict:
+        if resource_id is not None and not isinstance(resource_id, str):
+            raise HubError("ARGS_INVALID", field="resource_id")
+        if kind is not None and not isinstance(kind, str):
+            raise HubError("ARGS_INVALID", field="kind")
+        if key is not None and not isinstance(key, str):
+            raise HubError("ARGS_INVALID", field="key")
         with self._lock:
             if resource_id:
                 rows = self._db.execute("SELECT * FROM resources WHERE resource_id=? AND state='held'", (resource_id,)).fetchall()
@@ -346,18 +390,46 @@ class HubStore:
                                  (now, row["resource_id"]))
         return {"released": len(mine)}
 
+    def release_resources_by_ids(self, resource_ids: list[str] | set[str]) -> list[dict]:
+        """Atomically release specific held resource_ids (internal Hub lifecycle use)."""
+        ids = [rid for rid in resource_ids if isinstance(rid, str) and rid]
+        if not ids:
+            return []
+        released: list[dict] = []
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                now = self.clock()
+                for rid in ids:
+                    row = self._db.execute("SELECT * FROM resources WHERE resource_id=? AND state='held'", (rid,)).fetchone()
+                    if row is not None:
+                        self._db.execute("UPDATE resources SET state='released', released_at=? WHERE resource_id=?", (now, rid))
+                        released.append(self._resource(row))
+                self._db.execute("COMMIT")
+            except BaseException:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+        return released
+
     def owner_of(self, kind: str, key: str) -> dict | None:
+        if not isinstance(kind, str) or not isinstance(key, str):
+            return None
         with self._lock:
             rows = self._holders(kind, key)
         return self._resource(rows[0]) if rows else None
 
     def require_owned(self, session: dict, kind: str, key: str) -> dict:
-        owner = self.owner_of(kind, key)
-        if owner is None:
+        if not isinstance(kind, str) or not isinstance(key, str):
             raise HubError("RESOURCE_NOT_FOUND", kind=kind, key=key)
-        if owner["session_id"] != session["session_id"]:
-            raise HubError("RESOURCE_NOT_OWNED", "this resource belongs to another agent", kind=kind)
-        return owner
+        with self._lock:
+            holders = self._holders(kind, key)
+        if not holders:
+            raise HubError("RESOURCE_NOT_FOUND", kind=kind, key=key)
+        for owner in holders:
+            if owner["session_id"] == session["session_id"]:
+                return self._resource(owner)
+        raise HubError("RESOURCE_NOT_OWNED", "this resource belongs to another agent", kind=kind)
 
     def resources(self, *, session_id: str | None = None, kind: str | None = None) -> list[dict]:
         query, params = "SELECT * FROM resources WHERE state='held'", []
@@ -456,20 +528,36 @@ class HubStore:
             state = row["state"]
             if state == "started" and not (key in self._running and row["boot_id"] == self.boot_id):
                 state = "unknown"
+        response = json.loads(row["response"]) if row["response"] else None
+        execution_started = not (
+            state == "failed"
+            and isinstance(response, dict)
+            and isinstance(response.get("details"), dict)
+            and response["details"].get("execution_started") is False
+        )
         return {"request_key": request_key, "state": state, "op": row["op"], "started_at": row["started_at"],
-                "finished_at": row["finished_at"], "execution_started": True, "automatic_replay": False,
-                "response": json.loads(row["response"]) if row["response"] else None}
+                "finished_at": row["finished_at"], "execution_started": execution_started, "automatic_replay": False,
+                "response": response}
 
     # ---- permission requests -------------------------------------------------------------
     def record_permission_request(self, session: dict, risk_class: str, target: dict, reason: str) -> dict:
-        signature = _hash(json.dumps([session["agent_id"], risk_class, target], sort_keys=True, default=str))[:24]
+        signature = _hash(json.dumps([session["agent_id"], session["task_id"], risk_class, target],
+                                     sort_keys=True, default=str))[:24]
         with self._lock:
             row = self._db.execute("SELECT * FROM permission_requests WHERE request_id=?", (signature,)).fetchone()
             if row is None:
                 self._db.execute("INSERT INTO permission_requests VALUES(?,?,?,?,?,?,?,'pending')",
                                  (signature, self.clock(), session["agent_id"], session["task_id"], risk_class,
                                   json.dumps(target, ensure_ascii=False, default=str), reason[:500]))
-        return {"request_id": signature, "state": row["state"] if row else "pending", "repeated": row is not None}
+                return {"request_id": signature, "state": "pending", "repeated": False}
+            if row["state"] != "pending":
+                # A previously resolved request must become pending again if the
+                # grant later expired or was revoked and the agent asks anew.
+                self._db.execute(
+                    "UPDATE permission_requests SET at=?, task_id=?, reason=?, state='pending' WHERE request_id=?",
+                    (self.clock(), session["task_id"], reason[:500], signature))
+                return {"request_id": signature, "state": "pending", "repeated": False}
+        return {"request_id": signature, "state": "pending", "repeated": True}
 
     def permission_requests(self, state: str = "pending") -> list[dict]:
         with self._lock:

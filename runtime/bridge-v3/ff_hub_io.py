@@ -139,17 +139,37 @@ class HubIO:
             atomic_json(directory / "status.json", {"terminal_id": terminal_id, "state": "prepared",
                                                     "automatic_replay": False})
             try:
-                worker = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--worker", str(directory)],
-                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                          close_fds=True, creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
-                                          start_new_session=os.name != "nt")
+                worker_argv = [sys.executable, str(Path(__file__).resolve()), "--worker", str(directory)]
+                if os.name == "nt":
+                    flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                             | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+                    try:
+                        # Break away from a parent kill-on-close Job when permitted so the
+                        # terminal supervisor survives a hard crash of the Hub process.
+                        worker = subprocess.Popen(worker_argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.DEVNULL, close_fds=True,
+                                                  creationflags=flags | 0x01000000)
+                    except OSError:
+                        worker = subprocess.Popen(worker_argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                  stderr=subprocess.DEVNULL, close_fds=True, creationflags=flags)
+                else:
+                    worker = subprocess.Popen(worker_argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
             except OSError as exc:
                 atomic_json(directory / "status.json", {"terminal_id": terminal_id, "state": "launch_failed",
-                                                        "cause": type(exc).__name__})
+                                                        "cleanup_verified": True, "cause": type(exc).__name__})
+                self.hub.store.release(session, resource_id=resource["resource_id"])
                 raise HubError("TERMINAL_LAUNCH_FAILED", execution_started=False) from None
+            from ff_win_process_identity import process_creation_token
+            sup_create_time = process_creation_token(worker.pid)
+            # Separate from status.json so the Hub never races the worker's
+            # status writes, yet supervisor death in 'prepared' is still detectable.
+            atomic_json(directory / "supervisor.json",
+                        {"supervisor_pid": worker.pid, "supervisor_create_time": sup_create_time})
             threading.Thread(target=worker.wait, daemon=True).start()
             self.hub.store.update_resource_meta(resource["resource_id"],
-                                               {**resource["meta"], "supervisor_pid": worker.pid})
+                                               {**resource["meta"], "supervisor_pid": worker.pid,
+                                                "supervisor_create_time": sup_create_time})
             self.hub.store.audit("terminal.start", **session, terminal_id=terminal_id, supervisor_pid=worker.pid,
                                  app=executable, cwd=str(cwd))
             return {"terminal_id": terminal_id, "state": "starting", "supervisor_pid": worker.pid,
@@ -157,23 +177,67 @@ class HubIO:
         if command not in {"status", "cancel"}:
             raise HubError("TERMINAL_COMMAND_INVALID", commands=["start", "status", "list", "cancel"])
         terminal_id = args.get("terminal_id")
+        if not isinstance(terminal_id, str) or not terminal_id:
+            raise HubError("TERMINAL_ID_REQUIRED", execution_started=False)
         self.hub.store.require_owned(session, "terminal", terminal_id)
         if command == "cancel":
             # Only the already-owned supervisor interprets this signal. No PID guessing.
-            (self.root / terminal_id / "cancel.flag").touch()
+            try:
+                (self.root / terminal_id / "cancel.flag").touch()
+            except OSError:
+                raise HubError("TERMINAL_STATE_UNAVAILABLE", terminal_id=terminal_id, automatic_replay=False) from None
             self._reconcile_cancel(terminal_id)
         return self._status(terminal_id)
 
-    def _status(self, terminal_id: str) -> dict:
-        directory = self.root / terminal_id
+    @staticmethod
+    def _supervisor_alive(pid, create_time) -> bool:
+        if type(pid) is not int or pid <= 0:
+            return False
+        if os.name == "nt":
+            from ff_win_process_identity import process_identity_matches
+            return process_identity_matches(pid, create_time)
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    @staticmethod
+    def _read_status(directory: Path, terminal_id: str) -> dict:
         try:
             result = json.loads((directory / "status.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise HubError("TERMINAL_STATE_UNAVAILABLE", terminal_id=terminal_id, automatic_replay=False) from None
-        if os.name == "nt" and result.get("state") == "running":
-            from ff_win_process_identity import process_identity_matches
-            if not process_identity_matches(result.get("supervisor_pid"), result.get("supervisor_create_time")):
-                result.update(state="unknown", reason="TERMINAL_SUPERVISOR_LOST", automatic_replay=False)
+        if not isinstance(result, dict):
+            raise HubError("TERMINAL_STATE_UNAVAILABLE", terminal_id=terminal_id, automatic_replay=False)
+        return result
+
+    def _status(self, terminal_id: str) -> dict:
+        directory = self.root / terminal_id
+        result = self._read_status(directory, terminal_id)
+        if result.get("state") in {"prepared", "running"}:
+            sup_pid = result.get("supervisor_pid")
+            sup_time = result.get("supervisor_create_time")
+            if sup_pid is None:
+                try:
+                    sup = json.loads((directory / "supervisor.json").read_text(encoding="utf-8"))
+                    sup_pid = sup.get("supervisor_pid")
+                    sup_time = sup.get("supervisor_create_time")
+                except (OSError, ValueError):
+                    pass
+            if sup_pid is None and result.get("state") == "prepared":
+                owner = self.hub.store.owner_of("terminal", terminal_id)
+                meta = owner["meta"] if owner else {}
+                sup_pid, sup_time = meta.get("supervisor_pid"), meta.get("supervisor_create_time")
+            if sup_pid is not None and not self._supervisor_alive(sup_pid, sup_time):
+                # Re-read once so a supervisor that wrote its final status and exited
+                # between the first read and the liveness probe is not misclassified.
+                refreshed = self._read_status(directory, terminal_id)
+                if refreshed.get("state") in {"prepared", "running"}:
+                    result = {**refreshed, "state": "unknown", "reason": "TERMINAL_SUPERVISOR_LOST",
+                              "automatic_replay": False}
+                else:
+                    result = refreshed
         log = directory / "output.log"
         if log.exists():
             with log.open("rb") as stream:
@@ -184,7 +248,7 @@ class HubIO:
 
     def _reconcile_cancel(self, terminal_id: str) -> None:
         status = self._status(terminal_id)
-        if os.name == "nt" and status.get("reason") == "TERMINAL_SUPERVISOR_LOST":
+        if os.name == "nt" and status.get("state") == "unknown" and status.get("reason") == "TERMINAL_SUPERVISOR_LOST":
             from ff_win_detached_job import terminate_detached_job_by_name
             token = terminal_id.removeprefix("term-")
             try:
@@ -193,14 +257,18 @@ class HubIO:
                 raise HubError("TERMINAL_CLEANUP_UNCONFIRMED", terminal_id=terminal_id) from None
             # A named job persists while a member exists. Its absence confirms
             # that no member of this exact job remains, not a guess by PID/name.
+            persisted = {key: value for key, value in status.items() if key not in {"output", "output_tail_only"}}
             atomic_json(self.root / terminal_id / "status.json",
-                        {**status, "state": "cancelled", "cleanup_verified": True,
+                        {**persisted, "state": "cancelled", "cleanup_verified": True,
                          "termination_evidence": proof or "exact_named_job_absent", "finished_at": time.time()})
 
     def cleanup(self, held: list[dict]) -> list[dict]:
         terminals = [row for row in held if row["kind"] == "terminal"]
         for row in terminals:
-            (self.root / row["key"] / "cancel.flag").touch()
+            try:
+                (self.root / row["key"] / "cancel.flag").touch()
+            except OSError:
+                pass
             try:
                 self._reconcile_cancel(row["key"])
             except HubError:

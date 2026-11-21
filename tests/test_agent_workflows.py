@@ -38,6 +38,33 @@ class TestAgentWorkflowManifest(unittest.TestCase):
         self.assertIn("visible_desktop_only_with_trusted_owner_grant",x["route_preference"])
         self.assertTrue("do_not_auto_replay" in x["refusals"]["outcome_unknown"])
 
+    def test_shared_hub_isolated_hidden_browser_default_and_mandatory_cleanup(self):
+        data = agent_workflows()
+        browser = data["browser_workflow"]
+        self.assertEqual(browser["preferred_route"], "shared_hub.isolated_hidden_browser")
+        self.assertEqual(browser["default_ops"], ["managed_browser", "private_browser"])
+        self.assertEqual(browser["default_isolation"], "isolated_hidden_profile")
+        self.assertTrue(browser["owner_chrome_route"]["explicit_selection_required"])
+        self.assertIs(browser["owner_chrome_route"]["silent_fallback_from_hidden"], False)
+        self.assertTrue(browser["background_tabs"])
+        self.assertIs(browser["focus_or_foreground_input"], False)
+        self.assertEqual(browser["cleanup"]["operation"], "session_close")
+        self.assertEqual(
+            set(browser["cleanup"]["required_on"]),
+            {"success", "failure", "cancel", "timeout", "owner_stop"},
+        )
+        self.assertEqual(
+            browser["cleanup"]["verify_fields"],
+            ["cleanup_verified", "resources_retained", "browser_tabs_closed"],
+        )
+        self.assertTrue(browser["legacy_fallback"]["never_silently_fallback"])
+        self.assertIn("shared_hub_isolated_hidden_browser", data["route_preference"])
+        self.assertIn("shared_hub_browser_background", data["route_preference"])
+        self.assertLess(
+            data["route_preference"].index("shared_hub_isolated_hidden_browser"),
+            data["route_preference"].index("shared_hub_browser_background"),
+        )
+
     def test_advertised_preflight_is_not_assumed_to_be_live_supported(self):
         data=agent_workflows()
         self.assertIs(data["preflight_actual_rpc_support_verified"], False)

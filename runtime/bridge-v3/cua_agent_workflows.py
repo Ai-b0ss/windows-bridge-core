@@ -19,14 +19,58 @@ def agent_workflows() -> dict:
         "shared_hub": {
             "feature": "capabilities.features.universal_agent_runtime",
             "bridge_op": "hub",
+            "entry_http_path": "/agent/v1",
+            "mcp_transport": "stdio",
             "require_enabled": True,
             "request": {"op": "capabilities", "args": {}},
+            "route_plan_request": {"op": "route_plan", "args": {"surface": "browser"}},
+            "session_bootstrap": {"op": "session_open", "args": {"agent_id": "<stable-agent-id>", "task_id": "<stable-task-id>"}},
             "session_required_for_work": True,
+            "session_secret_must_remain_private": True,
             "request_key_required_for_mutations": True,
             "resume_requires_saved_token": True,
             "foreground_input_available": False,
             "discovery_is_task_proof": False,
-            "instruction": "If disabled, keep existing routes; never enable or restart production to probe a feature",
+            "instruction": (
+                "When enabled, route ALL browser and hidden-desktop work through the shared Hub or /agent/v1 Agent Entry. "
+                "Default browser route is isolated hidden Chrome (managed_browser or private_browser); owner's signed-in Chrome "
+                "(Hub browser) is explicit-only when owner profile authentication is specifically needed. "
+                "Never create direct visible Playwright connections per task or silently fall back to direct visible Playwright; "
+                "if the Hub is unavailable, use an official API/CLI or report the blocker. Never enable or restart production to probe a feature"
+            ),
+        },
+        "browser_workflow": {
+            "preferred_route": "shared_hub.isolated_hidden_browser",
+            "default_ops": ["managed_browser", "private_browser"],
+            "default_isolation": "isolated_hidden_profile",
+            "owner_chrome_route": {
+                "hub_op": "browser",
+                "transport": "playwright_extension_background",
+                "owner_profile": "existing_signed_in_chrome",
+                "explicit_selection_required": True,
+                "silent_fallback_from_hidden": False,
+            },
+            "background_tabs": True,
+            "focus_or_foreground_input": False,
+            "session_scope": "one owner per agent_id/task_id",
+            "commands": ["open", "list", "navigate", "snapshot", "read", "act", "wait_for", "screenshot", "evaluate", "restore", "close"],
+            "mutating_calls_require_request_key": True,
+            "cleanup": {
+                "required_on": ["success", "failure", "cancel", "timeout", "owner_stop"],
+                "operation": "session_close",
+                "verify_fields": ["cleanup_verified", "resources_retained", "browser_tabs_closed"],
+                "only_session_owned_resources": True,
+            },
+            "shared_connector": (
+                "When the explicit owner-Chrome route is active, one shared Playwright connector tab may remain while the browser manager "
+                "is running. It is not an agent-owned page; never close it or create a new connector per task"
+            ),
+            "legacy_fallback": {
+                "route": "computer_use.attach",
+                "allowed_only_if": "shared Hub is unavailable, the task cannot be completed through an official API/CLI/SDK, and owner-Chrome extension was explicitly requested",
+                "requires": ["explicit transport=extension", "stable agent_id/task_id", "close in finally", "force_new_connection only when required"],
+                "never_silently_fallback": True,
+            },
         },
         "owner_task_context_guidance": {
             "bridge_op": "set_desktop_mode",
@@ -170,6 +214,8 @@ def agent_workflows() -> dict:
         ],
         "route_preference": [
             "verified_official_api_cli_sdk_mcp_com",
+            "shared_hub_isolated_hidden_browser",
+            "shared_hub_browser_background",
             "owned_hidden_background_interface",
             "semantic_uia_win32",
             "screen_capture_or_vision_after_verified_need",
@@ -197,7 +243,7 @@ def agent_workflows() -> dict:
         "refusals": {
             "outcome_unknown": "do_not_auto_replay; use request_status and independent postcondition",
             "owner_approval_unverified": "do_not_invent_approval_or_force_visible_desktop",
-            "background_route_unproven": "web_research_official_and_maintained_oss_then_probe_installable_or_hidden_route",
+            "background_route_unproven": "check_the_configured_shared_hub_isolated_hidden_browser_first; do_not_silently_fall_back_to_owner_chrome_direct_CUA_extension_or_visible_playwright",
             "away_is_not_visible_consent": "ask_in_same_chat_before_first_visible_mouse_or_keyboard",
             "web_unavailable": "exhaustion_unknown_not_eligible_for_foreground",
             "chat_yes_without_trusted_grant": "pass_owner_words_via_set_desktop_mode_owner_chat_permission_never_invent_a_quote",

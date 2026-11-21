@@ -19,7 +19,7 @@ from ff_hub_store import HubError, _ident
 ENTRY_PATH = "/agent/v1"
 SCHEMA = "ff-agent-entry-v1"
 BASE_OPS = {"capabilities", "route_plan", "session_open", "session_status",
-            "session_heartbeat", "request_status", "task_cancel", "audit_read"}
+            "session_heartbeat", "session_close", "request_status", "task_cancel", "audit_read"}
 SCOPES = {
     "private_browser": {"private_browser", "managed_browser"},
     "private_app": {"app_discover", "app_open", "app_windows", "app_observe",
@@ -30,7 +30,8 @@ SCOPES = {
 BROWSER_COMMANDS = ("open", "info", "close", "tabs", "tab_open", "tab_close", "navigate",
                     "observe", "snapshot", "read", "act", "upload", "download_prepare", "download_read", "screenshot")
 READ_ONLY = {"info", "tabs", "observe", "snapshot", "read", "download_read", "screenshot"}
-MUTATIONS = {"task_cancel", "resource_claim", "resource_release", "app_open", "app_act", "app_close"}
+MUTATIONS = {"session_close", "task_cancel", "resource_claim", "resource_release", "app_open", "app_act", "app_close"}
+FORBIDDEN_BROWSER_ARGS = frozenset({"route", "foreground", "headless", "profile_dir"})
 SAFE_APPS = DEFAULT_SAFE_APPS
 LOCK_KINDS = {"custom", "file", "directory"}
 GRANT_ID = re.compile(r"eg-[0-9a-f]{32}\Z", re.ASCII)
@@ -415,9 +416,14 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
                 "operations": sorted(operations),
                 "browser_commands": list(BROWSER_COMMANDS) if "private_browser" in operations else [],
                 "managed_browser_commands": list(BROWSER_COMMANDS) if "managed_browser" in operations else [],
+                "managed_browser_profile_args": ["profile_id", "profile_name", "persistent_profile"] if "managed_browser" in operations else [],
                 "file_commands": ["list", "put", "read"] if "task_file" in operations else [],
                 "apps": sorted(scope["apps"]), "client_id": scope["client_id"], "agent_id": scope["agent_id"],
                 "task_id": scope["task_id"], "expires_at": scope["expires_at"],
+                "default_browser_route": "isolated_hidden_browser",
+                "owner_chrome_available": False,
+                "silent_playwright_fallback": False,
+                "cleanup_receipt_fields": ["closed", "cleanup_verified", "resources_retained"],
                 "foreground_fallback": False, "automatic_mutation_replay": False}
     if op == "route_plan":
         return route_plan(
@@ -435,7 +441,7 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
         args = {**args, "task_id": scope["task_id"]}
     command = args.get("command")
     if op in {"private_browser", "managed_browser"} and (
-            command not in BROWSER_COMMANDS or {"route", "foreground"} & args.keys()):
+            command not in BROWSER_COMMANDS or FORBIDDEN_BROWSER_ARGS & args.keys()):
         raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)
     if op == "app_discover":
         cid = authority.catalog.canonical_id(args.get("app")) if set(args) == {"app"} else None

@@ -5,7 +5,7 @@
 | Cursor | agent/cursor-agent CLI, auth and a real task capability | owned instance, native editor helpers, UIA/CDP when compatible | actual agent result and file changes/readback |
 | Antigravity | installed agy/official CLI compatibility + authenticated task | compatible isolated Electron UI route | requested response or resulting edit |
 | Excel | COM/object model and entitlement-specific features | owner-scoped hidden Excel/UIA | saved XLSX and independent document readback |
-| Browser | site API; **the owner's signed-in Chrome through the Playwright extension** (`attach` with `transport:"extension"`, own tab, `find` then `act` by `ref`, no mouse); then CDP/Playwright isolated profile | native UIA/semantic fallback | URL and postcondition, only owned tabs closed |
+| Browser | site API; **shared FF Agent Hub isolated hidden browser** (`managed_browser` / `private_browser`, default isolated profile, zero owner-Chrome tabs); explicit Hub `browser` (owner's signed-in Chrome extension in background mode) only when owner auth is explicitly required; never silently fall back to direct visible Playwright | native UIA/semantic fallback | URL and postcondition; `session_close` (with `request_key`) in `finally`, verify `cleanup_verified=true`, `resources_retained=0`, and `browser_tabs_closed` |
 | Claude Desktop GUI | Verify native app PID/HWND and read-only UIA Snapshot; do not substitute Claude Code CLI | Verified owned native/UIA route only with task-scoped consent | Actual existing GUI state, semantic target, postcondition; no arbitrary click under read-only |
 | Unknown Windows app | discover official API, CLI, SDK, MCP and tested OSS tool | hidden Desktop, Win32/UIA, WGC/OCR/vision | real task-specific postcondition |
 

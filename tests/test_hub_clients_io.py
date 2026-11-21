@@ -52,6 +52,7 @@ class ClientIOTests(unittest.TestCase):
                 adapter.call({"op": "session_close", "task_id": "task"})
             except HubError:
                 pass
+            adapter.close()
         self.hub.shutdown()
         self.hub.store.close()
         self.temporary.cleanup()
@@ -151,12 +152,23 @@ class ClientIOTests(unittest.TestCase):
 
     def test_restart_adapter_reuses_checkpoint_explicit_resume_revokes_old_secret(self):
         old = json.loads(next(self.a.checkpoints.glob("*.json")).read_text())
+        # While self.a is still live, another adapter instance must fail closed instead of hijacking.
+        competing = Adapter(self.root, "client-a", client=self.client)
+        try:
+            self.error("CHECKPOINT_OWNED_BY_LIVE_PROCESS", lambda: competing.call({"op": "session_open", "task_id": "task"}))
+        finally:
+            competing.close()
+        # After prior adapter exits cleanly, a restarted adapter recovers its checkpoint and can resume explicitly.
+        self.a.close()
         fresh = Adapter(self.root, "client-a", client=self.client)
-        self.assertTrue(fresh.call({"op": "session_open", "task_id": "task"})["checkpoint_reused"])
-        resumed = fresh.call({"op": "session_resume", "task_id": "task"})
-        self.assertNotEqual(old["session_id"], resumed["session_id"])
-        self.assertFalse(self.client.raw({"op": "session_status", "session_id": old["session_id"],
-                                          "session_secret": old["session_secret"]})["ok"])
+        try:
+            self.assertTrue(fresh.call({"op": "session_open", "task_id": "task"})["checkpoint_reused"])
+            resumed = fresh.call({"op": "session_resume", "task_id": "task"})
+            self.assertNotEqual(old["session_id"], resumed["session_id"])
+            self.assertFalse(self.client.raw({"op": "session_status", "session_id": old["session_id"],
+                                              "session_secret": old["session_secret"]})["ok"])
+        finally:
+            fresh.close()
 
     def test_files_policy_cas_dedupe_foreign_lock_and_revocation(self):
         path = self.root / "result.txt"
