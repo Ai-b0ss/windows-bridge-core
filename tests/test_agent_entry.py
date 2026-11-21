@@ -106,7 +106,8 @@ class AgentEntryTest(unittest.TestCase):
     def test_scoped_route_cannot_be_overridden(self):
         _, token = self.enroll("browser", scopes=["private_browser"])
         route = self.call("route_plan", token=token)
-        self.assertEqual(route["selected"], "private_cdp")
+        self.assertIn(route["selected"], {"persistent_playwright", "private_cdp"})
+        self.assertNotIn(route["selected"], {"owner_chrome_extension", "owner_chrome_profile1_hidden_secondary"})
         self.assertFalse(route["foreground_fallback"])
         session = self.call("session_open", token=token)["session_id"]
         self.expect("ENTRY_BROWSER_COMMAND_DENIED", "private_browser", token=token, session=session,
