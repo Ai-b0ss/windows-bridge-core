@@ -454,7 +454,11 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
                 "cleanup_receipt_fields": ["closed", "cleanup_verified", "resources_retained"],
                 "foreground_fallback": False, "automatic_mutation_replay": False}
     if op == "route_plan":
-        default_profile = getattr(getattr(hub, "owner_chrome_secondary", None), "profile_dir_name", None) or "Profile 1"
+        default_profile = (
+            hub.configured_owner_chrome_profile()
+            if hasattr(hub, "configured_owner_chrome_profile")
+            else (getattr(getattr(hub, "owner_chrome_secondary", None), "profile_dir_name", None) or "Profile 1")
+        )
         explicit_profile = args.get("profile_dir_name")
         return route_plan(
             scope,

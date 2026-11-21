@@ -573,6 +573,28 @@ class Hub:
         except (OSError, ValueError):
             return {}
 
+    def configured_owner_chrome_profile(self, explicit: str | None = None) -> str:
+        """Resolve effective owner Chrome profile dynamically from state/hub/config.json without restarting Hub."""
+        if explicit is not None:
+            try:
+                return validate_profile_dir_name(explicit)
+            except OwnerChromeSecondaryError as exc:
+                raise HubError(exc.code, exc.message, execution_started=False, **exc.details) from None
+        cfg = self._config()
+        raw_cfg = cfg.get("owner_chrome_profile") or cfg.get("chrome_profile")
+        if raw_cfg is not None:
+            try:
+                profile = validate_profile_dir_name(str(raw_cfg))
+            except OwnerChromeSecondaryError as exc:
+                raise HubError(exc.code, exc.message, execution_started=False, **exc.details) from None
+            mgr = self.owner_chrome_secondary
+            if hasattr(mgr, "set_default_profile"):
+                mgr.set_default_profile(profile)
+            elif hasattr(mgr, "profile_dir_name"):
+                mgr.profile_dir_name = profile
+            return profile
+        return getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
+
     # ---- permissions ---------------------------------------------------------------------
     def _permit(self, session: dict, risk_class: str, target: dict | None = None, *, action: str = "") -> dict:
         target_payload = target or {}
@@ -776,7 +798,8 @@ class Hub:
             )
         owner = self._owner(session)
         if command == "preflight":
-            profile_name = args.get("profile_dir_name")
+            raw_profile = args.get("profile_dir_name")
+            profile_name = raw_profile if raw_profile is not None else self.configured_owner_chrome_profile()
             connect_ws = bool(args.get("connect_ws", False))
             if connect_ws:
                 host = self._extract_preflight_host(args.get("url"), args.get("host"))
@@ -788,9 +811,10 @@ class Hub:
                 payload["connect_ws"] = True
             return self._call_owner_chrome_secondary("preflight", payload)
         if command == "status":
+            configured = self.configured_owner_chrome_profile()
             st = self._call_owner_chrome_secondary("status", {})
             mine = [item["key"] for item in self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target")]
-            return {**st, "my_targets": mine}
+            return {**st, "configured_profile": configured, "my_targets": mine}
         if command == "list":
             mine = self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target")
             live = {item["tab_id"]: item for item in self._call_owner_chrome_secondary("list", {"owner": owner}).get("tabs", [])}
@@ -812,9 +836,11 @@ class Hub:
             validated_url = self._validate_owner_chrome_url(args.get("url"))
             host = _extract_url_host(validated_url)
             self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action="owner_chrome_hidden.open")
+            effective_profile = self.configured_owner_chrome_profile(args.get("profile_dir_name"))
             open_payload = {
                 "owner": owner,
                 **{k: v for k, v in args.items() if k != "command"},
+                "profile_dir_name": effective_profile,
                 "url": validated_url,
             }
             tab = self._call_owner_chrome_secondary("open", open_payload)
@@ -1053,7 +1079,7 @@ class Hub:
                 )
 
             if provider == OWNER_CHROME_HIDDEN_ROUTE:
-                effective_profile = profile_dir_name or getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
+                effective_profile = self.configured_owner_chrome_profile(profile_dir_name)
                 tab_id: str | None = None
                 target_id: str | None = None
                 resource: dict | None = None
@@ -2021,6 +2047,7 @@ class Hub:
 
     # ---- discovery -----------------------------------------------------------------------
     def capabilities(self) -> dict:
+        configured_profile = self.configured_owner_chrome_profile()
         return {
             "schema": "ff-agent-hub-capabilities-v1", "hub_version": HUB_VERSION, "pid": os.getpid(),
             "agent_entry": {"schema": ENTRY_SCHEMA, "http_path": ENTRY_PATH, "bind": "loopback",
@@ -2033,6 +2060,8 @@ class Hub:
             "browser_routes": {
                 "primary_owner_auth": OWNER_CHROME_HIDDEN_ROUTE,
                 "primary_owner_auth_op": "owner_chrome_hidden",
+                "owner_chrome_configured_profile": configured_profile,
+                "owner_chrome_cdp_handover_supported": os.name == "nt",
                 "primary_owner_auth_requires_cdp_and_default_context": True,
                 "no_interruption_site_read_op": "site_read",
                 "no_interruption_visibility_modes": ["background_tab", "strict_invisible"],
@@ -2101,6 +2130,7 @@ class Hub:
                 },
                 "owner_chrome_hidden": {
                     "route": OWNER_CHROME_HIDDEN_ROUTE,
+                    "configured_profile": configured_profile,
                     "primary_owner_auth": True,
                     "mutating": "open/navigate/reload/act/evaluate/close",
                     "request_key_required": True,
@@ -2195,12 +2225,44 @@ class Hub:
         }
 
     def status(self) -> dict:
+        try:
+            configured_profile = self.configured_owner_chrome_profile()
+        except HubError:
+            configured_profile = getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
+        sec_info: dict[str, Any] = {
+            "running": getattr(self.owner_chrome_secondary, "running", lambda: False)(),
+            "route": OWNER_CHROME_HIDDEN_ROUTE,
+            "profile_dir_name": configured_profile,
+            "cdp_handover_supported": os.name == "nt",
+        }
+        status_fn = getattr(self.owner_chrome_secondary, "status", None)
+        if callable(status_fn):
+            try:
+                raw_sec = status_fn()
+                if isinstance(raw_sec, dict):
+                    for key in (
+                        "connected",
+                        "active_targets",
+                        "chrome_version",
+                        "discovery_mode",
+                        "default_browser_context_id",
+                        "keepalive_active",
+                        "keepalive_interval_s",
+                        "keepalive_ok_count",
+                        "last_keepalive_at",
+                        "last_keepalive_error",
+                        "connected_at",
+                        "cdp_handover_supported",
+                    ):
+                        if key in raw_sec:
+                            sec_info[key] = raw_sec[key]
+            except Exception:
+                pass
         return {"hub_version": HUB_VERSION, "pid": os.getpid(), "uptime_seconds": round(time.time() - self.started_at, 1),
                 "sessions": self.store.sessions(), "private_desktops": len(self._hidden),
                 "browser_manager": {"running": getattr(self.browser, "running", lambda: None)(),
                                     "starts": getattr(self.browser, "starts", None)},
-                "owner_chrome_secondary": {"running": getattr(self.owner_chrome_secondary, "running", lambda: False)(),
-                                           "route": OWNER_CHROME_HIDDEN_ROUTE},
+                "owner_chrome_secondary": sec_info,
                 "managed_browser": {"running": getattr(self.managed_browser, "running", lambda: None)(),
                                     "starts": getattr(self.managed_browser, "starts", None)},
                 "pending_owner_requests": len(self.store.permission_requests()),
@@ -2261,7 +2323,8 @@ class Hub:
             raise HubError("OP_UNSUPPORTED", "unknown operation; read `capabilities`", op=op)
         if not isinstance(args, dict):
             raise HubError("ARGS_INVALID")
-        if op in {"capabilities", "hub_status", "hub_shutdown_idle", "route_plan", "request_status", "session_status", "session_heartbeat",
+        if op in {"capabilities", "hub_status", "hub_shutdown_idle", "hub_cdp_handover_export", "hub_cdp_handover_commit",
+                  "hub_cdp_handover_abort", "route_plan", "request_status", "session_status", "session_heartbeat",
                   "resource_list", "permission_check", "permission_describe", "secret_list", "audit_read", "app_discover"}:
             if check_access:
                 check_access()
@@ -2306,7 +2369,7 @@ class Hub:
             if request.get("session_id") and request.get("session_secret"):
                 sess = self.store.authenticate(request.get("session_id"), request.get("session_secret"))
                 scope = self._scope_for_session(sess)
-            default_profile = getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
+            default_profile = self.configured_owner_chrome_profile()
             cap = str(args.get("capability") or "dom")
             explicit_profile = args.get("profile_dir_name")
             resolved_profile = (
@@ -2325,6 +2388,50 @@ class Hub:
                 visibility=args.get("visibility"),
                 strict_invisibility=args.get("strict_invisibility"),
             )
+        if op == "hub_cdp_handover_export":
+            if check_access is not None:
+                raise HubError("ENTRY_SCOPE_DENIED", execution_started=False)
+            with self._hidden_lock:
+                if self.store.sessions() or self._hidden or self.store.resources():
+                    raise HubError("HUB_BUSY", "cancel/finish owned tasks before CDP socket handover", retry_safe=False)
+                exporter = getattr(self.owner_chrome_secondary, "export_approved_cdp_socket", None)
+                if not callable(exporter):
+                    raise HubError("CDP_HANDOVER_UNSUPPORTED", execution_started=False)
+                try:
+                    exported = exporter(
+                        target_pid=args.get("target_pid"),
+                        target_create_time=args.get("target_create_time"),
+                    )
+                except OwnerChromeSecondaryError as exc:
+                    raise HubError(exc.code, exc.message, **exc.details) from None
+                self.store.audit("cdp_handover_exported", target_pid=args.get("target_pid"))
+                return exported
+        if op == "hub_cdp_handover_commit":
+            if check_access is not None:
+                raise HubError("ENTRY_SCOPE_DENIED", execution_started=False)
+            with self._hidden_lock:
+                committer = getattr(self.owner_chrome_secondary, "commit_cdp_handover", None)
+                if not callable(committer):
+                    raise HubError("CDP_HANDOVER_UNSUPPORTED", execution_started=False)
+                try:
+                    res = committer()
+                except OwnerChromeSecondaryError as exc:
+                    raise HubError(exc.code, exc.message, **exc.details) from None
+                self.store.audit("cdp_handover_committed")
+                return res
+        if op == "hub_cdp_handover_abort":
+            if check_access is not None:
+                raise HubError("ENTRY_SCOPE_DENIED", execution_started=False)
+            with self._hidden_lock:
+                aborter = getattr(self.owner_chrome_secondary, "abort_cdp_handover", None)
+                if not callable(aborter):
+                    raise HubError("CDP_HANDOVER_UNSUPPORTED", execution_started=False)
+                try:
+                    res = aborter()
+                except OwnerChromeSecondaryError as exc:
+                    raise HubError(exc.code, exc.message, **exc.details) from None
+                self.store.audit("cdp_handover_aborted")
+                return res
         if op == "hub_shutdown_idle":
             with self._hidden_lock:
                 if self.store.sessions() or self._hidden:
@@ -2694,7 +2801,9 @@ class _HubLease:
                 self.file.close()
 
 
-def serve(state_dir: Path, port: int) -> int:
+def serve(state_dir: Path, port: int, *, standby_endpoint: Path | None = None) -> int:
+    if standby_endpoint is not None:
+        return _serve_standby(state_dir, port, standby_endpoint)
     try:
         with _HubLease(state_dir):
             return _serve_locked(state_dir, port)
@@ -2705,7 +2814,151 @@ def serve(state_dir: Path, port: int) -> int:
         return 3
 
 
-def _serve_locked(state_dir: Path, port: int) -> int:
+def _make_standby_handler(
+    mgr: OwnerChromeHiddenSecondaryManager,
+    key: str,
+    state: dict[str, Any],
+    shutdown_cb: Callable[[], None],
+) -> type:
+    class StandbyHandler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: Any) -> None:
+            return
+
+        def _reply(self, status: int, body: dict) -> None:
+            data = json.dumps(body, ensure_ascii=False, default=str).encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            try:
+                self.wfile.write(data)
+            except OSError:
+                pass
+
+        def do_POST(self) -> None:
+            if not hmac.compare_digest(self.headers.get("X-FF-Hub-Key", "").encode("utf-8"), key.encode("utf-8")):
+                self.close_connection = True
+                return self._reply(401, {"ok": False, "error_code": "UNAUTHORIZED"})
+            if self.path != "/rpc":
+                self.close_connection = True
+                return self._reply(404, {"ok": False, "error_code": "NOT_FOUND"})
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if not 0 < length <= MAX_REQUEST_BYTES:
+                    raise ValueError
+                request = json.loads(self.rfile.read(length))
+            except (ValueError, TimeoutError):
+                self.close_connection = True
+                return self._reply(400, {"ok": False, "error_code": "REQUEST_INVALID"})
+            op = request.get("op") if isinstance(request, dict) else None
+            args = request.get("args") if isinstance(request, dict) and isinstance(request.get("args"), dict) else {}
+            try:
+                if op == "hub_standby_status":
+                    result = {
+                        "standby": True,
+                        "pid": os.getpid(),
+                        "create_time": process_creation_token(os.getpid()),
+                        "port": self.server.server_address[1],
+                        "adopted": bool(state.get("adopted")),
+                        "owner_chrome_secondary": mgr.status(),
+                    }
+                elif op == "hub_cdp_handover_adopt":
+                    result = mgr.adopt_approved_cdp_socket(args)
+                    state["adopted"] = True
+                elif op == "hub_standby_activate":
+                    state["activate"] = True
+                    result = {"activating": True, "pid": os.getpid(), "adopted": bool(state.get("adopted"))}
+                    self._reply(200, {"ok": True, "result": result})
+                    shutdown_cb()
+                    return
+                elif op == "hub_standby_abort":
+                    state["activate"] = False
+                    result = {"aborted": True, "pid": os.getpid()}
+                    self._reply(200, {"ok": True, "result": result})
+                    shutdown_cb()
+                    return
+                else:
+                    raise HubError("OP_UNSUPPORTED", "standby hub only accepts handover/activation ops", op=op)
+                self._reply(200, {"ok": True, "result": result})
+            except OwnerChromeSecondaryError as exc:
+                self._reply(200, {"ok": False, "error_code": exc.code, "message": exc.message, "details": exc.details})
+            except HubError as exc:
+                self._reply(200, {"ok": False, "error_code": exc.code, "message": exc.message, "details": exc.details})
+            except Exception as exc:
+                self._reply(200, {"ok": False, "error_code": "HUB_INTERNAL_ERROR", "message": type(exc).__name__, "details": {}})
+
+    return StandbyHandler
+
+
+def _serve_standby(state_dir: Path, port: int, standby_endpoint: Path) -> int:
+    """Start in local standby mode to adopt an approved CDP socket before acquiring the main Hub lease."""
+    key_file = state_dir / "hub.key"
+    if not key_file.is_file():
+        print("HUB_KEY_REQUIRED_FOR_STANDBY", file=sys.stderr)
+        return 4
+    key = key_file.read_text(encoding="ascii").strip()
+    try:
+        cfg = json.loads((state_dir / "config.json").read_text(encoding="utf-8"))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    except (OSError, ValueError):
+        cfg = {}
+    mgr = OwnerChromeHiddenSecondaryManager(
+        state_dir,
+        profile_dir_name=str(cfg.get("owner_chrome_profile") or cfg.get("chrome_profile") or "Profile 1"),
+        cdp_endpoint=cfg.get("owner_chrome_cdp_endpoint"),
+        user_data_dir=cfg.get("owner_chrome_user_data_dir"),
+    )
+    state: dict[str, Any] = {"adopted": False, "activate": False}
+    server_holder: list[HubHTTPServer] = []
+
+    def stop_standby() -> None:
+        if server_holder:
+            threading.Thread(target=server_holder[0].shutdown, daemon=True).start()
+
+    standby_server = HubHTTPServer(("127.0.0.1", 0), _make_standby_handler(mgr, key, state, stop_standby))
+    standby_server.daemon_threads = True
+    server_holder.append(standby_server)
+    record = {
+        "standby": True,
+        "pid": os.getpid(),
+        "create_time": process_creation_token(os.getpid()),
+        "port": standby_server.server_address[1],
+        "package": str(PACKAGE),
+    }
+    standby_endpoint.parent.mkdir(parents=True, exist_ok=True)
+    tmp = standby_endpoint.with_suffix(".tmp")
+    tmp.write_text(json.dumps(record), encoding="utf-8")
+    os.replace(tmp, standby_endpoint)
+    try:
+        standby_server.serve_forever(poll_interval=0.2)
+    except KeyboardInterrupt:
+        state["activate"] = False
+    finally:
+        standby_server.server_close()
+        try:
+            standby_endpoint.unlink(missing_ok=True)
+        except OSError:
+            pass
+    if not state.get("activate"):
+        mgr.shutdown(close_targets=False)
+        return 0
+    deadline = time.monotonic() + 15.0
+    while True:
+        try:
+            with _HubLease(state_dir):
+                return _serve_locked(state_dir, port, owner_chrome_secondary=mgr)
+        except HubError as exc:
+            if exc.code != "HUB_ALREADY_RUNNING" or time.monotonic() >= deadline:
+                mgr.shutdown(close_targets=False)
+                print("HUB_STANDBY_LEASE_TIMEOUT", file=sys.stderr)
+                return 3
+            time.sleep(0.05)
+
+
+def _serve_locked(state_dir: Path, port: int, *, owner_chrome_secondary: Any = None) -> int:
     state_dir.mkdir(parents=True, exist_ok=True)
     endpoint_file, key_file = state_dir / "endpoint.json", state_dir / "hub.key"
     try:
@@ -2719,7 +2972,7 @@ def _serve_locked(state_dir: Path, port: int) -> int:
         temporary.write_text(_secrets.token_urlsafe(48), encoding="ascii")
         os.replace(temporary, key_file)
     key = key_file.read_text(encoding="ascii").strip()
-    hub = Hub(state_dir)
+    hub = Hub(state_dir, owner_chrome_secondary=owner_chrome_secondary)
     server = HubHTTPServer(("127.0.0.1", port), make_handler(hub, key))
     server.daemon_threads = True
     hub._shutdown_request = lambda: threading.Thread(target=server.shutdown, daemon=True).start()
@@ -2729,7 +2982,8 @@ def _serve_locked(state_dir: Path, port: int) -> int:
     temporary = endpoint_file.with_suffix(".tmp")
     temporary.write_text(json.dumps(record), encoding="utf-8")
     os.replace(temporary, endpoint_file)
-    hub.store.audit("hub_start", port=record["port"], boot_id=hub.store.boot_id)
+    hub.store.audit("hub_start", port=record["port"], boot_id=hub.store.boot_id,
+                    cdp_adopted=bool(owner_chrome_secondary is not None and owner_chrome_secondary.running()))
     threading.Thread(target=hub.run_maintenance, daemon=True).start()
     try:
         server.serve_forever(poll_interval=0.5)
@@ -2748,6 +3002,150 @@ def _serve_locked(state_dir: Path, port: int) -> int:
         except (OSError, ValueError):
             pass
     return 0
+
+
+def _raw_port_rpc(port: int, key: str, request: dict, *, timeout: float = 15.0) -> dict:
+    prepared = urllib.request.Request(
+        f"http://127.0.0.1:{int(port)}/rpc",
+        method="POST",
+        data=json.dumps(request).encode("utf-8"),
+        headers={"Content-Type": "application/json", "X-FF-Hub-Key": key},
+    )
+    with _loopback_opener().open(prepared, timeout=timeout) as response:
+        reply = HubClient.validate_reply(json.loads(response.read(MAX_REQUEST_BYTES + 1)))
+    if not reply.get("ok"):
+        raise HubError(reply.get("error_code") or "HUB_ERROR", reply.get("message"), **(reply.get("details") or {}))
+    return reply["result"]
+
+
+def handover_upgrade(
+    state_dir: Path,
+    new_runtime: Path,
+    *,
+    port: int | None = None,
+    python: str | None = None,
+    wait_seconds: float = 20.0,
+) -> dict:
+    """Replace a running idle Hub process with new_runtime while preserving an approved CDP socket (Windows)."""
+    state_dir = Path(state_dir)
+    new_hub_py = Path(new_runtime) / "ff_hub.py"
+    if not new_hub_py.is_file():
+        raise HubError("HANDOVER_RUNTIME_NOT_FOUND", "ff_hub.py not found in new_runtime", path=str(new_hub_py))
+    client = HubClient(state_dir, timeout=15.0)
+    old_ep = client.endpoint()
+    old_status = client.call("hub_status")
+    if old_status.get("sessions") or old_status.get("resources") or old_status.get("private_desktops"):
+        raise HubError("HUB_BUSY", "cancel/finish owned tasks before handover upgrade", retry_safe=False)
+    target_port = int(port) if port is not None else int(old_ep["port"])
+    key = (state_dir / "hub.key").read_text(encoding="ascii").strip()
+    standby_ep_file = state_dir / f"standby-{_secrets.token_hex(6)}.json"
+    standby_ep_file.unlink(missing_ok=True)
+    argv = [
+        python or sys.executable,
+        str(new_hub_py),
+        "serve",
+        "--state-dir",
+        str(state_dir),
+        "--port",
+        str(target_port),
+        "--standby-endpoint",
+        str(standby_ep_file),
+    ]
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    with open(state_dir / "hub.log", "ab", buffering=0) as log:
+        options = dict(stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(new_runtime), close_fds=True)
+        try:
+            proc = subprocess.Popen(argv, creationflags=flags | 0x01000000, **options)
+        except OSError:
+            proc = subprocess.Popen(argv, creationflags=flags, **options)
+
+    standby_ep: dict | None = None
+    deadline = time.monotonic() + min(max(float(wait_seconds), 5.0), 30.0)
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise HubError("HANDOVER_STANDBY_EXITED", "standby Hub exited before ready", returncode=proc.returncode)
+        if standby_ep_file.is_file():
+            try:
+                standby_ep = json.loads(standby_ep_file.read_text(encoding="utf-8"))
+                break
+            except (OSError, ValueError):
+                pass
+        time.sleep(0.05)
+    if standby_ep is None:
+        proc.kill()
+        standby_ep_file.unlink(missing_ok=True)
+        raise HubError("HANDOVER_STANDBY_TIMEOUT", "standby Hub did not publish endpoint")
+
+    standby_port = int(standby_ep["port"])
+    standby_pid = int(standby_ep["pid"])
+    standby_ctime = standby_ep.get("create_time")
+    cdp_handed_over = False
+    sec = old_status.get("owner_chrome_secondary") or {}
+    was_connected = bool(sec.get("connected") if "connected" in sec else sec.get("running"))
+    try:
+        _raw_port_rpc(standby_port, key, {"op": "hub_standby_status", "args": {}}, timeout=5.0)
+        if was_connected:
+            exported = client.call(
+                "hub_cdp_handover_export",
+                {"target_pid": standby_pid, "target_create_time": standby_ctime},
+            )
+            try:
+                _raw_port_rpc(standby_port, key, {"op": "hub_cdp_handover_adopt", "args": exported}, timeout=10.0)
+            except Exception:
+                try:
+                    client.call("hub_cdp_handover_abort", {})
+                except Exception:
+                    pass
+                raise
+            client.call("hub_cdp_handover_commit", {})
+            cdp_handed_over = True
+    except Exception:
+        try:
+            _raw_port_rpc(standby_port, key, {"op": "hub_standby_abort", "args": {}}, timeout=3.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        standby_ep_file.unlink(missing_ok=True)
+        raise
+
+    # Old Hub has cleanly released its duplicate CDP handle; shut it down and activate standby.
+    client.call("hub_shutdown_idle", {})
+    old_pid = int(old_ep["pid"])
+    old_ctime = old_ep.get("create_time")
+    exit_dl = time.monotonic() + 12.0
+    while time.monotonic() < exit_dl:
+        alive = (
+            process_identity_matches(old_pid, old_ctime)
+            if (os.name == "nt" and type(old_ctime) is int)
+            else _pid_alive(old_pid)
+        )
+        if not alive:
+            break
+        time.sleep(0.05)
+
+    _raw_port_rpc(standby_port, key, {"op": "hub_standby_activate", "args": {}}, timeout=10.0)
+    ready_dl = time.monotonic() + min(max(float(wait_seconds), 5.0), 30.0)
+    while time.monotonic() < ready_dl:
+        try:
+            ep = client.endpoint()
+            if ep.get("pid") == standby_pid:
+                st = client.call("hub_status")
+                if st.get("pid") == standby_pid:
+                    return {
+                        "upgraded": True,
+                        "old_pid": old_pid,
+                        "new_pid": standby_pid,
+                        "port": int(ep["port"]),
+                        "package": ep.get("package"),
+                        "cdp_handed_over": cdp_handed_over,
+                        "owner_chrome_secondary": st.get("owner_chrome_secondary"),
+                    }
+        except HubError:
+            pass
+        time.sleep(0.05)
+    raise HubError("HANDOVER_ACTIVATE_TIMEOUT", "activated standby Hub did not become ready", new_pid=standby_pid)
 
 
 class HubHTTPServer(http.server.ThreadingHTTPServer):
@@ -2819,6 +3217,11 @@ def main(argv: list[str] | None = None) -> int:
     run = commands.add_parser("serve")
     run.add_argument("--port", type=int, default=None)
     run.add_argument("--state-dir", type=Path, default=None, dest="serve_state_dir")
+    run.add_argument("--standby-endpoint", type=Path, default=None)
+    ho = commands.add_parser("handover-upgrade", help="upgrade an idle Hub while preserving an approved CDP socket (Windows)")
+    ho.add_argument("--new-runtime", type=Path, required=True)
+    ho.add_argument("--port", type=int, default=None)
+    ho.add_argument("--python", default=None)
     commands.add_parser("status")
     commands.add_parser("policy")
     commands.add_parser("requests")
@@ -2886,11 +3289,16 @@ def main(argv: list[str] | None = None) -> int:
             config_port = json.loads((state_dir / "config.json").read_text(encoding="utf-8")).get("port")
         except (OSError, ValueError):
             pass
-        return serve(state_dir, options.port if options.port is not None else
-                     (config_port if config_port is not None else DEFAULT_PORT))
+        return serve(
+            state_dir,
+            options.port if options.port is not None else (config_port if config_port is not None else DEFAULT_PORT),
+            standby_endpoint=options.standby_endpoint,
+        )
     policy, store_path = Policy(state_dir / "policy.json"), state_dir / "hub.db"
     try:
-        if options.command == "status":
+        if options.command == "handover-upgrade":
+            show(handover_upgrade(state_dir, options.new_runtime, port=options.port, python=options.python))
+        elif options.command == "status":
             show(HubClient(state_dir, timeout=5).call("hub_status"))
         elif options.command == "policy":
             show(policy.describe())

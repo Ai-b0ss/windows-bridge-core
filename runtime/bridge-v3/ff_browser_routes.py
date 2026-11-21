@@ -563,7 +563,12 @@ def evaluate_no_interruption_site_read(
 
     # --- Candidate 1: owner_chrome_profile1_hidden_secondary (strictly invisible windowless CDP) ---
     mgr = (getattr(hub, "owner_chrome_hidden", None) or getattr(hub, "owner_chrome_secondary", None)) if hub is not None else None
-    effective_hidden_profile = profile_dir_name or getattr(mgr, "profile_dir_name", None) or "Profile 1"
+    configured_profile = (
+        hub.configured_owner_chrome_profile()
+        if (hub is not None and hasattr(hub, "configured_owner_chrome_profile"))
+        else getattr(mgr, "profile_dir_name", None)
+    )
+    effective_hidden_profile = profile_dir_name or configured_profile or "Profile 1"
     hidden_entry: dict[str, Any] = {
         "provider": OWNER_CHROME_HIDDEN_SECONDARY_ROUTE,
         "hub_op": "owner_chrome_hidden",

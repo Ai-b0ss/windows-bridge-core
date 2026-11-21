@@ -16,6 +16,16 @@ class HubGatewayError(RuntimeError):
         self.code, self.details = code, details
 
 
+_LOCAL_ONLY_HUB_OPS = frozenset({
+    "hub_cdp_handover_export",
+    "hub_cdp_handover_adopt",
+    "hub_cdp_handover_commit",
+    "hub_cdp_handover_abort",
+    "hub_standby_activate",
+    "hub_standby_status",
+})
+
+
 class HubGateway:
     def __init__(self, bridge_root: Path, *, client_factory: Callable | None = None,
                  starter: Callable | None = None):
@@ -64,6 +74,8 @@ class HubGateway:
                 or not isinstance(request.get("op"), str) or not request["op"]
                 or not isinstance(request.get("args", {}), dict)):
             raise HubGatewayError("HUB_REQUEST_INVALID", execution_started=False)
+        if request["op"] in _LOCAL_ONLY_HUB_OPS:
+            raise HubGatewayError("HUB_OP_LOCAL_ONLY", op=request["op"], execution_started=False)
         # Owner-side configuration/grants/secrets are deliberately absent from
         # the Hub RPC API. Arbitrary endpoints, state roots and keys cannot be
         # selected by the caller of this gateway.

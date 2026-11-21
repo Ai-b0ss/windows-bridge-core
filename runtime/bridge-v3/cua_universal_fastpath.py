@@ -40,6 +40,7 @@ class _LocalWebSocket:
             raise RuntimeError("LOCAL_WS_URL_REQUIRED")
         self._deadline = time.monotonic() + timeout
         self._buffer = bytearray()
+        self.frame_dirty = False
         self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
         try:
             self._handshake(parsed)
@@ -48,6 +49,20 @@ class _LocalWebSocket:
             raise
         self.set_deadline(None)
         self.sock.settimeout(timeout)
+
+    @classmethod
+    def from_adopted_socket(cls, sock: socket.socket, *, buffered: bytes = b"", timeout: float = 5.0) -> "_LocalWebSocket":
+        """Wrap an already-upgraded loopback WebSocket without a new handshake."""
+        inst = cls.__new__(cls)
+        inst._deadline = None
+        inst._buffer = bytearray(buffered)
+        inst.frame_dirty = False
+        inst.sock = sock
+        inst.sock.settimeout(timeout)
+        return inst
+
+    def buffered_bytes(self) -> bytes:
+        return bytes(self._buffer)
 
     def set_deadline(self, deadline: float | None) -> None:
         self._deadline = deadline
@@ -99,15 +114,17 @@ class _LocalWebSocket:
         self._buffer.extend(rest)
 
     def _recv_exact(self, n: int) -> bytes:
-        out = self._buffer[:n]
-        del self._buffer[:n]
-        while len(out) < n:
+        # Keep unread bytes inside self._buffer until all n bytes arrive so a
+        # timeout at a frame boundary never drops partial data from the stream.
+        while len(self._buffer) < n:
             self._apply_deadline()
-            chunk = self.sock.recv(n - len(out))
+            chunk = self.sock.recv(n - len(self._buffer))
             if not chunk:
                 raise EOFError("WS_EOF")
-            out.extend(chunk)
-        return bytes(out)
+            self._buffer.extend(chunk)
+        out = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return out
 
     def send(self, text: str) -> None:
         payload = text.encode("utf-8")
@@ -124,12 +141,19 @@ class _LocalWebSocket:
             head.extend(struct.pack("!Q", n))
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         self._apply_deadline()
-        self.sock.sendall(bytes(head) + mask + masked)
+        try:
+            self.sock.sendall(bytes(head) + mask + masked)
+        except Exception:
+            self.frame_dirty = True
+            raise
 
     def recv(self) -> str:
         parts = bytearray()
         while True:
             b1, b2 = self._recv_exact(2)
+            # Once a frame header has been consumed from the buffer, any
+            # mid-frame interruption leaves the stream desynchronized.
+            self.frame_dirty = True
             fin, opcode = bool(b1 & 0x80), b1 & 0x0F
             n = b2 & 0x7F
             if n == 126:
@@ -145,13 +169,19 @@ class _LocalWebSocket:
                 raise EOFError("WS_CLOSED")
             if opcode == 0x9:
                 self._send_control(0xA, payload)
+                if not parts:
+                    self.frame_dirty = False
                 continue
             if opcode in (0x1, 0x0):
                 parts.extend(payload)
                 if fin:
+                    self.frame_dirty = False
                     return parts.decode("utf-8")
+            elif not parts:
+                self.frame_dirty = False
 
     def _send_control(self, opcode: int, payload: bytes) -> None:
+        payload = payload[:125]
         mask = os.urandom(4)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
         self._apply_deadline()

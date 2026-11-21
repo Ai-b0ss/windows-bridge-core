@@ -22,6 +22,7 @@ Empirical Chrome 158.0.8127.36 basis:
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 from pathlib import Path
@@ -40,6 +41,7 @@ import uuid
 from cua_browser_profiles import linked
 from cua_programmatic_discovery import _netstat_text, _parse_local_endpoint, owned_tcp_listeners
 from cua_universal_fastpath import _LocalWebSocket, _LocalWebSocketHandshakeError
+from ff_win_process_identity import process_creation_token, process_identity_matches
 
 ROUTE_NAME = "owner_chrome_profile1_hidden_secondary"
 MIN_HIDDEN_TARGET_CHROME = (158, 0, 8127, 2)
@@ -474,6 +476,16 @@ class _BrowserCDPClient:
         self.seq = 0
         self.generation = 0
         self._keepalive_stop: threading.Event | None = None
+        self.connected_at: float | None = None
+        self.keepalive_ok_count = 0
+        self.last_keepalive_at: float | None = None
+        self.last_keepalive_error: str | None = None
+
+    def stop_keepalive(self) -> None:
+        with self._lock:
+            if self._keepalive_stop is not None:
+                self._keepalive_stop.set()
+                self._keepalive_stop = None
 
     def start_keepalive(self) -> None:
         """Preserve an existing approved socket; never connect or request Chrome consent."""
@@ -493,16 +505,42 @@ class _BrowserCDPClient:
             ).start()
 
     def _keepalive_loop(self, generation: int, stop: threading.Event) -> None:
-        while not stop.wait(self.KEEPALIVE_INTERVAL_S):
+        try:
+            while not stop.wait(self.KEEPALIVE_INTERVAL_S):
+                with self._lock:
+                    if stop.is_set() or self.generation != generation or self.socket is None:
+                        return
+                    try:
+                        # Browser.getVersion is read-only; no new WebSocket or target is created.
+                        self.send("Browser.getVersion", timeout=self.KEEPALIVE_TIMEOUT_S)
+                        self.keepalive_ok_count += 1
+                        self.last_keepalive_at = time.time()
+                        self.last_keepalive_error = None
+                    except OwnerChromeSecondaryError as exc:
+                        self.last_keepalive_error = exc.code
+                        # send() tears down a broken socket. Never reattach automatically.
+                        return
+        finally:
             with self._lock:
-                if stop.is_set() or self.generation != generation or self.socket is None:
-                    return
-                try:
-                    # Browser.getVersion is read-only; no new WebSocket or target is created.
-                    self.send("Browser.getVersion", timeout=self.KEEPALIVE_TIMEOUT_S)
-                except OwnerChromeSecondaryError:
-                    # send() tears down a broken socket. Never reattach automatically.
-                    return
+                stop.set()
+                if self._keepalive_stop is stop:
+                    self._keepalive_stop = None
+
+    def keepalive_status(self) -> dict[str, Any]:
+        with self._lock:
+            active = bool(
+                self.socket is not None
+                and self._keepalive_stop is not None
+                and not self._keepalive_stop.is_set()
+            )
+            return {
+                "keepalive_active": active,
+                "keepalive_interval_s": float(self.KEEPALIVE_INTERVAL_S),
+                "keepalive_ok_count": int(self.keepalive_ok_count),
+                "last_keepalive_at": self.last_keepalive_at,
+                "last_keepalive_error": self.last_keepalive_error,
+                "connected_at": self.connected_at,
+            }
 
     def connected(self) -> bool:
         with self._lock:
@@ -516,6 +554,7 @@ class _BrowserCDPClient:
             sock = self.socket
             self.socket = None
             self.endpoint = None
+            self.connected_at = None
             if sock is not None:
                 try:
                     sock.close()
@@ -530,6 +569,54 @@ class _BrowserCDPClient:
             self.socket = _LocalWebSocket(ws_url, timeout=timeout)
             self.endpoint = ws_url
             self.generation += 1
+            self.connected_at = time.time()
+            self.keepalive_ok_count = 0
+            self.last_keepalive_at = None
+            self.last_keepalive_error = None
+
+    def adopt(self, ws: _LocalWebSocket, ws_url: str, *, seq: int = 0) -> None:
+        with self._lock:
+            self.reset()
+            self.socket = ws
+            self.endpoint = ws_url
+            self.seq = max(int(seq), 0)
+            self.generation += 1
+            self.connected_at = time.time()
+            self.keepalive_ok_count = 0
+            self.last_keepalive_at = None
+            self.last_keepalive_error = None
+
+    def _send_once(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        session_id: str | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        if self.socket is None:
+            raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_DISCONNECTED", "CDP socket is not connected")
+        self.seq += 1
+        rid = self.seq
+        packet: dict[str, Any] = {"id": rid, "method": method, "params": params or {}}
+        if session_id is not None:
+            packet["sessionId"] = session_id
+        deadline = time.monotonic() + max(0.5, float(timeout))
+        self.socket.set_deadline(deadline)
+        self.socket.send(json.dumps(packet))
+        while True:
+            reply = json.loads(self.socket.recv())
+            if reply.get("id") != rid:
+                continue
+            if "error" in reply and reply["error"]:
+                err = reply["error"]
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_REJECTED",
+                    str(err.get("message") or "CDP command rejected"),
+                    cdp_code=err.get("code"),
+                    method=method,
+                )
+            return reply.get("result") if isinstance(reply.get("result"), dict) else {}
 
     def send(
         self,
@@ -542,30 +629,37 @@ class _BrowserCDPClient:
         with self._lock:
             if self.socket is None:
                 raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_DISCONNECTED", "CDP socket is not connected")
-            self.seq += 1
-            rid = self.seq
-            packet: dict[str, Any] = {"id": rid, "method": method, "params": params or {}}
-            if session_id is not None:
-                packet["sessionId"] = session_id
-            deadline = time.monotonic() + max(0.5, float(timeout))
             try:
-                self.socket.set_deadline(deadline)
-                self.socket.send(json.dumps(packet))
-                while True:
-                    reply = json.loads(self.socket.recv())
-                    if reply.get("id") != rid:
-                        continue
-                    if "error" in reply and reply["error"]:
-                        err = reply["error"]
-                        raise OwnerChromeSecondaryError(
-                            "OWNER_CHROME_CDP_REJECTED",
-                            str(err.get("message") or "CDP command rejected"),
-                            cdp_code=err.get("code"),
-                            method=method,
-                        )
-                    return reply.get("result") if isinstance(reply.get("result"), dict) else {}
+                return self._send_once(method, params, session_id=session_id, timeout=timeout)
             except OwnerChromeSecondaryError:
                 raise
+            except (TimeoutError, socket.timeout) as exc:
+                # A slow page-session command must not destroy an already-approved
+                # browser-level CDP channel if the WebSocket stream is still clean.
+                if session_id is not None and not getattr(self.socket, "frame_dirty", False):
+                    try:
+                        self._send_once("Browser.getVersion", {}, timeout=2.0)
+                    except Exception:
+                        pass
+                    else:
+                        raise OwnerChromeSecondaryError(
+                            "OWNER_CHROME_CDP_TIMEOUT",
+                            "CDP page command timed out; approved browser connection preserved",
+                            cause=type(exc).__name__,
+                            method=method,
+                            outcome_unknown=True,
+                            retry_safe=False,
+                            connection_preserved=True,
+                        ) from exc
+                self.reset()
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_DISCONNECTED",
+                    "CDP transport failed during command",
+                    cause=type(exc).__name__,
+                    method=method,
+                    outcome_unknown=True,
+                    retry_safe=False,
+                ) from exc
             except Exception as exc:
                 self.reset()
                 raise OwnerChromeSecondaryError(
@@ -1267,6 +1361,13 @@ class OwnerChromeHiddenSecondaryManager:
                 "probe_ms": int((time.monotonic() - t0) * 1000),
             }
 
+    def set_default_profile(self, profile_dir_name: str) -> str:
+        """Update the default Chrome profile without resetting an approved CDP channel."""
+        validated = validate_profile_dir_name(profile_dir_name)
+        with self._lock:
+            self.profile_dir_name = validated
+        return validated
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             return {
@@ -1281,6 +1382,195 @@ class OwnerChromeHiddenSecondaryManager:
                 "default_browser_context_id": self._verified_info.get("default_browser_context_id") if self._verified_info else None,
                 "visible_side_effect_free": True,
                 "screenshot_supported": False,
+                "cdp_handover_supported": os.name == "nt",
+                **self._cdp.keepalive_status(),
+            }
+
+    def export_approved_cdp_socket(self, *, target_pid: int, target_create_time: int | None = None) -> dict[str, Any]:
+        """Duplicate an ALREADY-APPROVED loopback CDP socket for a verified local target PID (Windows only).
+
+        Never opens a new WebSocket or triggers Chrome consent; refuses if active targets exist.
+        """
+        if os.name != "nt":
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_WINDOWS_REQUIRED", "WinSock socket handover requires Windows")
+        if type(target_pid) is not int or target_pid <= 0 or target_pid == os.getpid():
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_TARGET_INVALID", "invalid handover target PID")
+        if target_create_time is not None and (
+            type(target_create_time) is not int or not process_identity_matches(target_pid, target_create_time)
+        ):
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_TARGET_INVALID", "target process identity mismatch")
+        with self._lock:
+            if self._targets:
+                raise OwnerChromeSecondaryError(
+                    "CDP_HANDOVER_TARGETS_ACTIVE",
+                    "close active hidden targets before handing over the CDP socket",
+                    active_targets=len(self._targets),
+                )
+            with self._cdp._lock:
+                ws = self._cdp.socket
+                if ws is None or not self._cdp.endpoint or not self._verified_info:
+                    raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_DISCONNECTED", "no approved CDP socket to hand over")
+                if getattr(ws, "frame_dirty", False):
+                    raise OwnerChromeSecondaryError("CDP_HANDOVER_STREAM_DIRTY", "CDP stream is mid-frame; refusing handover")
+                raw_sock = getattr(ws, "sock", None)
+                if not isinstance(raw_sock, socket.socket):
+                    raise OwnerChromeSecondaryError("CDP_HANDOVER_SOCKET_INVALID", "underlying WinSock socket unavailable")
+                self._cdp.stop_keepalive()
+                try:
+                    peer = raw_sock.getpeername()
+                    if not isinstance(peer, tuple) or len(peer) < 2 or peer[0] not in {"127.0.0.1", "::1"}:
+                        raise OwnerChromeSecondaryError("CDP_HANDOVER_SOCKET_INVALID", "CDP peer is not loopback")
+                    # Verify the existing approved socket is still live before duplicating it.
+                    self._cdp.send("Browser.getVersion", {}, timeout=2.5)
+                    share_bytes = raw_sock.share(target_pid)
+                    buffered = ws.buffered_bytes() if hasattr(ws, "buffered_bytes") else b""
+                    return {
+                        "schema": "ff-cdp-socket-handover-v1",
+                        "source_pid": os.getpid(),
+                        "source_create_time": process_creation_token(os.getpid()),
+                        "socket_share_b64": base64.b64encode(share_bytes).decode("ascii"),
+                        "buffered_b64": base64.b64encode(buffered).decode("ascii"),
+                        "seq": int(self._cdp.seq),
+                        "endpoint": str(self._cdp.endpoint),
+                        "verified_info": dict(self._verified_info),
+                    }
+                except Exception:
+                    if self._cdp.connected() and self._verified_info and self._verified_info.get("approval_gated"):
+                        self._cdp.start_keepalive()
+                    raise
+
+    def commit_cdp_handover(self) -> dict[str, Any]:
+        """Release this process's duplicate handle after the peer verified adoption."""
+        with self._lock:
+            if self._targets:
+                raise OwnerChromeSecondaryError("CDP_HANDOVER_TARGETS_ACTIVE", "cannot commit handover with active targets")
+            self._cdp.reset()
+            self._verified_info = None
+            return {"committed": True, "connected": False}
+
+    def abort_cdp_handover(self) -> dict[str, Any]:
+        """Resume keepalive if a planned handover did not complete."""
+        with self._lock:
+            if self._cdp.connected() and self._verified_info and self._verified_info.get("approval_gated"):
+                self._cdp.start_keepalive()
+            return {"aborted": True, "connected": self._cdp.connected(), **self._cdp.keepalive_status()}
+
+    def adopt_approved_cdp_socket(self, payload: dict[str, Any], *, profile_dir_name: str | None = None) -> dict[str, Any]:
+        """Adopt a duplicated ALREADY-APPROVED loopback CDP socket from a verified local Hub process."""
+        if os.name != "nt":
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_WINDOWS_REQUIRED", "WinSock socket handover requires Windows")
+        if not isinstance(payload, dict) or payload.get("schema") != "ff-cdp-socket-handover-v1":
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_PAYLOAD_INVALID", "invalid handover payload schema")
+        src_pid = payload.get("source_pid")
+        src_ctime = payload.get("source_create_time")
+        if (
+            type(src_pid) is not int
+            or src_pid <= 0
+            or src_pid == os.getpid()
+            or type(src_ctime) is not int
+            or not process_identity_matches(src_pid, src_ctime)
+        ):
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_SOURCE_INVALID", "unverified handover source process")
+        raw_share_b64 = payload.get("socket_share_b64")
+        raw_buf_b64 = payload.get("buffered_b64", "")
+        raw_endpoint = payload.get("endpoint")
+        raw_seq = payload.get("seq", 0)
+        raw_info = payload.get("verified_info")
+        if (
+            not isinstance(raw_share_b64, str)
+            or not raw_share_b64
+            or not isinstance(raw_buf_b64, str)
+            or not isinstance(raw_endpoint, str)
+            or type(raw_seq) is not int
+            or raw_seq < 0
+            or not isinstance(raw_info, dict)
+        ):
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_PAYLOAD_INVALID", "malformed handover payload fields")
+
+        ep_port, ep_path, valid_ws_url = _validate_loopback_ws_url(raw_endpoint)
+        target_profile = validate_profile_dir_name(
+            profile_dir_name or raw_info.get("profile_dir_name") or self.profile_dir_name
+        )
+        try:
+            share_bytes = base64.b64decode(raw_share_b64, validate=True)
+            buffered = base64.b64decode(raw_buf_b64, validate=True) if raw_buf_b64 else b""
+        except ValueError:
+            raise OwnerChromeSecondaryError("CDP_HANDOVER_SOCKET_INVALID", "invalid base64 socket descriptor") from None
+
+        with self._lock:
+            if self._targets:
+                raise OwnerChromeSecondaryError("CDP_HANDOVER_TARGETS_ACTIVE", "cannot adopt while targets are active")
+            if self._cdp.connected():
+                raise OwnerChromeSecondaryError("CDP_HANDOVER_ALREADY_CONNECTED", "CDP socket already connected")
+            adopted_sock: socket.socket | None = None
+            try:
+                adopted_sock = socket.fromshare(share_bytes)
+                if adopted_sock.type != socket.SOCK_STREAM:
+                    raise OwnerChromeSecondaryError("CDP_HANDOVER_SOCKET_INVALID", "adopted socket is not TCP")
+                peer = adopted_sock.getpeername()
+                if (
+                    not isinstance(peer, tuple)
+                    or len(peer) < 2
+                    or peer[0] not in {"127.0.0.1", "::1"}
+                    or int(peer[1]) != ep_port
+                ):
+                    raise OwnerChromeSecondaryError("CDP_HANDOVER_SOCKET_INVALID", "adopted socket peer mismatch")
+            except OwnerChromeSecondaryError:
+                if adopted_sock is not None:
+                    try:
+                        adopted_sock.close()
+                    except OSError:
+                        pass
+                raise
+            except Exception as exc:
+                if adopted_sock is not None:
+                    try:
+                        adopted_sock.close()
+                    except OSError:
+                        pass
+                raise OwnerChromeSecondaryError(
+                    "CDP_HANDOVER_SOCKET_INVALID",
+                    "failed to restore duplicated WinSock descriptor",
+                    cause=type(exc).__name__,
+                ) from None
+
+            ws = _LocalWebSocket.from_adopted_socket(adopted_sock, buffered=buffered, timeout=5.0)
+            self._cdp.adopt(ws, valid_ws_url, seq=raw_seq)
+            try:
+                info = {
+                    "port": ep_port,
+                    "ws_path": ep_path,
+                    "ws_url": valid_ws_url,
+                    "browser": None,
+                    "chrome_version": raw_info.get("chrome_version"),
+                    "pid": raw_info.get("pid") or _find_listener_pid_for_port(ep_port, hint_pid=self.chrome_pid),
+                    "discovery_mode": raw_info.get("discovery_mode") or "devtools_active_port_ws_only",
+                    "http_discovery_status": raw_info.get("http_discovery_status", 404),
+                    "approval_gated": bool(raw_info.get("approval_gated", True)),
+                }
+                checked_info = self._verify_ws_browser_version(info, timeout_s=5.0, reused=True)
+                ctx_info = self._verify_profile_default_context(
+                    profile_dir_name=target_profile,
+                    info=checked_info,
+                    timeout_s=5.0,
+                )
+            except Exception:
+                self._cdp.reset()
+                raise
+            merged = {**checked_info, **ctx_info, "profile_dir_name": target_profile}
+            self._verified_info = merged
+            self.profile_dir_name = target_profile
+            if merged.get("approval_gated"):
+                self._cdp.start_keepalive()
+            return {
+                "adopted": True,
+                "connected": True,
+                "route": ROUTE_NAME,
+                "profile_dir_name": target_profile,
+                "chrome_version": merged["chrome_version"],
+                "default_browser_context_id": merged["default_browser_context_id"],
+                "discovery_mode": merged["discovery_mode"],
+                **self._cdp.keepalive_status(),
             }
 
     def _require_target(self, owner: str, tab_or_target_id: Any) -> dict[str, Any]:
@@ -1392,8 +1682,12 @@ class OwnerChromeHiddenSecondaryManager:
             raise OwnerChromeSecondaryError("POSTCONDITION_INVALID", "unsupported postcondition format", attempted=False)
 
         while True:
-            if eval_once():
-                return True
+            try:
+                if eval_once():
+                    return True
+            except OwnerChromeSecondaryError as exc:
+                if exc.code not in {"SCRIPT_FAILED", "OWNER_CHROME_CDP_REJECTED"}:
+                    raise
             if time.monotonic() >= deadline:
                 return False
             time.sleep(0.1)
@@ -1562,9 +1856,19 @@ class OwnerChromeHiddenSecondaryManager:
                                 attempted=True,
                                 retry_safe=False,
                             )
-                        dl = time.monotonic() + min(timeout, 10.0)
+                        open_wait_s = min(
+                            max(float(args.get("timeout_ms", 10000)) / 1000.0, 0.2),
+                            min(timeout, 25.0),
+                        )
+                        dl = time.monotonic() + open_wait_s
                         while time.monotonic() < dl:
-                            ready = self._eval(rec, "({rs:document.readyState, url:location.href, title:document.title})", timeout_s=3.0)
+                            try:
+                                ready = self._eval(rec, "({rs:document.readyState, url:location.href, title:document.title})", timeout_s=3.0)
+                            except OwnerChromeSecondaryError as exc:
+                                if exc.code in {"SCRIPT_FAILED", "OWNER_CHROME_CDP_REJECTED"}:
+                                    time.sleep(0.05)
+                                    continue
+                                raise
                             if isinstance(ready, dict) and ready.get("url") and ready["url"] != "about:blank":
                                 rec["url"] = str(ready["url"])
                                 rec["title"] = str(ready.get("title") or "")
@@ -1659,18 +1963,55 @@ class OwnerChromeHiddenSecondaryManager:
 
             if op == "navigate":
                 url = valid_url(args.get("url"))
+                prev_url = str(rec.get("url") or "")
+                nav_token = uuid.uuid4().hex
+                try:
+                    self._eval(rec, f"(()=>{{window.__ffhsec_nav={json.dumps(nav_token)};return true;}})()", timeout_s=2.0)
+                except OwnerChromeSecondaryError as exc:
+                    if exc.code not in {"SCRIPT_FAILED", "OWNER_CHROME_CDP_REJECTED"}:
+                        raise
+                prev_parts = urllib.parse.urlsplit(prev_url)
+                next_parts = urllib.parse.urlsplit(url)
+                same_doc_fragment = (
+                    prev_parts[:4] == next_parts[:4]
+                    and prev_parts.fragment != next_parts.fragment
+                )
                 nav = self._cdp.send("Page.navigate", {"url": url}, session_id=rec["session_id"], timeout=min(timeout, 15.0))
                 rec["snapshot"] = None
                 if nav.get("errorText"):
                     raise OwnerChromeSecondaryError("NAVIGATION_FAILED", str(nav["errorText"]), attempted=True, retry_safe=False)
-                dl = time.monotonic() + min(float(args.get("timeout_ms", 10000)) / 1000.0, 20.0)
+                dl = time.monotonic() + min(max(float(args.get("timeout_ms", 10000)) / 1000.0, 0.5), 25.0)
+                last_ready: dict[str, Any] | None = None
                 while time.monotonic() < dl:
-                    ready = self._eval(rec, "({rs:document.readyState, url:location.href, title:document.title})", timeout_s=3.0)
-                    if isinstance(ready, dict) and ready.get("rs") in {"interactive", "complete"}:
-                        rec["url"] = str(ready.get("url") or url)
-                        rec["title"] = str(ready.get("title") or "")
-                        break
+                    try:
+                        ready = self._eval(
+                            rec,
+                            f"({{rs:document.readyState, url:location.href, title:document.title, navigated:window.__ffhsec_nav!=={json.dumps(nav_token)}}})",
+                            timeout_s=3.0,
+                        )
+                    except OwnerChromeSecondaryError as exc:
+                        if exc.code in {"SCRIPT_FAILED", "OWNER_CHROME_CDP_REJECTED"}:
+                            time.sleep(0.05)
+                            continue
+                        raise
+                    if isinstance(ready, dict):
+                        last_ready = ready
+                        cur_url = str(ready.get("url") or "")
+                        marker_cleared = ready.get("navigated")
+                        committed = (
+                            marker_cleared is True
+                            or marker_cleared is None
+                            or (same_doc_fragment and cur_url == url)
+                        )
+                        if committed and ready.get("rs") in {"interactive", "complete"}:
+                            rec["url"] = cur_url or url
+                            rec["title"] = str(ready.get("title") or "")
+                            break
                     time.sleep(0.05)
+                else:
+                    if isinstance(last_ready, dict) and last_ready.get("url"):
+                        rec["url"] = str(last_ready["url"])
+                        rec["title"] = str(last_ready.get("title") or "")
                 return {"tab_id": rec["tab_id"], "target_id": rec["target_id"], "url": rec["url"], "title": rec["title"], "navigated": True}
 
             if op == "reload":
@@ -1982,6 +2323,13 @@ class OwnerChromeHiddenSecondaryManager:
                     verified = self._check_postcondition(rec, condition, timeout_s=min(timeout, 8.0))
                     if not verified:
                         raise OwnerChromeSecondaryError("POSTCONDITION_FAILED", "postcondition not met", attempted=True, retry_safe=False)
+                    try:
+                        fresh = self._eval(rec, "({url:location.href,title:document.title})", timeout_s=2.0)
+                        if isinstance(fresh, dict) and fresh.get("url"):
+                            rec["url"] = str(fresh["url"])
+                            rec["title"] = str(fresh.get("title") or rec["title"])
+                    except OwnerChromeSecondaryError:
+                        pass
                 return {
                     "ok": True,
                     "acted": True,
