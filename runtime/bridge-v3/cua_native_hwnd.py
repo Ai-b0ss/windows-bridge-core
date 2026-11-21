@@ -12,6 +12,9 @@ WM_GETTEXT = 0x000D
 WM_GETTEXTLENGTH = 0x000E
 WM_SETTEXT = 0x000C
 WM_COMMAND = 0x0111
+WM_CHAR = 0x0102
+EM_SETSEL = 0x00B1
+EM_REPLACESEL = 0x00C2
 BM_GETCHECK = 0x00F0
 BM_CLICK = 0x00F5
 CB_GETCURSEL = 0x0147
@@ -26,10 +29,14 @@ GWL_STYLE = -16
 BS_TYPEMASK = 0x000F
 BS_CHECKBOX_TYPES = {0x0002, 0x0003, 0x0005, 0x0006}
 
-_EDIT_CLASSES = {"edit", "richedit", "richedit20a", "richedit20w", "richedit50w"}
+_EDIT_CLASSES = {"edit", "richedit", "richedit20a", "richedit20w", "richedit50w", "richeditd2dpt"}
 _BUTTON_CLASS = "button"
 _COMBOBOX_CLASS = "combobox"
 _LISTBOX_CLASS = "listbox"
+_FORBIDDEN_PHYSICAL_ACTIONS = frozenset({
+    "physical_sequence", "send_input", "mouse_click", "mouse_move",
+    "key_tap", "key_chord", "unicode_char", "visual_click", "switch_desktop",
+})
 
 
 class HwndTransport(Protocol):
@@ -49,6 +56,28 @@ class Win32Transport:
             raise NativeError("HWND_WINDOWS_ONLY", "HWND message backend requires Windows")
         self.user32 = ctypes.windll.user32
         ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
+        self.user32.IsWindow.argtypes = [ctypes.wintypes.HWND]
+        self.user32.IsWindow.restype = ctypes.wintypes.BOOL
+        self.user32.GetForegroundWindow.argtypes = []
+        self.user32.GetForegroundWindow.restype = ctypes.wintypes.HWND
+        self.user32.GetCursorPos.argtypes = [ctypes.POINTER(ctypes.wintypes.POINT)]
+        self.user32.GetCursorPos.restype = ctypes.wintypes.BOOL
+        self.user32.GetWindowThreadProcessId.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.DWORD)]
+        self.user32.GetWindowThreadProcessId.restype = ctypes.wintypes.DWORD
+        self.user32.GetClassNameW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.LPWSTR, ctypes.c_int]
+        self.user32.GetClassNameW.restype = ctypes.c_int
+        self.user32.GetDlgCtrlID.argtypes = [ctypes.wintypes.HWND]
+        self.user32.GetDlgCtrlID.restype = ctypes.c_int
+        self.user32.GetParent.argtypes = [ctypes.wintypes.HWND]
+        self.user32.GetParent.restype = ctypes.wintypes.HWND
+        self.user32.GetWindowLongPtrW.argtypes = [ctypes.wintypes.HWND, ctypes.c_int]
+        self.user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        self.user32.GetWindowRect.argtypes = [ctypes.wintypes.HWND, ctypes.POINTER(ctypes.wintypes.RECT)]
+        self.user32.GetWindowRect.restype = ctypes.wintypes.BOOL
+        self.user32.IsWindowEnabled.argtypes = [ctypes.wintypes.HWND]
+        self.user32.IsWindowEnabled.restype = ctypes.wintypes.BOOL
+        self.user32.PostMessageW.argtypes = [ctypes.wintypes.HWND, ctypes.wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t]
+        self.user32.PostMessageW.restype = ctypes.wintypes.BOOL
         self.user32.SendMessageTimeoutW.argtypes = [
             ctypes.wintypes.HWND,
             ctypes.wintypes.UINT,
@@ -61,7 +90,7 @@ class Win32Transport:
         self.user32.SendMessageTimeoutW.restype = ctypes.c_ssize_t
 
     def is_window(self, hwnd: int) -> bool:
-        return bool(self.user32.IsWindow(hwnd))
+        return bool(self.user32.IsWindow(ctypes.wintypes.HWND(hwnd)))
 
     def foreground_hwnd(self) -> int:
         return int(self.user32.GetForegroundWindow() or 0)
@@ -108,28 +137,52 @@ class Win32Transport:
             u.CloseDesktop(input_desktop)
 
     def window_info(self, hwnd: int) -> dict[str, Any]:
+        from cua_desktop_identity import DesktopIdentityError, require_same_desktop
+        from ff_win_process_identity import process_creation_token
+
+        try:
+            require_same_desktop(hwnd)
+        except DesktopIdentityError as exc:
+            if str(exc) == "CROSS_DESKTOP_TARGET_FORBIDDEN":
+                raise NativeError(
+                    "CROSS_DESKTOP_TARGET_FORBIDDEN",
+                    "Target HWND belongs to another Windows desktop",
+                    {"hwnd": hwnd, "retry_safe": False},
+                ) from exc
+            if not self.is_window(hwnd):
+                raise NativeError("STALE_TARGET", "HWND is no longer valid", {"hwnd": hwnd}) from exc
+            raise NativeError("HWND_DESKTOP_IDENTITY_UNAVAILABLE", str(exc), {"hwnd": hwnd}) from exc
         if not self.is_window(hwnd):
             raise NativeError("STALE_TARGET", "HWND is no longer valid", {"hwnd": hwnd})
         pid = ctypes.wintypes.DWORD(0)
-        self.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        tid = self.user32.GetWindowThreadProcessId(ctypes.wintypes.HWND(hwnd), ctypes.byref(pid))
+        if not tid or not pid.value:
+            raise NativeError("STALE_TARGET", "HWND thread/process identity unavailable", {"hwnd": hwnd})
+        create_time = process_creation_token(int(pid.value))
+        if create_time is None:
+            raise NativeError(
+                "TARGET_IDENTITY_UNAVAILABLE",
+                "Process creation time unavailable for HWND",
+                {"hwnd": int(hwnd), "pid": int(pid.value)},
+            )
         cls = ctypes.create_unicode_buffer(256)
-        if not self.user32.GetClassNameW(hwnd, cls, len(cls)):
+        if not self.user32.GetClassNameW(ctypes.wintypes.HWND(hwnd), cls, len(cls)):
             raise NativeError("HWND_QUERY_FAILED", "GetClassNameW failed", {"hwnd": hwnd})
-        control_id = int(self.user32.GetDlgCtrlID(hwnd))
-        parent_hwnd = int(self.user32.GetParent(hwnd) or 0)
-        self.user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
-        style = int(self.user32.GetWindowLongPtrW(hwnd, GWL_STYLE))
+        control_id = int(self.user32.GetDlgCtrlID(ctypes.wintypes.HWND(hwnd)))
+        parent_hwnd = int(self.user32.GetParent(ctypes.wintypes.HWND(hwnd)) or 0)
+        style = int(self.user32.GetWindowLongPtrW(ctypes.wintypes.HWND(hwnd), GWL_STYLE))
         rect = ctypes.wintypes.RECT()
-        if not self.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        if not self.user32.GetWindowRect(ctypes.wintypes.HWND(hwnd), ctypes.byref(rect)):
             raise NativeError("HWND_QUERY_FAILED", "GetWindowRect failed", {"hwnd": hwnd})
         return {
             "hwnd": int(hwnd),
             "pid": int(pid.value),
+            "create_time": int(create_time),
             "class_name": cls.value,
             "control_id": control_id,
             "parent_hwnd": parent_hwnd,
             "style": style,
-            "enabled": bool(self.user32.IsWindowEnabled(hwnd)),
+            "enabled": bool(self.user32.IsWindowEnabled(ctypes.wintypes.HWND(hwnd))),
             "geometry": {
                 "left": int(rect.left), "top": int(rect.top),
                 "right": int(rect.right), "bottom": int(rect.bottom),
@@ -147,7 +200,7 @@ class Win32Transport:
             out.append(int(child))
             return True
 
-        self.user32.EnumChildWindows(hwnd, cb, 0)
+        self.user32.EnumChildWindows(ctypes.wintypes.HWND(hwnd), cb, 0)
         return out
 
     def get_text(self, hwnd: int) -> str:
@@ -160,12 +213,22 @@ class Win32Transport:
         ULONG_PTR = ctypes.c_ulonglong if ctypes.sizeof(ctypes.c_void_p) == 8 else ctypes.c_ulong
         result = ULONG_PTR(0)
         ok = self.user32.SendMessageTimeoutW(
-            hwnd, WM_GETTEXT, len(buf), ctypes.cast(buf, ctypes.c_void_p).value or 0,
+            ctypes.wintypes.HWND(hwnd), WM_GETTEXT, len(buf), ctypes.cast(buf, ctypes.c_void_p).value or 0,
             SMTO_BLOCK | SMTO_ABORTIFHUNG, self.timeout_ms, ctypes.byref(result),
         )
         if not ok:
             raise NativeError("HWND_MESSAGE_TIMEOUT", "WM_GETTEXT failed or timed out", {"hwnd": hwnd, "timeout_ms": self.timeout_ms})
         return buf.value
+
+    def post_message(self, hwnd: int, msg: int, wparam: int = 0, lparam: int = 0) -> bool:
+        if not self.is_window(hwnd):
+            raise NativeError("STALE_TARGET", "HWND is no longer valid", {"hwnd": hwnd})
+        if isinstance(wparam, bool) or not isinstance(wparam, int) or isinstance(lparam, bool) or not isinstance(lparam, int):
+            raise NativeError("INVALID_ARGUMENT", "PostMessage wparam and lparam must be integers")
+        ok = bool(self.user32.PostMessageW(ctypes.wintypes.HWND(hwnd), msg, wparam, lparam))
+        if not ok:
+            raise NativeError("HWND_POST_MESSAGE_FAILED", "PostMessageW failed", {"hwnd": hwnd, "message": msg})
+        return True
 
     def send_timeout(self, hwnd: int, msg: int, wparam: int = 0, lparam: int | str = 0, timeout_ms: int = 2000) -> int:
         if not self.is_window(hwnd):
@@ -183,7 +246,7 @@ class Win32Transport:
         else:
             raise NativeError("INVALID_ARGUMENT", "lparam must be integer or string")
         ok = self.user32.SendMessageTimeoutW(
-            hwnd, msg, wparam, lparam_value,
+            ctypes.wintypes.HWND(hwnd), msg, wparam, lparam_value,
             SMTO_BLOCK | SMTO_ABORTIFHUNG, timeout_ms, ctypes.byref(result),
         )
         if not ok:
@@ -206,9 +269,18 @@ class HwndMessageBackend:
             "semantic_only": True,
             "physical_input": False,
             "arbitrary_messages": False,
-            "background_safe_actions": ["set_value", "invoke", "toggle", "select_index"],
+            "cross_desktop_sendinput_supported": False,
+            "cross_desktop_target_allowed": False,
+            "hwnd_pid_create_time_enforced": True,
+            "background_safe_actions": ["set_value", "replace_selection", "type_chars", "invoke", "toggle", "select_index"],
             "desktop_exclusive_actions": [],
             "supported_classes": sorted(_EDIT_CLASSES | {_BUTTON_CLASS, _COMBOBOX_CLASS, _LISTBOX_CLASS}),
+            "supported_messages": [
+                "WM_GETTEXT", "WM_GETTEXTLENGTH", "WM_SETTEXT",
+                "EM_SETSEL", "EM_REPLACESEL", "WM_CHAR",
+                "BM_CLICK", "BM_GETCHECK", "CB_SETCURSEL", "CB_GETCURSEL",
+                "LB_SETCURSEL", "LB_GETCURSEL", "WM_COMMAND",
+            ],
             "timeout_ms": self.timeout_ms,
             "selection_notification": "WM_COMMAND(CBN_SELCHANGE/LBN_SELCHANGE)",
             "mutating_timeout_retry_safe": False,
@@ -216,10 +288,34 @@ class HwndMessageBackend:
 
     def fingerprint(self, target: dict[str, Any]) -> dict[str, Any]:
         hwnd = self._target_hwnd(target)
+        expected_pid = target.get("pid")
+        if expected_pid is not None and (isinstance(expected_pid, bool) or not isinstance(expected_pid, int) or expected_pid <= 0):
+            raise NativeError("INVALID_ARGUMENT", "target pid must be a positive integer")
+        expected_create_time = target.get("create_time")
+        if expected_create_time is not None and (isinstance(expected_create_time, bool) or not isinstance(expected_create_time, int) or expected_create_time <= 0):
+            raise NativeError("INVALID_ARGUMENT", "target create_time must be a positive integer")
         info = self.transport.window_info(hwnd)
-        return {"hwnd": info["hwnd"], "pid": info["pid"], "class_name": info["class_name"]}
+        if expected_pid is not None and int(info["pid"]) != expected_pid:
+            raise NativeError(
+                "TARGET_IDENTITY_MISMATCH",
+                "HWND target PID does not match expected ownership",
+                {"hwnd": hwnd, "expected_pid": expected_pid, "actual_pid": int(info["pid"])},
+            )
+        create_time = info.get("create_time")
+        if expected_create_time is not None:
+            if create_time is None or int(create_time) != expected_create_time:
+                raise NativeError(
+                    "TARGET_IDENTITY_MISMATCH",
+                    "HWND target process creation time does not match expected ownership",
+                    {"hwnd": hwnd, "pid": int(info["pid"])},
+                )
+        fp: dict[str, Any] = {"hwnd": info["hwnd"], "pid": info["pid"], "class_name": info["class_name"]}
+        if create_time is not None:
+            fp["create_time"] = int(create_time)
+        return fp
 
     def snapshot(self, target: dict[str, Any], options: dict[str, Any]) -> list[dict[str, Any]]:
+        self.fingerprint(target)
         root = self._target_hwnd(target)
         hwnds = [root] + self.transport.child_windows(root)
         out: list[dict[str, Any]] = []
@@ -238,6 +334,7 @@ class HwndMessageBackend:
         return out
 
     def resolve(self, target: dict[str, Any], identity: dict[str, Any]) -> list[dict[str, Any]]:
+        self.fingerprint(target)
         root = self._target_hwnd(target)
         wanted_hwnd = identity.get("hwnd")
         if isinstance(wanted_hwnd, bool) or not isinstance(wanted_hwnd, int) or wanted_hwnd <= 0:
@@ -249,15 +346,19 @@ class HwndMessageBackend:
         return [entity] if entity["identity"] == identity else []
 
     def act(self, target: dict[str, Any], entity: dict[str, Any], action: str, args: dict[str, Any]) -> dict[str, Any]:
+        if action in _FORBIDDEN_PHYSICAL_ACTIONS:
+            inactive = getattr(self.transport, "_on_inactive_desktop", None)
+            code = "PRIVATE_DESKTOP_PHYSICAL_INPUT_UNSUPPORTED" if (callable(inactive) and inactive()) else "PHYSICAL_INPUT_FORBIDDEN"
+            raise NativeError(
+                code,
+                f"Physical input action {action!r} is forbidden in HwndMessageBackend; no SendInput fallback",
+                {"action": action, "physical_input_used": False, "retry_safe": False},
+            )
+        self.fingerprint(target)
         hwnd = self._entity_hwnd(entity)
         if action == "select_index":
             info = self.transport.window_info(hwnd)
-            identity = {
-                "hwnd": int(info["hwnd"]), "pid": int(info["pid"]),
-                "class_name": str(info["class_name"]), "control_id": int(info.get("control_id", 0)),
-                "parent_hwnd": int(info.get("parent_hwnd", 0) or 0),
-                "style_type": int(info.get("style", 0)) & BS_TYPEMASK,
-            }
+            identity = self._identity_from_info(info)
             if identity != entity.get("identity"):
                 raise NativeError("TARGET_MOVED", "HWND identity changed before action", {"hwnd": hwnd})
             cls = identity["class_name"].lower()
@@ -278,6 +379,48 @@ class HwndMessageBackend:
                 raise NativeError("INVALID_ARGUMENT", "set_value requires string value")
             result = self._mutating_send(hwnd, WM_SETTEXT, 0, value, "WM_SETTEXT")
             return self._with_interaction_receipt({"message": "WM_SETTEXT", "result": result}, interaction_before)
+        if action == "replace_selection" and cls in _EDIT_CLASSES:
+            value = args.get("value")
+            if not isinstance(value, str):
+                raise NativeError("INVALID_ARGUMENT", "replace_selection requires string value")
+            select_all = args.get("select_all", False)
+            if not isinstance(select_all, bool):
+                raise NativeError("INVALID_ARGUMENT", "select_all must be boolean")
+            if select_all:
+                self._mutating_send(hwnd, EM_SETSEL, 0, -1, "EM_SETSEL")
+            result = self._mutating_send(hwnd, EM_REPLACESEL, 1, value, "EM_REPLACESEL")
+            return self._with_interaction_receipt(
+                {"message": "EM_REPLACESEL", "select_all": select_all, "result": result},
+                interaction_before,
+            )
+        if action == "type_chars" and cls in _EDIT_CLASSES:
+            text = args.get("text")
+            if not isinstance(text, str) or not text or len(text) > 4096 or "\x00" in text:
+                raise NativeError("INVALID_ARGUMENT", "type_chars requires non-empty text (1..4096 chars, no NUL)")
+            delivery = args.get("delivery", "send")
+            if delivery not in {"send", "post"}:
+                raise NativeError("INVALID_ARGUMENT", "delivery must be 'send' or 'post'")
+            encoded = text.encode("utf-16-le")
+            units = [int.from_bytes(encoded[i:i + 2], "little") for i in range(0, len(encoded), 2)]
+            if delivery == "post":
+                post_fn = getattr(self.transport, "post_message", None)
+                if not callable(post_fn):
+                    raise NativeError("NO_BACKGROUND_ROUTE", "Transport does not support PostMessageW")
+                for unit in units:
+                    post_fn(hwnd, WM_CHAR, unit, 1)
+                # Fence behind the window's message queue so posted WM_CHARs
+                # are processed before returning for postcondition readback.
+                self.transport.send_timeout(hwnd, WM_GETTEXTLENGTH, 0, 0, self.timeout_ms)
+                return self._with_interaction_receipt(
+                    {"message": "WM_CHAR", "delivery": "post", "code_units": len(units)},
+                    interaction_before,
+                )
+            for unit in units:
+                self._mutating_send(hwnd, WM_CHAR, unit, 1, "WM_CHAR")
+            return self._with_interaction_receipt(
+                {"message": "WM_CHAR", "delivery": "send", "code_units": len(units)},
+                interaction_before,
+            )
         if action == "invoke" and cls == _BUTTON_CLASS:
             result = self._mutating_send(hwnd, BM_CLICK, 0, 0, "BM_CLICK")
             return self._with_interaction_receipt({"message": "BM_CLICK", "result": result}, interaction_before)
@@ -348,6 +491,7 @@ class HwndMessageBackend:
         raise NativeError("ACTION_UNSUPPORTED", f"HWND action {action!r} is not allowlisted for class {current['class_name']!r}")
 
     def read_entity(self, target: dict[str, Any], entity: dict[str, Any]) -> dict[str, Any]:
+        self.fingerprint(target)
         current = self._entity(self._entity_hwnd(entity))
         if current["identity"] != entity["identity"]:
             raise NativeError("TARGET_MOVED", "HWND identity changed during read")
@@ -391,6 +535,20 @@ class HwndMessageBackend:
                 },
             ) from exc
 
+    @staticmethod
+    def _identity_from_info(info: dict[str, Any]) -> dict[str, Any]:
+        identity: dict[str, Any] = {
+            "hwnd": int(info["hwnd"]),
+            "pid": int(info["pid"]),
+            "class_name": str(info["class_name"]),
+            "control_id": int(info.get("control_id", 0)),
+            "parent_hwnd": int(info.get("parent_hwnd", 0) or 0),
+            "style_type": int(info.get("style", 0)) & BS_TYPEMASK,
+        }
+        if info.get("create_time") is not None:
+            identity["create_time"] = int(info["create_time"])
+        return identity
+
     def _entity(self, hwnd: int) -> dict[str, Any]:
         info = self.transport.window_info(hwnd)
         cls = str(info["class_name"])
@@ -401,7 +559,7 @@ class HwndMessageBackend:
         role = "window"
         if cls_lower in _EDIT_CLASSES:
             role = "edit"
-            actions = ["set_value"]
+            actions = ["set_value", "replace_selection", "type_chars"]
         elif cls_lower == _BUTTON_CLASS:
             role = "button"
             actions = ["invoke"]
@@ -417,14 +575,7 @@ class HwndMessageBackend:
             role = "listbox"
             actions = ["select_index"]
             state["selected_index"] = self.transport.send_timeout(hwnd, LB_GETCURSEL, 0, 0, self.timeout_ms)
-        identity = {
-            "hwnd": int(info["hwnd"]),
-            "pid": int(info["pid"]),
-            "class_name": cls,
-            "control_id": int(info.get("control_id", 0)),
-            "parent_hwnd": int(info.get("parent_hwnd", 0) or 0),
-            "style_type": int(info.get("style", 0)) & BS_TYPEMASK,
-        }
+        identity = self._identity_from_info(info)
         return {
             "identity": identity,
             "role": role,

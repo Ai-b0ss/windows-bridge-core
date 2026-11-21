@@ -154,7 +154,13 @@ def read_document_text(transport, hwnd, owns):
         raise RuntimeError("HIDDEN_DOCUMENT_TEXT_TARGET_AMBIGUOUS")
     selected = candidates[0]
     def identity(info):
-        return tuple(info[key] for key in ("hwnd", "pid", "parent_hwnd", "class_name"))
+        return (
+            info["hwnd"],
+            info["pid"],
+            info["parent_hwnd"],
+            info["class_name"],
+            info.get("create_time"),
+        )
     def valid():
         return (owns(hwnd) and identity(transport.window_info(hwnd)) == identity(root) and
                 identity(transport.window_info(selected["hwnd"])) == identity(selected))

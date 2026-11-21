@@ -1,5 +1,6 @@
 """Inactive Windows desktop worker. No SwitchDesktop or physical input API."""
 from __future__ import annotations
+import atexit
 import ctypes
 from ctypes import wintypes as w
 import json
@@ -14,6 +15,7 @@ import threading
 import time
 from types import SimpleNamespace
 import uuid
+import weakref
 from cua_sidecar_supervisor import _bind_windows_kill_on_close_job, _close_windows_job_handle
 
 class HiddenDesktopError(RuntimeError):
@@ -39,6 +41,69 @@ class _JobAccounting(ctypes.Structure):
         ("TotalPageFaultCount", w.DWORD), ("TotalProcesses", w.DWORD),
         ("ActiveProcesses", w.DWORD), ("TotalTerminatedProcesses", w.DWORD),
     ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [
+        ("ReadOperationCount", ctypes.c_ulonglong), ("WriteOperationCount", ctypes.c_ulonglong),
+        ("OtherOperationCount", ctypes.c_ulonglong), ("ReadTransferCount", ctypes.c_ulonglong),
+        ("WriteTransferCount", ctypes.c_ulonglong), ("OtherTransferCount", ctypes.c_ulonglong),
+    ]
+
+
+class _BasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_longlong), ("PerJobUserTimeLimit", ctypes.c_longlong),
+        ("LimitFlags", w.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", w.DWORD),
+        ("Affinity", ctypes.c_size_t), ("PriorityClass", w.DWORD), ("SchedulingClass", w.DWORD),
+    ]
+
+
+class _ExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _BasicLimitInformation), ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
+
+
+def _create_named_kill_on_close_job(kernel32, job_name: str, process_handle):
+    """Create a fresh named Windows Job Object and bind the suspended worker handle."""
+    kernel32.CreateJobObjectW.argtypes = [w.LPVOID, w.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = w.HANDLE
+    kernel32.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+    kernel32.SetInformationJobObject.restype = w.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = w.BOOL
+    ctypes.set_last_error(0)
+    job = kernel32.CreateJobObjectW(None, job_name)
+    err = ctypes.get_last_error()
+    if not job:
+        raise ctypes.WinError(err)
+    if err == 183:  # ERROR_ALREADY_EXISTS: never attach to a foreign/pre-existing job
+        kernel32.CloseHandle(job)
+        raise HiddenDesktopError("HIDDEN_JOB_ALREADY_EXISTS", {"job_name": job_name})
+    try:
+        info = _ExtendedLimitInformation()
+        info.BasicLimitInformation.LimitFlags = 0x00002000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        if not kernel32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.AssignProcessToJobObject(job, process_handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return int(job)
+    except BaseException:
+        kernel32.CloseHandle(job)
+        raise
+
+
+def _atexit_close_session(ref):
+    session = ref()
+    if session is not None:
+        try:
+            session.close()
+        except Exception:
+            pass
 
 
 def _medium_desktop(u, k, desktop_name):
@@ -118,22 +183,25 @@ class HiddenDesktopSession:
         self.root=Path(package_root).resolve()
         self.session_id=uuid.uuid4().hex
         self.desktop_name="FFBridge-Agent-"+self.session_id
+        self.job_name="Local\\FFBridge-HiddenDesktop-"+self.session_id
         self._lock=threading.Lock();self._close_lock=threading.Lock();self._queue=queue.Queue()
         self._desktop=None;self._process=None;self._job=None;self._writer=None;self._reader=None
-        self._stderr=None;self.pid=None;self._closed=False
+        self._stderr=None;self.pid=None;self._closed=False;self.cancelled=False
         self._editor_profiles=[];self.editor_profile_cleanup=[]
         self._chrome_profile=None;self.browser_profile_cleanup=[]
-        self.job_cleanup_verified=False
+        self.job_cleanup_verified=False;self.desktop_cleanup_verified=False
         self.worker_integrity=worker_integrity;self.webview_port=None
         self._u=ctypes.WinDLL("user32",use_last_error=True);self._k=ctypes.WinDLL("kernel32",use_last_error=True)
         self._u.CreateDesktopW.argtypes=[w.LPCWSTR,w.LPCWSTR,ctypes.c_void_p,w.DWORD,w.DWORD,ctypes.c_void_p];self._u.CreateDesktopW.restype=w.HANDLE
-        self._u.CloseDesktop.argtypes=[w.HANDLE]
+        self._u.CloseDesktop.argtypes=[w.HANDLE];self._u.CloseDesktop.restype=w.BOOL
         self._k.CreateProcessW.argtypes=[w.LPCWSTR,w.LPWSTR,ctypes.c_void_p,ctypes.c_void_p,w.BOOL,w.DWORD,ctypes.c_void_p,w.LPCWSTR,ctypes.POINTER(_StartupInfoEx),ctypes.POINTER(_ProcessInfo)]
         self._k.CloseHandle.argtypes=[w.HANDLE];self._k.ResumeThread.argtypes=[w.HANDLE]
         self._k.SetHandleInformation.argtypes=[w.HANDLE,w.DWORD,w.DWORD]
         self._k.TerminateProcess.argtypes=[w.HANDLE,w.UINT];self._k.WaitForSingleObject.argtypes=[w.HANDLE,w.DWORD]
         self._k.TerminateJobObject.argtypes=[w.HANDLE,w.UINT]
         self._k.QueryInformationJobObject.argtypes=[w.HANDLE,ctypes.c_int,w.LPVOID,w.DWORD,ctypes.POINTER(w.DWORD)]
+        self._k.OpenProcess.argtypes=[w.DWORD,w.BOOL,w.DWORD];self._k.OpenProcess.restype=w.HANDLE
+        self._k.IsProcessInJob.argtypes=[w.HANDLE,w.HANDLE,ctypes.POINTER(w.BOOL)];self._k.IsProcessInJob.restype=w.BOOL
         self._k.InitializeProcThreadAttributeList.argtypes=[w.LPVOID,w.DWORD,w.DWORD,ctypes.POINTER(ctypes.c_size_t)]
         self._k.UpdateProcThreadAttribute.argtypes=[w.LPVOID,w.DWORD,ctypes.c_size_t,w.LPVOID,ctypes.c_size_t,w.LPVOID,w.LPVOID]
         self._k.DeleteProcThreadAttributeList.argtypes=[w.LPVOID]
@@ -178,18 +246,19 @@ class HiddenDesktopSession:
                 raise ctypes.WinError(ctypes.get_last_error())
             self._process=pi.hProcess;self.pid=pi.pid
             try:
-                self._job=_bind_windows_kill_on_close_job(SimpleNamespace(pid=self.pid))
+                self._job=_create_named_kill_on_close_job(self._k,self.job_name,self._process)
                 if self._k.ResumeThread(pi.hThread)==0xffffffff:raise ctypes.WinError(ctypes.get_last_error())
             finally:self._k.CloseHandle(pi.hThread)
             os.close(input_read);descriptors.remove(input_read);os.close(output_write);descriptors.remove(output_write)
             self._writer=os.fdopen(input_write,"w",encoding="utf-8",newline="\n");descriptors.remove(input_write)
             self._reader=os.fdopen(output_read,"r",encoding="utf-8");descriptors.remove(output_read)
+            atexit.register(_atexit_close_session,weakref.ref(self))
             threading.Thread(target=self._pump,daemon=True).start()
             ready=self.request({"command":"health"},timeout_s=10)
             self.supported_apps=ready.get("supported_apps",[])
             if ready.get("desktop")!=self.desktop_name or ready.get("input_desktop")==self.desktop_name:
                 raise HiddenDesktopError("HIDDEN_DESKTOP_IDENTITY_INVALID")
-        except Exception:
+        except BaseException:
             for fd in descriptors:os.close(fd)
             self.close()
             raise
@@ -238,6 +307,9 @@ class HiddenDesktopSession:
             except (OSError,ValueError,queue.Empty):
                 self.close()
                 raise HiddenDesktopError("HIDDEN_ACTION_OUTCOME_UNKNOWN")
+            except BaseException:
+                self.close()
+                raise
             if reply.get("fatal") or reply.get("id")!=request_id:
                 self.close();raise HiddenDesktopError("HIDDEN_ACTION_OUTCOME_UNKNOWN")
             if not reply.get("ok"):
@@ -250,6 +322,40 @@ class HiddenDesktopSession:
     @property
     def closed(self):
         return self._closed
+
+    def is_process_in_session_job(self, pid: int) -> bool:
+        """Verify at the Windows kernel level that pid belongs to this session's Job Object."""
+        if self._closed or not self._job or type(pid) is not int or pid <= 0:
+            return False
+        proc = self._k.OpenProcess(0x1000, False, pid)
+        if not proc:
+            return False
+        try:
+            in_job = w.BOOL(False)
+            if not self._k.IsProcessInJob(proc, self._job, ctypes.byref(in_job)):
+                return False
+            return bool(in_job.value)
+        finally:
+            self._k.CloseHandle(proc)
+
+    def teardown_receipt(self) -> dict:
+        return {
+            "session_id": self.session_id,
+            "desktop_name": self.desktop_name,
+            "job_name": getattr(self, "job_name", None),
+            "closed": self._closed,
+            "cancelled": getattr(self, "cancelled", False),
+            "job_cleanup_verified": self.job_cleanup_verified,
+            "desktop_cleanup_verified": getattr(self, "desktop_cleanup_verified", False),
+            "browser_profile_cleanup": list(self.browser_profile_cleanup),
+            "editor_profile_cleanup": list(self.editor_profile_cleanup),
+        }
+
+    def cancel(self) -> dict:
+        """Forced cancel: immediately terminate the named Job, close desktop, wake waiters."""
+        self.cancelled = True
+        self.close()
+        return self.teardown_receipt()
 
     def _stop_owned_processes(self):
         job, self._job = self._job, None
@@ -296,8 +402,16 @@ class HiddenDesktopSession:
             writer,self._writer=self._writer,None
             try:writer.close()
             except OSError:pass
-        if self._stderr:self._stderr.close()
-        if self._desktop:self._u.CloseDesktop(self._desktop);self._desktop=None
+        if self._stderr:
+            stderr,self._stderr=self._stderr,None
+            stderr.close()
+        if self._desktop:
+            desktop,self._desktop=self._desktop,None
+            self.desktop_cleanup_verified=bool(self._u.CloseDesktop(desktop))
+        pending=getattr(self,"_queue",None)
+        if isinstance(pending,queue.Queue):
+            try:pending.put_nowait({"fatal":"HIDDEN_WORKER_CLOSED"})
+            except Exception:pass
         if self._chrome_profile is not None:
             profile,self._chrome_profile=self._chrome_profile,None
             try:
@@ -333,6 +447,13 @@ class HiddenDesktopSession:
             except Exception as exc:
                 self.editor_profile_cleanup.append({'root':str(profiles.path),'removed':False,'error_type':type(exc).__name__,'error':str(exc)})
         self._editor_profiles=[]
+
+    def __del__(self):
+        try:
+            if not getattr(self,"_closed",True):
+                self.close()
+        except Exception:
+            pass
 
     def __enter__(self):return self
     def __exit__(self,*exc):self.close()

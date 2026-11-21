@@ -44,8 +44,12 @@ class NativeSemanticCore:
     """
 
     _QUERY_KEYS = {"role", "name", "automation_id", "class_name", "control_id"}
-    _POSTCONDITION_TYPES = {"value_equals", "state_equals"}
+    _POSTCONDITION_TYPES = {"value_equals", "state_equals", "surface_entity_value_equals"}
     _POLICY_KEYS = {"background_required"}
+    _FORBIDDEN_PHYSICAL_ACTIONS = frozenset({
+        "physical_sequence", "send_input", "mouse_click", "mouse_move",
+        "key_tap", "key_chord", "unicode_char", "visual_click", "switch_desktop",
+    })
 
     def __init__(self, backend: NativeBackend):
         self.backend = backend
@@ -60,6 +64,8 @@ class NativeSemanticCore:
             "generation_scoped_refs": True,
             "action_time_reresolution": True,
             "explicit_verification": True,
+            "postcondition_types": sorted(self._POSTCONDITION_TYPES),
+            "rerender_receipt_recovery": True,
             "backend": self.backend.capabilities(),
         }
 
@@ -144,6 +150,12 @@ class NativeSemanticCore:
                 {"ref": ref, "generation": generation, "ref_generation": state.generation},
             )
         self._guard_surface(state)
+        if action in self._FORBIDDEN_PHYSICAL_ACTIONS:
+            raise NativeError(
+                "PHYSICAL_INPUT_FORBIDDEN",
+                f"Physical input action {action!r} is forbidden in NativeSemanticCore; no coordinate/SendInput fallback",
+                {"ref": ref, "action": action, "physical_input_used": False, "retry_safe": False},
+            )
         resolved = self._resolve_one(state, entity)
         actions = set(resolved.get("actions") or entity.get("actions") or [])
         if action not in actions:
@@ -172,12 +184,39 @@ class NativeSemanticCore:
                 # An action can replace its target; a later stale reference does
                 # not prove that the original mutation never happened.
                 self._guard_surface(state)
-                resolved_after = self._resolve_one(state, entity)
-                after = self.backend.read_entity(state.target, resolved_after)
-                verified, verification = self._verify(postcondition, after)
+                if postcondition["type"] == "surface_entity_value_equals":
+                    verified, verification = self._verify_surface_entity(state.target, postcondition)
+                else:
+                    try:
+                        resolved_after = self._resolve_one(state, entity)
+                        after = self.backend.read_entity(state.target, resolved_after)
+                    except NativeError as exc:
+                        if action != "set_value" or postcondition["type"] != "value_equals" or exc.code != "STALE_TARGET":
+                            raise
+                        # Electron or rerendering controls can replace an edit node after a
+                        # successful set_value. Re-read a UNIQUE semantic control in this
+                        # same window. Do not replay the mutation and never accept ambiguity.
+                        verified, verification = self._verify_surface_entity(
+                            state.target,
+                            {"type": "surface_entity_value_equals",
+                             "query": self._stable_identity_query(entity),
+                             "value": postcondition["value"]},
+                        )
+                    else:
+                        verified, verification = self._verify(postcondition, after)
+            elif isinstance(action_result, dict) and action_result.get("target_rerendered_after_action") is True:
+                raise NativeError(
+                    "STALE_TARGET",
+                    "Target disappeared after action and no postcondition was provided to verify outcome",
+                    {"ref": ref},
+                )
         except NativeError as exc:
-            raise NativeError(exc.code, exc.message, {
+            code = "ACTION_OUTCOME_UNKNOWN" if phase == "native_postcondition" and exc.code in (
+                "STALE_TARGET", "TARGET_MOVED", "TARGET_AMBIGUOUS",
+            ) else exc.code
+            raise NativeError(code, exc.message, {
                 **exc.details, "attempted": True, "retry_safe": False, "phase": phase,
+                "original_error_code": exc.code,
             }) from exc
         except Exception as exc:
             raise NativeError("NATIVE_ACTION_OUTCOME_UNKNOWN", type(exc).__name__, {
@@ -332,6 +371,11 @@ class NativeSemanticCore:
             key = postcondition.get("key")
             if not isinstance(key, str) or not key:
                 raise NativeError("INVALID_ARGUMENT", "state_equals requires non-empty key")
+        if kind == "surface_entity_value_equals":
+            query = postcondition.get("query")
+            cls._validate_query(query)
+            if not any(query.get(k) not in (None, "") for k in ("automation_id", "name", "control_id")):
+                raise NativeError("INVALID_ARGUMENT", "surface verification requires a named semantic control")
 
     @classmethod
     def _validate_policy(cls, policy: dict[str, Any] | None) -> dict[str, Any]:
@@ -360,6 +404,40 @@ class NativeSemanticCore:
             elif actual != wanted:
                 return False
         return True
+
+    @staticmethod
+    def _stable_identity_query(entity: dict[str, Any]) -> dict[str, Any]:
+        query: dict[str, Any] = {"role": entity.get("role")}
+        # Never recover by position or class name alone: rerendering frameworks
+        # rearrange nodes, and selecting another editor would falsely confirm success.
+        automation_id = entity.get("automation_id")
+        if automation_id not in (None, ""):
+            query["automation_id"] = automation_id
+        control_id = entity.get("control_id")
+        if isinstance(control_id, int) and not isinstance(control_id, bool) and control_id > 0:
+            query["control_id"] = control_id
+        name = entity.get("name")
+        has_id = "automation_id" in query or "control_id" in query
+        if name not in (None, "") and not (has_id and name == entity.get("value")):
+            query["name"] = name
+        if not any(key in query for key in ("automation_id", "name", "control_id")):
+            raise NativeError("ACTION_OUTCOME_UNKNOWN", "No stable semantic control selector")
+        return query
+
+    def _verify_surface_entity(self, target: dict[str, Any], postcondition: dict[str, Any]) -> tuple[bool, dict[str, Any]]:
+        query = postcondition["query"]
+        # Fresh, read-only snapshot in the exact action-scoped window. Do not
+        # reuse stale generation refs and do not retry an unknown mutation.
+        raw_entities = self.backend.snapshot(target, {})
+        entities = [self._normalize_entity(item) for item in raw_entities]
+        matches = [entity for entity in entities if self._matches(entity, query)]
+        if len(matches) != 1:
+            raise NativeError("ACTION_OUTCOME_UNKNOWN", "Post-action control not uniquely identifiable",
+                              {"matching_controls": len(matches), "query": query})
+        expected = postcondition["value"]
+        actual = matches[0].get("value")
+        return actual == expected, {"type": "surface_entity_value_equals", "query": query,
+                                    "expected": expected, "actual": actual, "matched": True}
 
     @staticmethod
     def _verify(postcondition: dict[str, Any], after: dict[str, Any]) -> tuple[bool, dict[str, Any]]:

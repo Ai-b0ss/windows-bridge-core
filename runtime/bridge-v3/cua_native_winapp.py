@@ -9,6 +9,12 @@ from typing import Any, Callable
 from cua_native_core import NativeError
 
 
+_FORBIDDEN_PHYSICAL_ACTIONS = frozenset({
+    "physical_sequence", "send_input", "mouse_click", "mouse_move",
+    "key_tap", "key_chord", "unicode_char", "visual_click", "switch_desktop",
+})
+
+
 class WinAppCliBackend:
     """Semantic backend adapter for Microsoft winapp ui JSON commands.
 
@@ -32,6 +38,8 @@ class WinAppCliBackend:
             "preview_dependency": True,
             "semantic_actions": ["invoke", "set_value", "scroll_into_view"],
             "physical_actions_exposed": False,
+            "cross_desktop_uia_supported": False,
+            "cross_desktop_sendinput_supported": False,
             # WinApp documents set-value and scroll-into-view as shared/background
             # UIA mutations. Invoke is semantic UIA but takes an exclusive desktop
             # turn in WinApp's own coordinator, so the outer policy must not infer
@@ -44,11 +52,25 @@ class WinAppCliBackend:
         # list-windows accepts -a but intentionally does NOT accept -w. For an
         # HWND target enumerate windows then select the exact numeric handle.
         if target.get("hwnd") is not None:
-            payload = self._run(["ui", "list-windows", "--json"])
-            windows = self._window_list(payload)
             wanted = self._hwnd_int(target["hwnd"])
             if wanted is None:
                 raise NativeError("INVALID_ARGUMENT", "Invalid hwnd target", {"hwnd": target.get("hwnd")})
+            if os.name == "nt":
+                from cua_desktop_identity import DesktopIdentityError, thread_and_target_desktop
+                try:
+                    desk = thread_and_target_desktop(wanted)
+                except DesktopIdentityError as exc:
+                    if str(exc) != "TARGET_DESKTOP_IDENTITY_UNAVAILABLE":
+                        raise NativeError("CROSS_DESKTOP_UIA_UNSUPPORTED", str(exc), {"hwnd": wanted}) from exc
+                else:
+                    if desk["target"] != desk["current"]:
+                        raise NativeError(
+                            "CROSS_DESKTOP_UIA_UNSUPPORTED",
+                            "WinApp UIA cannot target a window on another Windows desktop",
+                            {"hwnd": wanted, "current_desktop": desk["current"], "target_desktop": desk["target"]},
+                        )
+            payload = self._run(["ui", "list-windows", "--json"])
+            windows = self._window_list(payload)
             windows = [item for item in windows if self._hwnd_int(item.get("hwnd")) == wanted]
         elif target.get("app"):
             payload = self._run(["ui", "list-windows", "-a", str(target["app"]), "--json"])
@@ -63,12 +85,32 @@ class WinAppCliBackend:
         hwnd = self._hwnd_int(win.get("hwnd"))
         if hwnd is None:
             raise NativeError("BACKEND_CONTRACT_ERROR", "winapp list-windows result has invalid hwnd")
+        actual_pid = win.get("processId", win.get("pid"))
+        expected_pid = target.get("pid")
+        if expected_pid is not None:
+            if isinstance(expected_pid, bool) or not isinstance(expected_pid, int) or expected_pid <= 0:
+                raise NativeError("INVALID_ARGUMENT", "target.pid must be a positive integer")
+            if actual_pid != expected_pid:
+                raise NativeError("TARGET_IDENTITY_MISMATCH", "WinApp target PID mismatch", {"expected_pid": expected_pid, "actual_pid": actual_pid})
+        create_time = None
+        if os.name == "nt" and isinstance(actual_pid, int) and not isinstance(actual_pid, bool) and actual_pid > 0:
+            from ff_win_process_identity import process_creation_token
+            create_time = process_creation_token(actual_pid)
+        expected_ct = target.get("create_time")
+        if expected_ct is not None:
+            if isinstance(expected_ct, bool) or not isinstance(expected_ct, int) or expected_ct <= 0:
+                raise NativeError("INVALID_ARGUMENT", "target.create_time must be a positive integer")
+            if create_time is None or create_time != expected_ct:
+                raise NativeError("TARGET_IDENTITY_MISMATCH", "WinApp target create_time mismatch", {"hwnd": hex(hwnd), "pid": actual_pid})
         # Title and foreground state are mutable evidence, not target identity.
-        return {
+        result: dict[str, Any] = {
             "hwnd": hex(hwnd),
             "class_name": win.get("className") or win.get("class_name"),
-            "pid": win.get("processId", win.get("pid")),
+            "pid": actual_pid,
         }
+        if create_time is not None:
+            result["create_time"] = int(create_time)
+        return result
 
     def snapshot(self, target: dict[str, Any], options: dict[str, Any]) -> list[dict[str, Any]]:
         args = ["ui", "inspect", *self._target_args(target), "--json"]
@@ -104,6 +146,12 @@ class WinAppCliBackend:
         return [item for item in normalized if item["identity"] == identity]
 
     def act(self, target: dict[str, Any], entity: dict[str, Any], action: str, args: dict[str, Any]) -> dict[str, Any]:
+        if action in _FORBIDDEN_PHYSICAL_ACTIONS:
+            raise NativeError(
+                "PHYSICAL_INPUT_FORBIDDEN",
+                f"WinApp semantic adapter forbids physical input action {action!r}",
+                {"action": action, "physical_input_used": False, "retry_safe": False},
+            )
         selector = str(entity["identity"]["selector"])
         target_args = self._target_args(target)
         if action == "invoke":

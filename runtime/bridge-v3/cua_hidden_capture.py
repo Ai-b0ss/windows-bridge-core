@@ -41,19 +41,28 @@ def png_from_bgra(width, height, pixels):
         raise HiddenCaptureError("HIDDEN_CAPTURE_REPLY_TOO_LARGE")
     return png
 
+def _query_desktop_identity(identity, hwnd):
+    try:
+        return identity(hwnd)
+    except TypeError:
+        return identity()
+
+
 def capture_owned_window(hwnd, owns, *, backend=None, identity=None):
     if type(hwnd) is not int or hwnd <= 0 or not owns(hwnd):
         raise HiddenCaptureError("HIDDEN_WINDOW_NOT_OWNED")
     if identity is None:
         from cua_desktop_identity import desktop_identity
         identity = desktop_identity
-    desktop = identity()
-    if not desktop["current"].startswith("FFBridge-Agent-") or desktop["current"] == desktop["input"]:
+    desktop = _query_desktop_identity(identity, hwnd)
+    if (not desktop["current"].startswith("FFBridge-Agent-")
+            or desktop["current"] == desktop["input"]
+            or desktop.get("target", desktop["current"]) != desktop["current"]):
         raise HiddenCaptureError("HIDDEN_DESKTOP_IDENTITY_INVALID")
     backend = backend if backend is not None else Win32PrintWindow()
     width, height, pixels = backend.capture(hwnd)
     # Never release pixels from a target that disappeared or changed ownership.
-    if not owns(hwnd) or identity() != desktop:
+    if not owns(hwnd) or _query_desktop_identity(identity, hwnd) != desktop:
         raise HiddenCaptureError("HIDDEN_CAPTURE_TARGET_CHANGED")
     png = png_from_bgra(width, height, pixels)
     return {"engine":"PRINTWINDOW", "hwnd":hwnd, "frame_w":width, "frame_h":height,
@@ -98,7 +107,7 @@ class Win32PrintWindow:
             if not previous or previous==ctypes.c_void_p(-1).value:
                 raise HiddenCaptureError("HIDDEN_CAPTURE_SELECT_FAILED")
             selected=True
-            if not self.u.PrintWindow(hwnd,memory,0):
+            if not self.u.PrintWindow(hwnd,memory,0) and not self.u.PrintWindow(hwnd,memory,2):
                 raise HiddenCaptureError("HIDDEN_CAPTURE_RENDER_FAILED")
             self.g.SelectObject(memory,previous);selected=False
             info=ctypes.create_string_buffer(struct.pack("<IiiHHIIiiII",40,width,-height,1,32,0,width*height*4,0,0,0,0)+bytes(16))

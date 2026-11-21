@@ -43,10 +43,21 @@ uia_backend=None
 uia_core=None
 ui_backend=None
 ui_core=None
+hwnd_backend=None
+hwnd_core=None
 panels={}
 editors={}
 chrome=None
 private_browser=None
+_FORBIDDEN_PHYSICAL_COMMANDS=frozenset({
+    "physical_sequence","send_input","focus_target","acquire_physical_lease",
+    "release_physical_lease","visual_click","switch_desktop",
+    "mouse_click","mouse_move","key_tap","key_chord",
+})
+_FORBIDDEN_PHYSICAL_OPERATIONS=frozenset({
+    "physical_sequence","send_input","visual_click","mouse_click",
+    "mouse_move","key_tap","key_chord","unicode_char","switch_desktop",
+})
 def windows(pid):
     found=[];callback_type=ctypes.WINFUNCTYPE(w.BOOL,w.HWND,w.LPARAM)
     @callback_type
@@ -75,10 +86,76 @@ def owns(hwnd):
     if type(hwnd) is not int or hwnd<=0:return False
     pid=w.DWORD();U.GetWindowThreadProcessId(int(hwnd),ctypes.byref(pid))
     return live_app(pid.value) and int(hwnd) in windows(pid.value)
+
+def verify_owned_hwnd(hwnd, *, expected_pid=None, expected_create_time=None):
+    """Fail-closed HWND ownership check: owned live child + pid + create_time + private desktop."""
+    from cua_desktop_identity import DesktopIdentityError, require_private_desktop
+    if type(hwnd) is not int or hwnd<=0 or not owns(hwnd):
+        raise HiddenLaunchError("HIDDEN_WINDOW_NOT_OWNED",{"hwnd":hwnd,"retry_safe":False})
+    pid=w.DWORD()
+    tid=U.GetWindowThreadProcessId(int(hwnd),ctypes.byref(pid))
+    if not tid or not live_app(pid.value):
+        raise HiddenLaunchError("HIDDEN_WINDOW_NOT_OWNED",{"hwnd":hwnd,"retry_safe":False})
+    create_time=app_tokens.get(pid.value)
+    if type(create_time) is not int or create_time<=0:
+        raise HiddenLaunchError("HIDDEN_WINDOW_NOT_OWNED",{"hwnd":hwnd,"retry_safe":False})
+    try:
+        require_private_desktop(desktop, hwnd=hwnd)
+    except DesktopIdentityError as exc:
+        raise HiddenLaunchError("HIDDEN_WINDOW_NOT_OWNED",{"hwnd":hwnd,"reason":str(exc),"retry_safe":False}) from exc
+    if expected_pid is not None:
+        if type(expected_pid) is not int or expected_pid!=pid.value:
+            raise HiddenLaunchError("HIDDEN_WINDOW_IDENTITY_MISMATCH",{"hwnd":hwnd,"expected_pid":expected_pid,"retry_safe":False})
+    if expected_create_time is not None:
+        if type(expected_create_time) is not int or expected_create_time!=create_time:
+            raise HiddenLaunchError("HIDDEN_WINDOW_IDENTITY_MISMATCH",{"hwnd":hwnd,"retry_safe":False})
+    return {"hwnd":hwnd,"pid":pid.value,"create_time":create_time}
+
+def _reject_physical_input_request(args):
+    command=args.get("command")
+    operation=args.get("operation")
+    policy=args.get("policy")
+    if command in _FORBIDDEN_PHYSICAL_COMMANDS:
+        raise HiddenLaunchError(
+            "PRIVATE_DESKTOP_PHYSICAL_INPUT_UNSUPPORTED",
+            {
+                "command":command,
+                "reason":"Win32 SendInput/SwitchDesktop cannot target an inactive private desktop without hijacking the owner's input desktop; fail-closed with no visible-desktop fallback",
+                "physical_input_used":False,
+                "retry_safe":False,
+            },
+        )
+    if operation in _FORBIDDEN_PHYSICAL_OPERATIONS:
+        raise HiddenLaunchError(
+            "PRIVATE_DESKTOP_PHYSICAL_INPUT_UNSUPPORTED",
+            {
+                "command":command,
+                "operation":operation,
+                "reason":"Hardware SendInput/pointer injection is unsupported on an inactive private desktop; fail-closed with no visible-desktop fallback",
+                "physical_input_used":False,
+                "retry_safe":False,
+            },
+        )
+    if isinstance(policy,dict) and (
+        policy.get("physical_input_allowed") is True
+        or policy.get("foreground_allowed") is True
+        or policy.get("switch_desktop_allowed") is True
+    ):
+        raise HiddenLaunchError(
+            "PRIVATE_DESKTOP_PHYSICAL_INPUT_UNSUPPORTED",
+            {
+                "command":command,
+                "reason":"Private desktop refuses physical_input_allowed, foreground_allowed, and switch_desktop_allowed; no visible-desktop fallback",
+                "physical_input_used":False,
+                "retry_safe":False,
+            },
+        )
+
 def handle(args):
-    global uia_backend,uia_core,ui_backend,ui_core,chrome,private_browser
-    from cua_desktop_identity import require_private_desktop
+    global uia_backend,uia_core,ui_backend,ui_core,hwnd_backend,hwnd_core,chrome,private_browser
+    from cua_desktop_identity import PRIVATE_DESKTOP_BOUNDARIES, require_private_desktop
     identity=require_private_desktop(desktop)
+    _reject_physical_input_request(args)
     command=args.get("command")
     if command=='browser.launch':
         from cua_hidden_chrome import launch_chrome
@@ -120,6 +197,7 @@ def handle(args):
         import uuid
         hwnd=args.get('hwnd')
         if type(hwnd) is not int or not owns(hwnd) or hwnd not in editors:raise RuntimeError('HIDDEN_EDITOR_NOT_OWNED')
+        verify_owned_hwnd(hwnd,expected_pid=args.get('pid'),expected_create_time=args.get('create_time'))
         ctx=editors[hwnd]
         if command=='editor.observe':
             result=host_request(ctx['config'],ctx['discovery'],'observe');ctx['generation']+=1;ctx['ref']=uuid.uuid4().hex;ctx['observed']=result['document']
@@ -132,26 +210,26 @@ def handle(args):
             expected_text=observed['text'],expected_file_sha256=observed['file_sha256'],text=args.get('replacement_text')),
             'hwnd':hwnd,'route':'NATIVE_EDITOR_API'}
     if command in {"document.save","document.read","document.replace"}:
-        hwnd=args.get('hwnd');book=args.get('document_path')
-        if type(hwnd) is not int or not owns(hwnd):raise RuntimeError('HIDDEN_WINDOW_NOT_OWNED')
+        book=args.get('document_path')
+        target=verify_owned_hwnd(args.get('hwnd'),expected_pid=args.get('pid'),expected_create_time=args.get('create_time'))
+        hwnd=target['hwnd']
         if not isinstance(book,str) or not Path(book).is_absolute() or Path(book).suffix.casefold() not in {'.xlsx','.docx','.pptx'}:raise RuntimeError('HIDDEN_DOCUMENT_INVALID')
         if command!='document.save' and Path(book).suffix.casefold() not in {'.docx','.pptx'}:raise RuntimeError('HIDDEN_DOCUMENT_OPERATION_UNSUPPORTED')
         if command=='document.replace' and any(not isinstance(args.get(key),str) or len(args[key])>65536 for key in ('expected_text','replacement_text')):raise RuntimeError('HIDDEN_DOCUMENT_TEXT_INVALID')
         if uia_backend is None:
             from cua_native_uia3 import Uia3PersistentBackend
             uia_backend=Uia3PersistentBackend(prepare_uia(Path(__file__).resolve().parent),timeout_seconds=8,no_focus=True)
-        pid=w.DWORD();U.GetWindowThreadProcessId(hwnd,ctypes.byref(pid))
         if Path(book).suffix.casefold()=='.pptx':
             if command=='document.replace' and (type(args.get('slide_id')) is not int or type(args.get('shape_id')) is not int or not isinstance(args.get('shape_name'),str) or len(args['shape_name'])>1024):raise RuntimeError('HIDDEN_DOCUMENT_TARGET_INVALID')
-            return uia_backend._request('powerpoint_document',{'hwnd':hwnd,'pid':pid.value,'document_path':str(Path(book).resolve()),'action':command.split('.')[1],'slide_id':args.get('slide_id'),'shape_id':args.get('shape_id'),'shape_name':args.get('shape_name'),'expected_text':args.get('expected_text'),'replacement_text':args.get('replacement_text')})
+            return uia_backend._request('powerpoint_document',{'hwnd':hwnd,'pid':target['pid'],'document_path':str(Path(book).resolve()),'action':command.split('.')[1],'slide_id':args.get('slide_id'),'shape_id':args.get('shape_id'),'shape_name':args.get('shape_name'),'expected_text':args.get('expected_text'),'replacement_text':args.get('replacement_text')})
         if Path(book).suffix.casefold()=='.docx':
-            return uia_backend._request('word_document',{'hwnd':hwnd,'pid':pid.value,'document_path':str(Path(book).resolve()),'action':command.split('.')[1],'expected_text':args.get('expected_text'),'replacement_text':args.get('replacement_text')})
-        return uia_backend._request('excel_save',{'hwnd':hwnd,'pid':pid.value,'book_path':str(Path(book).resolve())})
+            return uia_backend._request('word_document',{'hwnd':hwnd,'pid':target['pid'],'document_path':str(Path(book).resolve()),'action':command.split('.')[1],'expected_text':args.get('expected_text'),'replacement_text':args.get('replacement_text')})
+        return uia_backend._request('excel_save',{'hwnd':hwnd,'pid':target['pid'],'book_path':str(Path(book).resolve())})
     if command in {"panel.discover","panel.inspect","panel.type","panel.invoke","panel.verify"}:
         from cua_universal_fastpath import UniversalFastPath
         from cua_native_hwnd import Win32Transport
-        hwnd=args.get('hwnd')
-        if type(hwnd) is not int or not owns(hwnd):raise RuntimeError('HIDDEN_WINDOW_NOT_OWNED')
+        target=verify_owned_hwnd(args.get('hwnd'),expected_pid=args.get('pid'),expected_create_time=args.get('create_time'))
+        hwnd=target['hwnd']
         fp=UniversalFastPath()
         if command=="panel.discover":
             window=Win32Transport().window_info(hwnd)
@@ -167,7 +245,9 @@ def handle(args):
         return fp.panel_action(discovery,command,action_args=args.get('action_args'))
     if command=="health":
         from cua_owned_editor_launch import available_editors
-        return {"desktop":desktop,"input_desktop":identity["input"],"physical_input_used":False,"supported_apps":available_apps(),'supported_editor_apps':available_editors(),"uia_pid":uia_backend.supervisor.process.pid if uia_backend and uia_backend.supervisor.process else None,
+        return {"desktop":desktop,"input_desktop":identity["input"],"physical_input_used":False,
+                "boundaries":PRIVATE_DESKTOP_BOUNDARIES,
+                "supported_apps":available_apps(),'supported_editor_apps':available_editors(),"uia_pid":uia_backend.supervisor.process.pid if uia_backend and uia_backend.supervisor.process else None,
                 "ui_pid":ui_backend.supervisor.process.pid if ui_backend and ui_backend.supervisor.process else None,
                 "apps":[{"pid":p.pid,"create_time":app_tokens[p.pid],"hwnds":windows(p.pid)} for p in apps.values() if live_app(p.pid)]}
     if command=="describe_owned_windows":
@@ -179,30 +259,42 @@ def handle(args):
         # Generic owned application: no per-app list. Only this process's own top-level
         # window is returned; an app that hands off to another instance is reported as such.
         from cua_hidden_apps import generic_launch_spec
+        from cua_native_core import NativeError
         from cua_native_hwnd import Win32Transport
         executable,arguments,directory,timeout=generic_launch_spec(args)
         si=subprocess.STARTUPINFO();si.dwFlags=subprocess.STARTF_USESHOWWINDOW;si.wShowWindow=4
         p=subprocess.Popen([str(executable),*arguments],startupinfo=si,cwd=directory)
         register_app(p);deadline=time.monotonic()+timeout;transport=Win32Transport()
-        while time.monotonic()<deadline:
-            if p.poll() is not None:
-                apps.pop(p.pid,None);app_tokens.pop(p.pid,None)
-                raise HiddenLaunchError("HIDDEN_APP_EXITED_BEFORE_WINDOW",{"exit_code":p.returncode,
-                    "hint":"the program ended or handed off to another instance; it has no own window here"})
-            best=None
-            for hwnd in windows(p.pid):
-                if not U.IsWindowVisible(hwnd) or U.GetWindow(hwnd,4):continue
-                info=transport.window_info(hwnd);geometry=info.get("geometry") or {}
-                area=max(0,geometry.get("right",0)-geometry.get("left",0))*max(0,geometry.get("bottom",0)-geometry.get("top",0))
-                if area>0 and (best is None or area>best[0]):best=(area,hwnd,info)
-            if best:
-                _,hwnd,info=best
-                if not owns(hwnd):raise HiddenLaunchError("HIDDEN_APP_IDENTITY_CHANGED")
-                return {"app":executable.name,"executable":str(executable),"pid":p.pid,"create_time":app_tokens[p.pid],"hwnd":hwnd,"desktop":desktop,
-                        "class_name":info["class_name"],"title":info.get("title"),"route":"HIDDEN_DESKTOP_GENERIC","physical_input_used":False}
-            time.sleep(.05)
-        p.kill();p.wait(timeout=5);apps.pop(p.pid,None);app_tokens.pop(p.pid,None)
-        raise HiddenLaunchError("HIDDEN_APP_WINDOW_NOT_FOUND",{"hint":"no visible top-level window appeared on the private desktop"})
+        try:
+            while time.monotonic()<deadline:
+                if p.poll() is not None:
+                    apps.pop(p.pid,None);app_tokens.pop(p.pid,None)
+                    raise HiddenLaunchError("HIDDEN_APP_EXITED_BEFORE_WINDOW",{"exit_code":p.returncode,
+                        "hint":"the program ended or handed off to another instance; it has no own window here"})
+                best=None
+                for hwnd in windows(p.pid):
+                    if not U.IsWindowVisible(hwnd) or U.GetWindow(hwnd,4):continue
+                    try:
+                        info=transport.window_info(hwnd)
+                    except NativeError as exc:
+                        if exc.code=="STALE_TARGET":continue
+                        raise
+                    geometry=info.get("geometry") or {}
+                    area=max(0,geometry.get("right",0)-geometry.get("left",0))*max(0,geometry.get("bottom",0)-geometry.get("top",0))
+                    if area>0 and (best is None or area>best[0]):best=(area,hwnd,info)
+                if best:
+                    _,hwnd,info=best
+                    owned_target=verify_owned_hwnd(hwnd,expected_pid=p.pid,expected_create_time=app_tokens[p.pid])
+                    return {"app":executable.name,"executable":str(executable),"pid":owned_target["pid"],"create_time":owned_target["create_time"],"hwnd":hwnd,"desktop":desktop,
+                            "class_name":info["class_name"],"title":info.get("title"),"route":"HIDDEN_DESKTOP_GENERIC","physical_input_used":False}
+                time.sleep(.05)
+            raise HiddenLaunchError("HIDDEN_APP_WINDOW_NOT_FOUND",{"hint":"no visible top-level window appeared on the private desktop"})
+        except BaseException:
+            if p.poll() is None:p.kill()
+            try:p.wait(timeout=5)
+            except Exception:pass
+            apps.pop(p.pid,None);app_tokens.pop(p.pid,None)
+            raise
     if command=="close_app":
         pid=args.get("pid")
         if type(pid) is not int or pid not in apps:raise RuntimeError("HIDDEN_APP_NOT_OWNED")
@@ -214,6 +306,8 @@ def handle(args):
         apps.pop(pid,None);app_tokens.pop(pid,None)
         return {"pid":pid,"closed":True}
     if command in {"launch_notepad","launch_app"}:
+        from cua_native_core import NativeError
+        from cua_native_hwnd import Win32Transport
         app,executable=launch_spec(args)
         si=subprocess.STARTUPINFO();si.dwFlags=subprocess.STARTF_USESHOWWINDOW;si.wShowWindow=4
         argv=[str(executable)]+{"excel":["/x"],"word":["/n"],
@@ -247,60 +341,90 @@ def handle(args):
             p=subprocess.Popen(argv,startupinfo=si)
         word_candidate_errors=[]
         register_app(p);deadline=time.monotonic()+(25 if app in {"excel","word","powerpoint","claude"} else 5)
-        while time.monotonic()<deadline:
-            found=windows(p.pid)
-            from cua_native_hwnd import Win32Transport
-            transport=Win32Transport()
-            candidates=[]
-            for hwnd in found:
-                if not U.IsWindowVisible(hwnd) or U.GetWindow(hwnd,4):
-                    continue
-                info=transport.window_info(hwnd)
-                if app=="claude":
-                    # Native window_info intentionally omits captions. An
-                    # exact title AND class guard prevents selecting Electron's
-                    # invisible utility frames or IME windows.
-                    caption=ctypes.create_unicode_buffer(256)
-                    U.GetWindowTextW(hwnd,caption,len(caption))
-                    info["title"]=caption.value
-                area=main_window_area(app,info,bool(U.IsWindowVisible(hwnd)),bool(U.GetWindow(hwnd,4)))
-                if area is None:continue
-                if app in {'word','powerpoint'} and args.get('document_path'):
-                    # Office recovery can create several frames. Bind the
-                    # requested native document before selecting a window.
-                    if uia_backend is None:
-                        from cua_native_uia3 import Uia3PersistentBackend
-                        uia_backend=Uia3PersistentBackend(prepare_uia(Path(__file__).resolve().parent),timeout_seconds=8,no_focus=True)
-                    from cua_native_core import NativeError
-                    try:
-                        uia_backend._request('word_document' if app=='word' else 'powerpoint_document',{'hwnd':hwnd,'pid':p.pid,'document_path':str(Path(args['document_path']).resolve()),'action':'read'})
-                    except NativeError as exc:
-                        if exc.code not in {'OWN_DOCUMENT_IDENTITY_MISMATCH','OWN_WORD_NATIVE_OBJECT_NOT_UNIQUE','OWN_WORD_DOCUMENT_FAILED','OWN_POWERPOINT_NATIVE_WINDOW_NOT_UNIQUE','OWN_POWERPOINT_READ_FAILED'}:raise
-                        if len(word_candidate_errors)<12:word_candidate_errors.append({'hwnd':hwnd,'code':exc.code,'message':exc.message,'details':exc.details})
+        transport=Win32Transport()
+        try:
+            while time.monotonic()<deadline:
+                found=windows(p.pid)
+                candidates=[]
+                for hwnd in found:
+                    if not U.IsWindowVisible(hwnd) or U.GetWindow(hwnd,4):
                         continue
-                candidates.append((area,hwnd,info))
-            if candidates:
-                _,hwnd,info=max(candidates,key=lambda item:item[0])
-                if not owns(hwnd):raise HiddenLaunchError("HIDDEN_APP_IDENTITY_CHANGED")
-                return {"app":app,"pid":p.pid,"create_time":app_tokens[p.pid],"hwnd":hwnd,"desktop":desktop,"class_name":info["class_name"]}
-            time.sleep(.02)
-        if p.poll() is None:p.kill()
-        p.wait(timeout=5);apps.pop(p.pid,None);app_tokens.pop(p.pid,None)
-        if app in {'word','powerpoint'}:
-            from cua_native_core import NativeError
-            raise NativeError('HIDDEN_APP_WINDOW_NOT_FOUND',details={('owned_word_candidate_errors' if app=='word' else 'owned_powerpoint_candidate_errors'):word_candidate_errors})
-        raise RuntimeError("HIDDEN_APP_WINDOW_NOT_FOUND")
+                    try:
+                        info=transport.window_info(hwnd)
+                    except NativeError as exc:
+                        if exc.code=="STALE_TARGET":continue
+                        raise
+                    if app=="claude":
+                        # Native window_info intentionally omits captions. An
+                        # exact title AND class guard prevents selecting Electron's
+                        # invisible utility frames or IME windows.
+                        caption=ctypes.create_unicode_buffer(256)
+                        U.GetWindowTextW(hwnd,caption,len(caption))
+                        info["title"]=caption.value
+                    area=main_window_area(app,info,bool(U.IsWindowVisible(hwnd)),bool(U.GetWindow(hwnd,4)))
+                    if area is None:continue
+                    if app in {'word','powerpoint'} and args.get('document_path'):
+                        # Office recovery can create several frames. Bind the
+                        # requested native document before selecting a window.
+                        if uia_backend is None:
+                            from cua_native_uia3 import Uia3PersistentBackend
+                            uia_backend=Uia3PersistentBackend(prepare_uia(Path(__file__).resolve().parent),timeout_seconds=8,no_focus=True)
+                        try:
+                            uia_backend._request('word_document' if app=='word' else 'powerpoint_document',{'hwnd':hwnd,'pid':p.pid,'document_path':str(Path(args['document_path']).resolve()),'action':'read'})
+                        except NativeError as exc:
+                            if exc.code not in {'OWN_DOCUMENT_IDENTITY_MISMATCH','OWN_WORD_NATIVE_OBJECT_NOT_UNIQUE','OWN_WORD_DOCUMENT_FAILED','OWN_POWERPOINT_NATIVE_WINDOW_NOT_UNIQUE','OWN_POWERPOINT_READ_FAILED'}:raise
+                            if len(word_candidate_errors)<12:word_candidate_errors.append({'hwnd':hwnd,'code':exc.code,'message':exc.message,'details':exc.details})
+                            continue
+                    candidates.append((area,hwnd,info))
+                if candidates:
+                    _,hwnd,info=max(candidates,key=lambda item:item[0])
+                    owned_target=verify_owned_hwnd(hwnd,expected_pid=p.pid,expected_create_time=app_tokens[p.pid])
+                    return {"app":app,"pid":owned_target["pid"],"create_time":owned_target["create_time"],"hwnd":hwnd,"desktop":desktop,"class_name":info["class_name"]}
+                time.sleep(.02)
+            if app in {'word','powerpoint'}:
+                raise NativeError('HIDDEN_APP_WINDOW_NOT_FOUND',details={('owned_word_candidate_errors' if app=='word' else 'owned_powerpoint_candidate_errors'):word_candidate_errors})
+            raise RuntimeError("HIDDEN_APP_WINDOW_NOT_FOUND")
+        except BaseException:
+            if p.poll() is None:p.kill()
+            try:p.wait(timeout=5)
+            except Exception:pass
+            apps.pop(p.pid,None);app_tokens.pop(p.pid,None)
+            raise
     if command=="capture_window":
         from cua_hidden_capture import capture_owned_window
-        return capture_owned_window(args.get("hwnd"), owns)
+        target=verify_owned_hwnd(args.get("hwnd"),expected_pid=args.get("pid"),expected_create_time=args.get("create_time"))
+        return capture_owned_window(target["hwnd"], owns)
     if command in {"read_notepad","read_text"}:
         from cua_native_hwnd import Win32Transport
         from cua_hidden_apps import read_document_text
-        hwnd=args.get("hwnd",0)
-        if type(hwnd) is not int or not owns(hwnd):
-            raise RuntimeError("HIDDEN_WINDOW_NOT_OWNED")
+        target=verify_owned_hwnd(args.get("hwnd",0),expected_pid=args.get("pid"),expected_create_time=args.get("create_time"))
         transport=Win32Transport()
-        return read_document_text(transport, hwnd, owns)
+        return read_document_text(transport, target["hwnd"], owns)
+    if command in {"hwnd_observe","hwnd_find","hwnd_act"}:
+        from cua_native_core import NativeSemanticCore,NativeError
+        from cua_native_hwnd import HwndMessageBackend
+        target=verify_owned_hwnd(args.get("hwnd",0),expected_pid=args.get("pid"),expected_create_time=args.get("create_time"))
+        if hwnd_backend is None:
+            hwnd_backend=HwndMessageBackend()
+            hwnd_core=NativeSemanticCore(hwnd_backend)
+        if command=="hwnd_observe":
+            result=hwnd_core.observe(target,args.get("options"))
+        else:
+            generation=args.get("generation")
+            state=hwnd_core._snapshots.get(generation) if type(generation) is int else None
+            if not state or state.target!=target:
+                raise NativeError("STALE_TARGET")
+            if command=="hwnd_find":
+                result=hwnd_core.find(generation,args.get("query"))
+            else:
+                if not isinstance(args.get("postcondition"),dict):
+                    raise NativeError("HIDDEN_HWND_POSTCONDITION_REQUIRED")
+                result=hwnd_core.act(args.get("ref"),args.get("operation"),args.get("action_args"),
+                    args["postcondition"],{"background_required":True},generation=generation)
+                if not result["verified"]:
+                    raise NativeError("POSTCONDITION_FAILED",details={"retry_safe":False,"attempted":True,"result":result})
+        return {**result,"route":"HIDDEN_DESKTOP_HWND_MESSAGE","private_desktop":desktop,
+                "owner_desktop_access_allowed":False,"physical_input_used":False}
     if command in {"ui_observe","ui_find","ui_act"}:
         # Full UI Automation patterns (toggle, set_value, select, expand, scroll, invoke) for
         # owned windows. Safe here and only here: this worker proved at start that its desktop
@@ -310,17 +434,16 @@ def handle(args):
         from cua_native_core import NativeSemanticCore,NativeError
         from cua_native_uia3 import Uia3PersistentBackend
         if os.environ.get(GENERIC_LAUNCH_ENV)!="1":raise RuntimeError("HIDDEN_GENERIC_UI_DISABLED")
-        hwnd=args.get("hwnd",0)
-        if type(hwnd) is not int or not owns(hwnd):raise RuntimeError("HIDDEN_WINDOW_NOT_OWNED")
+        target=verify_owned_hwnd(args.get("hwnd",0),expected_pid=args.get("pid"),expected_create_time=args.get("create_time"))
         if ui_backend is None:
             ui_backend=Uia3PersistentBackend(prepare_uia(Path(__file__).resolve().parent),timeout_seconds=10,no_focus=False)
             ui_core=NativeSemanticCore(ui_backend)
         if command=="ui_observe":
-            result=ui_core.observe({"hwnd":hwnd},args.get("options"))
+            result=ui_core.observe(target,args.get("options"))
         else:
             generation=args.get("generation")
             state=ui_core._snapshots.get(generation) if type(generation) is int else None
-            if not state or state.target!={"hwnd":hwnd}:raise NativeError("STALE_TARGET")
+            if not state or state.target!=target:raise NativeError("STALE_TARGET")
             if command=="ui_find":
                 result=ui_core.find(generation,args.get("query"))
             else:
@@ -334,19 +457,17 @@ def handle(args):
     if command in {"uia_observe","uia_find","uia_act"}:
         from cua_native_core import NativeSemanticCore,NativeError
         from cua_native_uia3 import Uia3PersistentBackend
-        hwnd=args.get("hwnd",0)
-        if type(hwnd) is not int or not owns(hwnd):
-            raise RuntimeError("HIDDEN_WINDOW_NOT_OWNED")
+        target=verify_owned_hwnd(args.get("hwnd",0),expected_pid=args.get("pid"),expected_create_time=args.get("create_time"))
         if uia_backend is None:
             uia_backend=Uia3PersistentBackend(prepare_uia(Path(__file__).resolve().parent),timeout_seconds=8,no_focus=True)
         if uia_core is None:
             uia_core=NativeSemanticCore(uia_backend)
         if command=="uia_observe":
-            result=uia_core.observe({"hwnd":hwnd},args.get("options"))
+            result=uia_core.observe(target,args.get("options"))
         else:
             generation=args.get("generation")
             state=uia_core._snapshots.get(generation) if type(generation) is int else None
-            if not state or state.target!={"hwnd":hwnd}:
+            if not state or state.target!=target:
                 raise NativeError("STALE_TARGET")
             if command=="uia_find":
                 result=uia_core.find(generation,args.get("query"))
@@ -364,14 +485,18 @@ def handle(args):
     payload=dict(args)
     payload["policy"]={"background_required":True,"foreground_allowed":False,"physical_input_allowed":False,"require_verified":True}
     if command=="attach":
-        target=payload.get("target") or {}
-        if not owns(target.get("hwnd",0)):
-            raise RuntimeError("HIDDEN_WINDOW_NOT_OWNED")
+        raw_target=payload.get("target") or {}
+        if not isinstance(raw_target,dict):
+            raise HiddenLaunchError("HIDDEN_WINDOW_NOT_OWNED",{"retry_safe":False})
+        owned_target=verify_owned_hwnd(raw_target.get("hwnd",0),expected_pid=raw_target.get("pid"),expected_create_time=raw_target.get("create_time"))
+        payload["target"]=owned_target
         payload["surface_kind"]="native";payload["route"]="HWND_MESSAGE"
     else:
         surface=plane._surfaces.get(payload.get("surface_id"))
-        if not surface or not owns(surface.get("target",{}).get("hwnd",0)):
-            raise RuntimeError("HIDDEN_WINDOW_NOT_OWNED")
+        if not surface:
+            raise HiddenLaunchError("HIDDEN_WINDOW_NOT_OWNED",{"retry_safe":False})
+        st=surface.get("target") or {}
+        verify_owned_hwnd(st.get("hwnd",0),expected_pid=st.get("pid"),expected_create_time=st.get("create_time"))
     return plane.dispatch(payload)
 try:
     for line in sys.stdin:
@@ -384,9 +509,16 @@ try:
             reply={"id":request_id,"ok":False,"error_code":getattr(exc,"code",str(exc)),"details":{**getattr(exc,"details",{}),"message":getattr(exc,"message",str(exc))}}
         print(json.dumps(reply,ensure_ascii=True),flush=True)
 finally:
-    plane.close()
-    if uia_backend is not None:uia_backend.close()
-    if ui_backend is not None:ui_backend.close()
-    for p in apps.values():
-        if p.poll() is None:p.kill()
-        p.wait(timeout=5)
+    try:plane.close()
+    except Exception:pass
+    if uia_backend is not None:
+        try:uia_backend.close()
+        except Exception:pass
+    if ui_backend is not None:
+        try:ui_backend.close()
+        except Exception:pass
+    for p in list(apps.values()):
+        try:
+            if p.poll() is None:p.kill()
+            p.wait(timeout=5)
+        except Exception:pass
