@@ -207,11 +207,15 @@ def probe_owner_chrome_hidden_secondary(
     cdp_endpoint: str | None = None,
     user_data_dir: str | Path | None = None,
     timeout_s: float = 3.0,
+    connect_ws: bool = False,
 ) -> dict[str, Any]:
-    """Read-only probe of already-running Chrome Profile 1 hidden secondary CDP readiness."""
+    """Read-only probe of already-running Chrome hidden secondary CDP readiness."""
     mgr = (getattr(hub, "owner_chrome_hidden", None) or getattr(hub, "owner_chrome_secondary", None)) if hub else None
     if mgr is not None and hasattr(mgr, "preflight"):
-        return mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s)
+        try:
+            return mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s, connect_ws=connect_ws)
+        except TypeError:
+            return mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s)
     from cua_owner_chrome_secondary import OwnerChromeHiddenSecondaryManager
 
     probe_mgr = OwnerChromeHiddenSecondaryManager(
@@ -219,7 +223,7 @@ def probe_owner_chrome_hidden_secondary(
         cdp_endpoint=cdp_endpoint,
         user_data_dir=user_data_dir,
     )
-    return probe_mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s)
+    return probe_mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s, connect_ws=connect_ws)
 
 
 def probe_owner_chrome(
@@ -493,7 +497,12 @@ def route_plan(
         owner_hidden_state = "UNAVAILABLE"
     elif probe_owner_preflight:
         owner_hidden_probe = probe_owner_chrome_hidden_secondary(hub=hub, profile_dir_name=profile_dir_name)
-        owner_hidden_state = "READY" if owner_hidden_probe.get("ok") else "UNAVAILABLE"
+        if owner_hidden_probe.get("ok"):
+            owner_hidden_state = "READY"
+        elif owner_hidden_probe.get("approval_required"):
+            owner_hidden_state = "APPROVAL_REQUIRED"
+        else:
+            owner_hidden_state = "UNAVAILABLE"
     else:
         owner_hidden_probe = {"ok": False, "reason": "OWNER_PREFLIGHT_SKIPPED", "probe_ms": 0}
         owner_hidden_state = "UNAVAILABLE"
@@ -551,6 +560,16 @@ def route_plan(
             "hidden_target_supported": bool(owner_hidden_probe.get("hidden_target_supported")),
             "screenshot_supported": False,
             "explicit_opt_in_only": True,
+            "cdp_discovered": bool(owner_hidden_probe.get("cdp_discovered", owner_hidden_probe.get("ok"))),
+            "discovery_mode": owner_hidden_probe.get("discovery_mode"),
+            "http_discovery_status": owner_hidden_probe.get("http_discovery_status"),
+            "approval_required": bool(owner_hidden_probe.get("approval_required")),
+            "confirmation_required": bool(owner_hidden_probe.get("confirmation_required")),
+            "denied": bool(owner_hidden_probe.get("denied")),
+            "refused": bool(owner_hidden_probe.get("refused")),
+            "chrome_version": owner_hidden_probe.get("chrome_version"),
+            **({"remedy": owner_hidden_probe["remedy"]} if owner_hidden_probe.get("remedy") else {}),
+            **({"automatic": owner_hidden_probe["automatic"]} if "automatic" in owner_hidden_probe else {}),
             "error_code": owner_hidden_probe.get("error_code"),
             "reason": owner_hidden_probe.get("reason") or "verified Chrome 158+ hidden target on Profile 1",
             "probe_ms": owner_hidden_probe.get("probe_ms", 0),

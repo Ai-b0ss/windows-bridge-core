@@ -619,7 +619,14 @@ class Hub:
         owner = self._owner(session)
         if command == "preflight":
             profile_name = args.get("profile_dir_name")
-            payload = {"profile_dir_name": profile_name} if profile_name is not None else {}
+            connect_ws = bool(args.get("connect_ws", False))
+            if connect_ws:
+                self._permit(session, "owner_chrome_hidden_secondary", {"host": ""}, action="owner_chrome_hidden.preflight_connect")
+            payload: dict[str, Any] = {}
+            if profile_name is not None:
+                payload["profile_dir_name"] = profile_name
+            if connect_ws:
+                payload["connect_ws"] = True
             return self._call_owner_chrome_secondary("preflight", payload)
         if command == "status":
             st = self._call_owner_chrome_secondary("status", {})
@@ -1576,13 +1583,14 @@ class Hub:
             if request.get("session_id") and request.get("session_secret"):
                 sess = self.store.authenticate(request.get("session_id"), request.get("session_secret"))
                 scope = {"agent_id": sess["agent_id"], "task_id": sess["task_id"]}
+            default_profile = getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
             return live_route_plan(
                 scope,
                 surface=str(args.get("surface") or "browser"),
                 hub=self,
                 capability=str(args.get("capability") or "dom"),
                 prefer=args.get("prefer"),
-                profile_dir_name=str(args.get("profile_dir_name") or "Profile 1"),
+                profile_dir_name=str(args.get("profile_dir_name") or default_profile),
             )
         if op == "hub_shutdown_idle":
             with self._hidden_lock:

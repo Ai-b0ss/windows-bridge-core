@@ -27,6 +27,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import socket
 import subprocess
 import threading
 import time
@@ -37,8 +38,8 @@ import urllib.request
 import uuid
 
 from cua_browser_profiles import linked
-from cua_programmatic_discovery import owned_tcp_listeners
-from cua_universal_fastpath import _LocalWebSocket
+from cua_programmatic_discovery import _netstat_text, _parse_local_endpoint, owned_tcp_listeners
+from cua_universal_fastpath import _LocalWebSocket, _LocalWebSocketHandshakeError
 
 ROUTE_NAME = "owner_chrome_profile1_hidden_secondary"
 MIN_HIDDEN_TARGET_CHROME = (158, 0, 8127, 2)
@@ -116,21 +117,109 @@ def _default_owner_user_data_dir() -> Path | None:
     return Path(local_app) / "Google" / "Chrome" / "User Data"
 
 
+def _is_connection_refused(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, ConnectionRefusedError):
+            return True
+        if getattr(cur, "winerror", None) == 10061 or getattr(cur, "errno", None) in {111, 61, 10061}:
+            return True
+        nxt = getattr(cur, "reason", None)
+        if isinstance(nxt, BaseException):
+            cur = nxt
+            continue
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        if isinstance(cur, (TimeoutError, socket.timeout)):
+            return True
+        nxt = getattr(cur, "reason", None)
+        if isinstance(nxt, BaseException):
+            cur = nxt
+            continue
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _parse_chrome_product(browser_str: str, *, allow_chromium: bool = False) -> tuple[str, tuple[int, ...]]:
+    text = str(browser_str or "")
+    match = CHROME_VERSION_RE.match(text)
+    if not match or (match.group(1) == "Chromium" and not allow_chromium):
+        raise OwnerChromeSecondaryError(
+            "OWNER_CHROME_CDP_INVALID",
+            "CDP endpoint is not a supported Google Chrome browser",
+            browser=text,
+        )
+    ver_tuple = tuple(int(match.group(i)) for i in range(2, 6))
+    if not _version_at_least(ver_tuple, MIN_HIDDEN_TARGET_CHROME):
+        raise OwnerChromeSecondaryError(
+            "OWNER_CHROME_VERSION_UNSUPPORTED",
+            "Chrome >= 158.0.8127.2 is required for hidden secondary targets",
+            chrome_version=".".join(str(x) for x in ver_tuple),
+            required=".".join(str(x) for x in MIN_HIDDEN_TARGET_CHROME),
+        )
+    return text, ver_tuple
+
+
 def _loopback_json_version(port: int, timeout: float = 2.0) -> dict[str, Any]:
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     url = f"http://127.0.0.1:{port}/json/version"
     try:
         with opener.open(url, timeout=timeout) as resp:
             if resp.status != 200:
-                raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_INVALID", f"unexpected HTTP {resp.status}")
+                raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_INVALID", f"unexpected HTTP {resp.status}", http_status=int(resp.status))
             raw = resp.read(65537)
     except OwnerChromeSecondaryError:
         raise
+    except urllib.error.HTTPError as exc:
+        code = int(getattr(exc, "code", 0) or 0)
+        try:
+            exc.close()
+        except Exception:
+            pass
+        if code == 404:
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_CDP_HTTP_DISCOVERY_DISABLED",
+                "loopback CDP /json/version returned HTTP 404 (Chrome approval-gated WebSocket-only remote debugging)",
+                http_status=404,
+                discovery_mode="devtools_active_port_ws_only",
+            ) from None
+        if code in {401, 403}:
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_CDP_DENIED",
+                f"loopback CDP /json/version rejected with HTTP {code}",
+                http_status=code,
+                denied=True,
+                discovery_state="denied",
+            ) from None
+        raise OwnerChromeSecondaryError(
+            "OWNER_CHROME_CDP_INVALID",
+            f"unexpected HTTP {code} from /json/version",
+            http_status=code,
+        ) from None
     except (TimeoutError, ConnectionError, urllib.error.URLError, OSError) as exc:
+        if _is_connection_refused(exc):
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_CDP_CONNECTION_REFUSED",
+                "loopback CDP port refused connection (listener is not accepting connections or DevToolsActivePort is stale)",
+                cause="ConnectionRefusedError",
+                refused=True,
+                discovery_state="connection_refused",
+                port=int(port),
+            ) from None
+        cause = type(getattr(exc, "reason", exc)).__name__
         raise OwnerChromeSecondaryError(
             "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
             "browser-level loopback CDP /json/version is unreachable",
-            cause=type(exc).__name__,
+            cause=cause,
         ) from exc
     if len(raw) > 65536:
         raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_INVALID", "/json/version response too large")
@@ -178,7 +267,7 @@ def _validate_loopback_ws_url(ws_url: str, expected_port: int | None = None, exp
         raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_INVALID", "CDP WebSocket port mismatch")
     if expected_path is not None and parsed.path != expected_path:
         raise OwnerChromeSecondaryError("OWNER_CHROME_CDP_INVALID", "CDP WebSocket path mismatch")
-    host = "127.0.0.1" if parsed.hostname in {"127.0.0.1", "localhost"} else parsed.hostname
+    host = "127.0.0.1" if parsed.hostname in {"127.0.0.1", "localhost"} else f"[{parsed.hostname}]"
     return int(parsed.port), parsed.path, f"ws://{host}:{parsed.port}{parsed.path}"
 
 
@@ -288,13 +377,9 @@ def _read_local_state_active_profiles(user_data_dir: Path | None) -> tuple[str |
     return last_used, active
 
 
-def _find_listener_pid_for_port(port: int, hint_pid: int | None = None) -> int | None:
-    if hint_pid is not None:
-        listeners = [x for x in owned_tcp_listeners(hint_pid) if x.get("port") == port]
-        if listeners and all(x.get("address") in {"127.0.0.1", "::1"} for x in listeners):
-            return int(hint_pid)
-        return None
-    if os.name != "nt":
+def _query_process_chrome_version_windows(pid: int) -> str | None:
+    """Read-only product version metadata for a running chrome.exe PID on Windows."""
+    if os.name != "nt" or not isinstance(pid, int) or pid <= 0:
         return None
     try:
         proc = subprocess.run(
@@ -304,7 +389,57 @@ def _find_listener_pid_for_port(port: int, hint_pid: int | None = None) -> int |
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                f"$c = Get-NetTCPConnection -LocalAddress 127.0.0.1 -LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; if ($c) {{ $c.OwningProcess }}",
+                (
+                    f"$p = Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue; "
+                    "if ($p -and $p.ProcessName -ieq 'chrome') { "
+                    "$m = $p.MainModule; "
+                    "if ($m -and $m.FileVersionInfo.ProductVersion) { $m.FileVersionInfo.ProductVersion } }"
+                ),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if proc.returncode == 0:
+            ver = proc.stdout.strip()
+            if re.fullmatch(r"\d+\.\d+\.\d+\.\d+", ver):
+                return f"Chrome/{ver}"
+    except Exception:
+        pass
+    return None
+
+
+def _find_listener_pid_for_port(port: int, hint_pid: int | None = None) -> int | None:
+    if hint_pid is not None:
+        listeners = [x for x in owned_tcp_listeners(hint_pid) if x.get("port") == port]
+        if listeners and all(x.get("address") in {"127.0.0.1", "::1"} for x in listeners):
+            return int(hint_pid)
+        return None
+    if os.name != "nt":
+        return None
+    text = _netstat_text(timeout_s=1.5)
+    if text:
+        for raw in text.splitlines():
+            parts = raw.split()
+            if len(parts) < 5 or parts[0].upper() != "TCP" or parts[3].upper() != "LISTENING":
+                continue
+            parsed = _parse_local_endpoint(parts[1])
+            if parsed is None:
+                continue
+            host, local_port = parsed
+            if local_port == int(port) and host in {"127.0.0.1", "::1"} and parts[4].isdigit():
+                return int(parts[4])
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "powershell.exe",
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                f"$c = Get-NetTCPConnection -LocalPort {int(port)} -State Listen -ErrorAction SilentlyContinue | Where-Object {{ $_.LocalAddress -in @('127.0.0.1', '::1') }} | Select-Object -First 1; if ($c) {{ $c.OwningProcess }}",
             ],
             capture_output=True,
             text=True,
@@ -446,10 +581,14 @@ class OwnerChromeHiddenSecondaryManager:
 
     def _resolve_cdp_info(self, *, timeout_s: float = 3.0) -> dict[str, Any]:
         expected_path: str | None = None
+        ws_host = "127.0.0.1"
+        udd = self.user_data_dir or _default_owner_user_data_dir()
         if self.cdp_endpoint:
+            parsed_ep = urllib.parse.urlsplit(str(self.cdp_endpoint or ""))
+            if parsed_ep.hostname == "::1":
+                ws_host = "[::1]"
             port, expected_path = _parse_cdp_endpoint(self.cdp_endpoint)
         else:
-            udd = self.user_data_dir or _default_owner_user_data_dir()
             if udd is None or not udd.is_dir():
                 raise OwnerChromeSecondaryError(
                     "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
@@ -475,23 +614,55 @@ class OwnerChromeHiddenSecondaryManager:
                 expected_pid=self.chrome_pid,
             )
 
-        version_payload = _loopback_json_version(port, timeout=min(float(timeout_s), 3.0))
-        browser_str = str(version_payload.get("Browser") or "")
-        match = CHROME_VERSION_RE.match(browser_str)
-        if not match or (match.group(1) == "Chromium" and not self.allow_chromium):
-            raise OwnerChromeSecondaryError(
-                "OWNER_CHROME_CDP_INVALID",
-                "CDP endpoint is not a supported Google Chrome browser",
-                browser=browser_str,
+        try:
+            version_payload = _loopback_json_version(port, timeout=min(float(timeout_s), 3.0))
+        except OwnerChromeSecondaryError as exc:
+            if exc.code != "OWNER_CHROME_CDP_HTTP_DISCOVERY_DISABLED":
+                raise
+            ws_path = expected_path
+            if ws_path is None and udd is not None and udd.is_dir():
+                try:
+                    marker_port, marker_path = _read_devtools_active_port(udd)
+                    if marker_port == port:
+                        ws_path = marker_path
+                except OwnerChromeSecondaryError:
+                    ws_path = None
+            if ws_path is None:
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
+                    "loopback CDP /json/version returned HTTP 404 and no matching DevToolsActivePort browser WebSocket path is available",
+                    http_status=404,
+                    http_discovery_status=404,
+                    discovery_mode="devtools_active_port_ws_only",
+                    ws_path_unavailable=True,
+                ) from None
+            ws_port, valid_ws_path, ws_url = _validate_loopback_ws_url(
+                f"ws://{ws_host}:{port}{ws_path}",
+                expected_port=port,
+                expected_path=ws_path,
             )
-        ver_tuple = tuple(int(match.group(i)) for i in range(2, 6))
-        if not _version_at_least(ver_tuple, MIN_HIDDEN_TARGET_CHROME):
-            raise OwnerChromeSecondaryError(
-                "OWNER_CHROME_VERSION_UNSUPPORTED",
-                "Chrome >= 158.0.8127.2 is required for hidden secondary targets",
-                chrome_version=".".join(str(x) for x in ver_tuple),
-                required=".".join(str(x) for x in MIN_HIDDEN_TARGET_CHROME),
-            )
+            local_browser = _query_process_chrome_version_windows(listener_pid) if listener_pid else None
+            local_ver_str: str | None = None
+            if local_browser:
+                _, local_ver_tuple = _parse_chrome_product(local_browser, allow_chromium=self.allow_chromium)
+                local_ver_str = ".".join(str(x) for x in local_ver_tuple)
+            return {
+                "port": ws_port,
+                "ws_path": valid_ws_path,
+                "ws_url": ws_url,
+                "browser": None,
+                "local_browser": local_browser,
+                "chrome_version": local_ver_str,
+                "pid": listener_pid,
+                "discovery_mode": "devtools_active_port_ws_only",
+                "http_discovery_status": 404,
+                "approval_gated": True,
+            }
+
+        browser_str, ver_tuple = _parse_chrome_product(
+            str(version_payload.get("Browser") or ""),
+            allow_chromium=self.allow_chromium,
+        )
         ws_port, ws_path, ws_url = _validate_loopback_ws_url(
             str(version_payload.get("webSocketDebuggerUrl") or ""),
             expected_port=port,
@@ -504,6 +675,233 @@ class OwnerChromeHiddenSecondaryManager:
             "browser": browser_str,
             "chrome_version": ".".join(str(x) for x in ver_tuple),
             "pid": listener_pid,
+            "discovery_mode": "http_json_version",
+            "http_discovery_status": 200,
+            "approval_gated": False,
+        }
+
+    def _precheck_local_profile_mismatch(self, *, profile_dir_name: str, info: dict[str, Any]) -> None:
+        """Fail closed on obvious profile mismatch from OS cmdline / Local State before requesting Chrome confirmation."""
+        if self._profile_verifier is not None:
+            return
+        udd = self.user_data_dir or _default_owner_user_data_dir()
+        cmdline = _query_process_cmdline_windows(info["pid"]) if info.get("pid") else None
+        cli_profile = _extract_profile_arg_from_cmdline(cmdline or "")
+        last_used, active_profiles = _read_local_state_active_profiles(udd)
+        common = {
+            "cdp_discovered": True,
+            "discovery_mode": info.get("discovery_mode"),
+            "http_discovery_status": info.get("http_discovery_status"),
+            "chrome_version": info.get("chrome_version"),
+            "expected_profile": profile_dir_name,
+        }
+        if len(active_profiles) > 1:
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH",
+                "multiple Chrome profiles are active in Local State; "
+                f"defaultBrowserContextId can shift away from '{profile_dir_name}', refusing fail-closed",
+                last_used=last_used,
+                active_profiles=active_profiles,
+                **common,
+            )
+        if cli_profile is not None:
+            if cli_profile != profile_dir_name:
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH",
+                    f"running Chrome default context belongs to '{cli_profile}', not '{profile_dir_name}'",
+                    detected_default_profile=cli_profile,
+                    **common,
+                )
+            if (last_used is not None and last_used != profile_dir_name) or (
+                active_profiles and set(active_profiles) != {profile_dir_name}
+            ):
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH",
+                    f"Chrome Local State active/last_used profile ({last_used!r} / {active_profiles!r}) "
+                    f"disagrees with '{profile_dir_name}' despite launch flag",
+                    cli_profile=cli_profile,
+                    last_used=last_used,
+                    active_profiles=active_profiles,
+                    **common,
+                )
+            return
+        observed_profile = active_profiles[0] if len(active_profiles) == 1 else last_used
+        if observed_profile is not None and observed_profile != profile_dir_name:
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH",
+                f"Chrome active profile in Local State is '{observed_profile}', not '{profile_dir_name}'",
+                detected_default_profile=observed_profile,
+                last_used=last_used,
+                active_profiles=active_profiles,
+                **common,
+            )
+
+    def _approval_required_error(
+        self,
+        info: dict[str, Any],
+        *,
+        message: str,
+        cause: str | None = None,
+    ) -> OwnerChromeSecondaryError:
+        details: dict[str, Any] = {
+            "cdp_discovered": True,
+            "approval_required": True,
+            "confirmation_required": True,
+            "discovery_mode": info.get("discovery_mode"),
+            "http_discovery_status": info.get("http_discovery_status"),
+            "chrome_version": info.get("chrome_version"),
+            "remedy": "OWNER_CHROME_APPROVE_REMOTE_DEBUGGING_DIALOG",
+            "automatic": False,
+        }
+        if cause:
+            details["cause"] = cause
+        return OwnerChromeSecondaryError("OWNER_CHROME_CDP_APPROVAL_REQUIRED", message, **details)
+
+    def _connect_ws_classified(self, info: dict[str, Any], *, timeout_s: float) -> bool:
+        """Connect browser-level loopback CDP WebSocket and classify refused/denied/approval-required errors without leaking ws_url."""
+        if self._cdp.connected() is True and self._cdp.endpoint == info["ws_url"]:
+            return True
+        try:
+            self._cdp.connect(info["ws_url"], timeout=timeout_s)
+            return False
+        except OwnerChromeSecondaryError:
+            raise
+        except _LocalWebSocketHandshakeError as exc:
+            if exc.status_code in {401, 403, 500} or exc.closed_before_response:
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_DENIED",
+                    "Chrome remote debugging WebSocket session was denied or closed before approval",
+                    cdp_discovered=True,
+                    denied=True,
+                    discovery_state="denied",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                    chrome_version=info.get("chrome_version"),
+                    ws_http_status=exc.status_code,
+                    closed_before_response=exc.closed_before_response,
+                ) from None
+            if exc.status_code == 404:
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_INVALID",
+                    "CDP browser WebSocket endpoint returned HTTP 404 (stale or mismatched DevToolsActivePort)",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                    ws_http_status=404,
+                ) from None
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_CDP_INVALID",
+                "CDP WebSocket handshake was rejected",
+                discovery_mode=info.get("discovery_mode"),
+                http_discovery_status=info.get("http_discovery_status"),
+                ws_http_status=exc.status_code,
+            ) from None
+        except Exception as exc:
+            if _is_connection_refused(exc):
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_CONNECTION_REFUSED",
+                    "loopback CDP WebSocket port refused connection",
+                    cause="ConnectionRefusedError",
+                    refused=True,
+                    discovery_state="connection_refused",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                    port=info.get("port"),
+                ) from None
+            if _is_timeout_error(exc):
+                if info.get("approval_gated"):
+                    raise self._approval_required_error(
+                        info,
+                        message=(
+                            "Chrome remote debugging confirmation is required; approve the browser prompt in Chrome "
+                            "(not clicked automatically)"
+                        ),
+                        cause="TimeoutError",
+                    ) from None
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
+                    "loopback CDP WebSocket handshake timed out",
+                    cause="TimeoutError",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                ) from None
+            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, EOFError)):
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_DENIED",
+                    "Chrome remote debugging session was closed or denied during WebSocket handshake",
+                    cdp_discovered=True,
+                    denied=True,
+                    discovery_state="denied",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                    chrome_version=info.get("chrome_version"),
+                    cause=type(exc).__name__,
+                ) from None
+            raise OwnerChromeSecondaryError(
+                "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
+                "loopback CDP WebSocket connection failed",
+                cause=type(exc).__name__,
+                discovery_mode=info.get("discovery_mode"),
+                http_discovery_status=info.get("http_discovery_status"),
+            ) from None
+
+    def _verify_ws_browser_version(self, info: dict[str, Any], *, timeout_s: float, reused: bool) -> dict[str, Any]:
+        if info.get("browser"):
+            return info
+        try:
+            ver_res = self._cdp.send("Browser.getVersion", {}, timeout=min(float(timeout_s), 5.0))
+        except OwnerChromeSecondaryError as exc:
+            if reused and exc.code == "OWNER_CHROME_CDP_DISCONNECTED":
+                raise
+            if exc.code == "OWNER_CHROME_CDP_DISCONNECTED":
+                if exc.details.get("cause") in {"TimeoutError", "timeout"} and info.get("approval_gated"):
+                    raise self._approval_required_error(
+                        info,
+                        message=(
+                            "Chrome remote debugging confirmation is required; approve the browser prompt in Chrome "
+                            "(not clicked automatically)"
+                        ),
+                        cause="TimeoutError",
+                    ) from None
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_DENIED",
+                    "Chrome remote debugging session was closed or denied before Browser.getVersion completed",
+                    cdp_discovered=True,
+                    denied=True,
+                    discovery_state="denied",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                    chrome_version=info.get("chrome_version"),
+                    cause=exc.details.get("cause") or exc.code,
+                ) from None
+            if exc.code == "OWNER_CHROME_CDP_REJECTED":
+                msg_low = exc.message.lower()
+                if any(tok in msg_low for tok in ("denied", "forbidden", "unauthorized", "not allowed", "rejected")):
+                    raise OwnerChromeSecondaryError(
+                        "OWNER_CHROME_CDP_DENIED",
+                        "Chrome remote debugging rejected Browser.getVersion",
+                        cdp_discovered=True,
+                        denied=True,
+                        discovery_state="denied",
+                        discovery_mode=info.get("discovery_mode"),
+                        http_discovery_status=info.get("http_discovery_status"),
+                        cdp_code=exc.details.get("cdp_code"),
+                    ) from None
+                raise OwnerChromeSecondaryError(
+                    "OWNER_CHROME_CDP_INVALID",
+                    "CDP endpoint rejected Browser.getVersion",
+                    discovery_mode=info.get("discovery_mode"),
+                    http_discovery_status=info.get("http_discovery_status"),
+                    cdp_code=exc.details.get("cdp_code"),
+                ) from None
+            raise
+        product, ver_tuple = _parse_chrome_product(
+            str(ver_res.get("product") or ""),
+            allow_chromium=self.allow_chromium,
+        )
+        return {
+            **info,
+            "browser": product,
+            "chrome_version": ".".join(str(x) for x in ver_tuple),
         }
 
     def _verify_profile_default_context(
@@ -622,31 +1020,101 @@ class OwnerChromeHiddenSecondaryManager:
             "verified_by": "local_state_single_active_profile",
         }
 
-    def _ensure_connected(self, *, profile_dir_name: str, timeout_s: float = 5.0) -> dict[str, Any]:
-        info = self._resolve_cdp_info(timeout_s=timeout_s)
-        self._cdp.connect(info["ws_url"], timeout=timeout_s)
-        ctx_info = self._verify_profile_default_context(
-            profile_dir_name=profile_dir_name,
-            info=info,
-            timeout_s=timeout_s,
-        )
-        merged = {**info, **ctx_info, "profile_dir_name": profile_dir_name}
+    def _ensure_connected(
+        self,
+        *,
+        profile_dir_name: str,
+        timeout_s: float = 5.0,
+        info: dict[str, Any] | None = None,
+        allow_reconnect_on_stale: bool = True,
+    ) -> dict[str, Any]:
+        resolved = dict(info) if info is not None else self._resolve_cdp_info(timeout_s=timeout_s)
+        reused = self._connect_ws_classified(resolved, timeout_s=timeout_s)
+        try:
+            checked_info = self._verify_ws_browser_version(resolved, timeout_s=timeout_s, reused=reused)
+            ctx_info = self._verify_profile_default_context(
+                profile_dir_name=profile_dir_name,
+                info=checked_info,
+                timeout_s=timeout_s,
+            )
+        except OwnerChromeSecondaryError as exc:
+            if reused and exc.code == "OWNER_CHROME_CDP_DISCONNECTED":
+                self._cdp.reset()
+                if not allow_reconnect_on_stale and resolved.get("approval_gated"):
+                    raise self._approval_required_error(
+                        resolved,
+                        message=(
+                            "previous Chrome remote debugging session closed; owner Chrome confirmation is required "
+                            "to re-establish the connection"
+                        ),
+                    ) from None
+                self._connect_ws_classified(resolved, timeout_s=timeout_s)
+                try:
+                    checked_info = self._verify_ws_browser_version(resolved, timeout_s=timeout_s, reused=False)
+                    ctx_info = self._verify_profile_default_context(
+                        profile_dir_name=profile_dir_name,
+                        info=checked_info,
+                        timeout_s=timeout_s,
+                    )
+                except Exception:
+                    if not self._targets:
+                        self._cdp.reset()
+                    raise
+            else:
+                if not self._targets and not (reused and exc.code == "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH"):
+                    self._cdp.reset()
+                raise
+        except Exception:
+            if not self._targets:
+                self._cdp.reset()
+            raise
+        merged = {**checked_info, **ctx_info, "profile_dir_name": profile_dir_name}
         self._verified_info = merged
         return merged
 
-    def preflight(self, *, profile_dir_name: str | None = None, timeout_s: float = 3.0) -> dict[str, Any]:
-        """Read-only probe of owner Chrome Profile 1 hidden secondary target eligibility."""
+    def preflight(
+        self,
+        *,
+        profile_dir_name: str | None = None,
+        timeout_s: float = 3.0,
+        connect_ws: bool = False,
+    ) -> dict[str, Any]:
+        """Read-only probe of owner Chrome hidden secondary target eligibility (consent-respecting on HTTP 404)."""
         t0 = time.monotonic()
         target_profile = validate_profile_dir_name(profile_dir_name or self.profile_dir_name)
         try:
             with self._lock:
-                verified = self._ensure_connected(profile_dir_name=target_profile, timeout_s=timeout_s)
-                if not self._targets:
-                    # Preflight stays read-only and does not hold an idle WebSocket open.
+                info = self._resolve_cdp_info(timeout_s=timeout_s)
+                already_connected = self._cdp.connected() is True and self._cdp.endpoint == info["ws_url"]
+                if info.get("approval_gated") and not already_connected and not connect_ws:
+                    self._precheck_local_profile_mismatch(profile_dir_name=target_profile, info=info)
+                    raise self._approval_required_error(
+                        info,
+                        message=(
+                            "Chrome loopback CDP is active via DevToolsActivePort (HTTP /json/version returned 404, "
+                            "approval-gated WebSocket-only mode); owner Chrome confirmation is required when attaching"
+                        ),
+                    )
+                verified = self._ensure_connected(
+                    profile_dir_name=target_profile,
+                    timeout_s=timeout_s,
+                    info=info,
+                    allow_reconnect_on_stale=(connect_ws or not info.get("approval_gated")),
+                )
+                if not self._targets and not verified.get("approval_gated"):
+                    # Keep legacy HTTP-200 preflight stateless; preserve owner-approved WS-only sessions
+                    # so subsequent open calls reuse the single approved Chrome connection without re-prompting.
                     self._cdp.reset()
             return {
                 "ok": True,
                 "available": True,
+                "cdp_discovered": True,
+                "approval_required": False,
+                "confirmation_required": False,
+                "denied": False,
+                "refused": False,
+                "discovery_mode": verified.get("discovery_mode"),
+                "http_discovery_status": verified.get("http_discovery_status"),
                 "route": ROUTE_NAME,
                 "profile_dir_name": target_profile,
                 "chrome_version": verified["chrome_version"],
@@ -658,17 +1126,32 @@ class OwnerChromeHiddenSecondaryManager:
                 "screenshot_supported": False,
                 "auth_inheritance": True,
                 "profile_copied": False,
-                "reason": "verified Chrome 158+ browser-level loopback CDP on Profile 1 default context",
+                "reason": (
+                    "verified Chrome 158+ browser-level loopback CDP via DevToolsActivePort WebSocket (HTTP 404 mode)"
+                    if verified.get("discovery_mode") == "devtools_active_port_ws_only"
+                    else "verified Chrome 158+ browser-level loopback CDP on Profile 1 default context"
+                ),
                 "error_code": None,
                 "probe_ms": int((time.monotonic() - t0) * 1000),
             }
         except OwnerChromeSecondaryError as exc:
             with self._lock:
-                if not self._targets:
+                if not self._targets and not (self._cdp.connected() is True and exc.code == "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH"):
                     self._cdp.reset()
+            details = dict(exc.details)
             return {
                 "ok": False,
                 "available": False,
+                "cdp_discovered": bool(details.get("cdp_discovered", False)),
+                "approval_required": bool(details.get("approval_required", False)),
+                "confirmation_required": bool(details.get("confirmation_required", False)),
+                "denied": bool(details.get("denied", False)),
+                "refused": bool(details.get("refused", False)),
+                "discovery_mode": details.get("discovery_mode"),
+                "http_discovery_status": details.get("http_discovery_status"),
+                "chrome_version": details.get("chrome_version"),
+                **({"remedy": details["remedy"]} if details.get("remedy") else {}),
+                **({"automatic": details["automatic"]} if "automatic" in details else {}),
                 "route": ROUTE_NAME,
                 "profile_dir_name": target_profile,
                 "profile_context_verified": False,
@@ -679,7 +1162,7 @@ class OwnerChromeHiddenSecondaryManager:
                 "profile_copied": False,
                 "reason": exc.message,
                 "error_code": exc.code,
-                "details": exc.details,
+                "details": details,
                 "probe_ms": int((time.monotonic() - t0) * 1000),
             }
 
@@ -693,6 +1176,7 @@ class OwnerChromeHiddenSecondaryManager:
                 "active_targets": len(self._targets),
                 "owners": sorted({rec["owner"] for rec in self._targets.values()}),
                 "chrome_version": self._verified_info.get("chrome_version") if self._verified_info else None,
+                "discovery_mode": self._verified_info.get("discovery_mode") if self._verified_info else None,
                 "default_browser_context_id": self._verified_info.get("default_browser_context_id") if self._verified_info else None,
                 "visible_side_effect_free": True,
                 "screenshot_supported": False,
@@ -811,7 +1295,11 @@ class OwnerChromeHiddenSecondaryManager:
     def call(self, op: str, args: dict[str, Any] | None = None, *, timeout: float = 30.0) -> dict[str, Any]:
         args = dict(args or {})
         if op == "preflight":
-            return self.preflight(profile_dir_name=args.get("profile_dir_name"), timeout_s=min(timeout, 5.0))
+            return self.preflight(
+                profile_dir_name=args.get("profile_dir_name"),
+                timeout_s=min(timeout, 5.0),
+                connect_ws=bool(args.get("connect_ws", False)),
+            )
         if op == "status":
             return self.status()
         if op == "shutdown":

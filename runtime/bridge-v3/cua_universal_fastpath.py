@@ -20,10 +20,23 @@ from cua_programmatic_discovery import discover_programmatic_surfaces, owned_tcp
 _EDITOR_VALUE_JS = r"""const editorValue=e=>{if(!e.isContentEditable)return e.value||'';const walk=n=>{if(n.nodeType===3)return n.nodeValue||'';if(n.nodeType!==1||n.getAttribute('aria-hidden')==='true')return '';if(n.tagName==='BR')return '\n';const children=[...n.childNodes].filter(x=>x.nodeType!==1||x.getAttribute('aria-hidden')!=='true'),block=n!==e&&['P','DIV'].includes(n.tagName);if(block&&children.length===1&&children[0].tagName==='BR')return '\n';let s=children.map(walk).join('');return block?s+'\n':s;};return walk(e).replace(/\r\n/g,'\n').replace(/\n$/,'');};"""
 
 
+class _LocalWebSocketHandshakeError(RuntimeError):
+    def __init__(
+        self,
+        message: str = "WS_HANDSHAKE_FAILED",
+        *,
+        status_code: int | None = None,
+        closed_before_response: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.closed_before_response = closed_before_response
+
+
 class _LocalWebSocket:
     def __init__(self, url: str, timeout: float):
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
+        if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or not parsed.port:
             raise RuntimeError("LOCAL_WS_URL_REQUIRED")
         self._deadline = time.monotonic() + timeout
         self._buffer = bytearray()
@@ -51,8 +64,9 @@ class _LocalWebSocket:
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
+        host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
         request = (
-            f"GET {path} HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{parsed.port}\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )
@@ -68,7 +82,16 @@ class _LocalWebSocket:
         headers, separator, rest = header.partition(b"\r\n\r\n")
         text = headers.decode("latin1", "replace")
         if not separator or len(headers) >= 16384 or not text.startswith("HTTP/1.1 101 "):
-            raise RuntimeError("WS_HANDSHAKE_FAILED")
+            status_code: int | None = None
+            first_line = text.split("\r\n", 1)[0]
+            parts = first_line.split(" ", 2)
+            if len(parts) >= 2 and parts[0] in {"HTTP/1.1", "HTTP/1.0"} and len(parts[1]) == 3 and parts[1].isdigit():
+                status_code = int(parts[1])
+            raise _LocalWebSocketHandshakeError(
+                "WS_HANDSHAKE_FAILED",
+                status_code=status_code,
+                closed_before_response=(not header or not separator),
+            )
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
         fields = dict(line.split(":", 1) for line in text.split("\r\n")[1:] if ":" in line)
         if not any(name.casefold() == "sec-websocket-accept" and value.strip() == expected for name, value in fields.items()):
