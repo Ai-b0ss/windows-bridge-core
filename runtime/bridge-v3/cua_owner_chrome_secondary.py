@@ -464,12 +464,45 @@ def _find_listener_pid_for_port(port: int, hint_pid: int | None = None) -> int |
 class _BrowserCDPClient:
     """Thread-safe loopback browser-target CDP client for one already-running Chrome instance."""
 
+    KEEPALIVE_INTERVAL_S = 45.0
+    KEEPALIVE_TIMEOUT_S = 4.0
+
     def __init__(self) -> None:
         self._lock = threading.RLock()
         self.socket: _LocalWebSocket | None = None
         self.endpoint: str | None = None
         self.seq = 0
         self.generation = 0
+        self._keepalive_stop: threading.Event | None = None
+
+    def start_keepalive(self) -> None:
+        """Preserve an existing approved socket; never connect or request Chrome consent."""
+        with self._lock:
+            if self.socket is None:
+                return
+            if self._keepalive_stop is not None and not self._keepalive_stop.is_set():
+                return
+            stop = threading.Event()
+            self._keepalive_stop = stop
+            generation = self.generation
+            threading.Thread(
+                target=self._keepalive_loop,
+                args=(generation, stop),
+                name="owner-chrome-approved-cdp-keepalive",
+                daemon=True,
+            ).start()
+
+    def _keepalive_loop(self, generation: int, stop: threading.Event) -> None:
+        while not stop.wait(self.KEEPALIVE_INTERVAL_S):
+            with self._lock:
+                if stop.is_set() or self.generation != generation or self.socket is None:
+                    return
+                try:
+                    # Browser.getVersion is read-only; no new WebSocket or target is created.
+                    self.send("Browser.getVersion", timeout=self.KEEPALIVE_TIMEOUT_S)
+                except OwnerChromeSecondaryError:
+                    # send() tears down a broken socket. Never reattach automatically.
+                    return
 
     def connected(self) -> bool:
         with self._lock:
@@ -477,6 +510,9 @@ class _BrowserCDPClient:
 
     def reset(self) -> None:
         with self._lock:
+            if self._keepalive_stop is not None:
+                self._keepalive_stop.set()
+                self._keepalive_stop = None
             sock = self.socket
             self.socket = None
             self.endpoint = None
@@ -1107,6 +1143,9 @@ class OwnerChromeHiddenSecondaryManager:
             raise
         merged = {**checked_info, **ctx_info, "profile_dir_name": profile_dir_name}
         self._verified_info = merged
+        if merged.get("approval_gated"):
+            # Only after browser identity and owner profile are verified.
+            self._cdp.start_keepalive()
         return merged
 
     def preflight(

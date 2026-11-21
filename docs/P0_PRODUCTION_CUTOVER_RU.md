@@ -154,6 +154,8 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
    - В режиме `chrome://inspect/#remote-debugging` (HTTP `/json/version` возвращает `404`, обнаружение идёт через `DevToolsActivePort`) Chrome 158+ требует явного подтверждения владельцем в **нативном диалоге браузера** при подключении WebSocket.
    - Одобрение политики Hub (Рубеж 1) **не** подтверждает и не отключает диалог Chrome (Рубеж 2). Пассивные `route_plan` и `preflight` (без `connect_ws: true`) не открывают WebSocket и сообщают `OWNER_CHROME_CDP_APPROVAL_REQUIRED` (`remedy: "OWNER_CHROME_APPROVE_REMOTE_DEBUGGING_DIALOG"`, `automatic: false`). При таймауте или отказе на этапе рукопожатия (`retry_safe: true, execution_started: false`) повтор с тем же `request_key` безопасен после подтверждения диалога в Chrome.
 
+**Поддержание ранее подтверждённой CDP-сессии:** после проверки Chrome и точного профиля Manager раз в 45 секунд выполняет безопасный Browser.getVersion по уже открытому WebSocket. Это уменьшает вероятность потери соединения из-за простоя и не создаёт новые WebSocket/вкладки или запросы прав. После разрыва соединения, остановки Hub или перезапуска Chrome повторное нативное подтверждение Chrome может понадобиться; автоматического нажатия «Разрешить» и самовыдачи grant нет. Любое действие по-прежнему проходит через текущую политику Hub, включая срок действия и отзыв разрешений.
+
 ### 4.3 Строгое разделение трёх браузерных режимов (запрет молчаливого fallback)
 
 | Режим / маршрут | Назначение | Наследование auth `Profile 1` | Видимые окна / вкладки | Молчаливый fallback из `owner_chrome_profile1_hidden_secondary` |
