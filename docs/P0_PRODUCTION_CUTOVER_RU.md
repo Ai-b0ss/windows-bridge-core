@@ -125,7 +125,36 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
    - Закрытие целей выполняется через `Target.closeTarget` с подтверждением исчезновения `target_id` в `Target.getTargets`; при неподтверждённом закрытии цель удерживается в SQLite (`forget_unconfirmed: false`, `TARGET_CLEANUP_UNCONFIRMED`, `resources_retained > 0`).
    - Если Chrome не запущен, версия ниже `158.0.8127.2` или `chrome://inspect/#remote-debugging` выключен, маршрут завершается **fail-closed** (`OWNER_CHROME_NOT_RUNNING`, `OWNER_CHROME_VERSION_UNSUPPORTED`, `OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE`) **без молчаливой подмены** другим маршрутом.
 
-### 4.2 Строгое разделение трёх браузерных режимов (запрет молчаливого fallback)
+### 4.2 Два независимых рубежа согласия и site-scoped разрешения (`owner_chrome_hidden_secondary`)
+
+Для маршрута `owner_chrome_hidden` действуют **два независимых рубежа согласия** (оба сохраняются fail-closed и никогда не обходятся программно):
+
+1. **Рубеж 1 — локальная политика Hub (`consent_gate: "hub_policy"`, класс `owner_chrome_hidden_secondary`):**
+   - Проверяется в Hub **до** установления WebSocket-соединения с Chrome (`execution_started: false`). Без разрешения возвращается `PERMISSION_REQUIRED` (`NO_MATCHING_GRANT` или `HOST_NOT_GRANTED`).
+   - Поддерживает **ограничение по сайту (`--hosts`)**, срок действия (`--ttl`) и **мгновенный отзыв** (`ff_hub.py grant revoke <grant_id>`; файл `policy.json` перечитывается на каждом решении без кэша).
+   - Выдача и управление выполняются только локально владельцем (никогда через RPC/MCP):
+     ```powershell
+     # Просмотреть ожидающие запросы (с указанием consent_gate и подсказками команд)
+     python <RELEASE_DIR>\ff_hub.py --state-dir <BRIDGE_ROOT>\state\hub requests
+
+     # Выдать постоянный site-scoped grant для конкретного HTTPS-сайта (или одобрить pending-запрос для HTTPS-сайта)
+     python <RELEASE_DIR>\ff_hub.py --state-dir <BRIDGE_ROOT>\state\hub grant add --classes owner_chrome_hidden_secondary --agents <agent> --hosts <site-host> --ttl 1h
+     python <RELEASE_DIR>\ff_hub.py --state-dir <BRIDGE_ROOT>\state\hub approve <request_id> --ttl 1h
+
+     # Отклонить/закрыть ненужный pending-запрос (например, smoke about:blank с пустым target.host)
+     python <RELEASE_DIR>\ff_hub.py --state-dir <BRIDGE_ROOT>\state\hub reject <request_id>
+
+     # Мгновенно отозвать выданный grant
+     python <RELEASE_DIR>\ff_hub.py --state-dir <BRIDGE_ROOT>\state\hub grant list
+     python <RELEASE_DIR>\ff_hub.py --state-dir <BRIDGE_ROOT>\state\hub grant revoke <grant_id>
+     ```
+   - **Важно про `about:blank` и пустой `target.host`:** у URL `about:blank` нет доменного имени (`target.host == ""`), поэтому он не соответствует site-scoped grant по `--hosts <site-host>`. Команда `ff_hub.py approve <request_id>` без `--hosts` **отказывает fail-closed (`APPROVE_HOST_SCOPE_REQUIRED`)** для запросов `owner_chrome_hidden_secondary` / `browser_script` с пустым `target.host`, чтобы случайно не выдать доступ ко всем сайтам в Chrome владельца (для явного unscoped-режима требуется отдельный флаг `--all-hosts`). Параметр `--hosts` принимает только голые имена хостов (`example.com`, `*.example.com`), а не полные URL с протоколом/путём/портом.
+   - Для активного `preflight` с `connect_ws: true` при наличии site-scoped grant передавайте `url: "https://<site-host>/"` или `host: "<site-host>"`.
+2. **Рубеж 2 — нативный диалог Chrome (`consent_gate: "chrome_remote_debugging_dialog"`):**
+   - В режиме `chrome://inspect/#remote-debugging` (HTTP `/json/version` возвращает `404`, обнаружение идёт через `DevToolsActivePort`) Chrome 158+ требует явного подтверждения владельцем в **нативном диалоге браузера** при подключении WebSocket.
+   - Одобрение политики Hub (Рубеж 1) **не** подтверждает и не отключает диалог Chrome (Рубеж 2). Пассивные `route_plan` и `preflight` (без `connect_ws: true`) не открывают WebSocket и сообщают `OWNER_CHROME_CDP_APPROVAL_REQUIRED` (`remedy: "OWNER_CHROME_APPROVE_REMOTE_DEBUGGING_DIALOG"`, `automatic: false`). При таймауте или отказе на этапе рукопожатия (`retry_safe: true, execution_started: false`) повтор с тем же `request_key` безопасен после подтверждения диалога в Chrome.
+
+### 4.3 Строгое разделение трёх браузерных режимов (запрет молчаливого fallback)
 
 | Режим / маршрут | Назначение | Наследование auth `Profile 1` | Видимые окна / вкладки | Молчаливый fallback из `owner_chrome_profile1_hidden_secondary` |
 |---|---|---|---|---|

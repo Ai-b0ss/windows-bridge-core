@@ -43,10 +43,11 @@ from cua_owner_chrome_secondary import (
     OwnerChromeHiddenSecondaryManager,
     OwnerChromeSecondaryError,
     ROUTE_NAME as OWNER_CHROME_HIDDEN_ROUTE,
+    valid_url as valid_owner_chrome_url,
 )
 from ff_agent_entry import ENTRY_PATH, SCHEMA as ENTRY_SCHEMA, EntryArtifacts, EntryAuthority, entry_call
 from ff_browser_routes import RouteAffinityStore, route_plan as live_route_plan
-from ff_hub_permissions import RISK_CLASSES, PermissionError_, Policy
+from ff_hub_permissions import RISK_CLASSES, PermissionError_, Policy, _clean_host_pattern
 from ff_hub_secrets import SecretError, Vault
 from ff_hub_store import HubError, HubStore, ORPHAN_TTL_SECONDS, RESOURCE_KINDS, SESSION_TTL_SECONDS
 from ff_win_process_identity import process_creation_token, process_identity_matches
@@ -92,6 +93,94 @@ def _positive_float(value: Any, default: float) -> float:
     if type(value) in (int, float) and math.isfinite(value) and value > 0:
         return float(value)
     return float(default)
+
+
+def _owner_chrome_gate_note() -> str:
+    return (
+        "Hub local standing policy (Gate 1: owner_chrome_hidden_secondary) is separate from Chrome's native "
+        "remote debugging confirmation dialog (Gate 2: chrome://inspect/#remote-debugging). Approving a Hub "
+        "policy grant never auto-approves or bypasses Chrome's browser dialog."
+    )
+
+
+def _extract_url_host(url: Any) -> str:
+    try:
+        raw = urllib.parse.urlsplit(str(url or "")).hostname or ""
+    except ValueError:
+        return ""
+    return raw.lower().rstrip(".")
+
+
+def _permission_owner_guidance(risk_class: str, agent_id: str, request_id: str, target: dict) -> dict[str, Any]:
+    host = str((target or {}).get("host") or "").strip().lower().rstrip(".")
+    if risk_class == "owner_chrome_hidden_secondary":
+        host_missing = not bool(host)
+        if host_missing:
+            actions = {
+                "inspect_pending": "ff_hub.py requests",
+                "approve_site_scoped": f"ff_hub.py approve {request_id} --hosts <site-host> --ttl 1h",
+                "grant_site_scoped": f"ff_hub.py grant add --classes owner_chrome_hidden_secondary --agents {agent_id} --hosts <site-host> --ttl 1h",
+                "reject_pending": f"ff_hub.py reject {request_id}",
+                "revoke_grant": "ff_hub.py grant revoke <grant_id>",
+            }
+            next_step = (
+                "Hub local policy (Gate 1, separate from Chrome's native remote debugging dialog) blocked this "
+                "request before execution. target.host is empty (for example about:blank or hostless preflight), "
+                "so bare `ff_hub.py approve` refuses to create an all-sites grant. Use an actual https://<host> URL, "
+                f"or have the owner grant a site-scoped revocable grant via `{actions['grant_site_scoped']}` "
+                f"(or `{actions['approve_site_scoped']}`; revoke anytime with `{actions['revoke_grant']}`). "
+                "Chrome may still show its separate native remote debugging dialog (Gate 2) when attaching."
+            )
+        else:
+            actions = {
+                "inspect_pending": "ff_hub.py requests",
+                "approve_site_scoped": f"ff_hub.py approve {request_id} --ttl 1h",
+                "grant_site_scoped": f"ff_hub.py grant add --classes owner_chrome_hidden_secondary --agents {agent_id} --hosts {host} --ttl 1h",
+                "reject_pending": f"ff_hub.py reject {request_id}",
+                "revoke_grant": "ff_hub.py grant revoke <grant_id>",
+            }
+            next_step = (
+                f"Hub local policy (Gate 1, separate from Chrome's native remote debugging dialog) blocked access "
+                f"to host '{host}' before execution. Tell the owner once: they can grant a site-scoped, revocable "
+                f"permission via `{actions['approve_site_scoped']}` or `{actions['grant_site_scoped']}` and revoke "
+                f"it anytime with `{actions['revoke_grant']}`. After Hub Gate 1 is granted, Chrome may still show "
+                "its separate native remote debugging dialog (Gate 2) when attaching."
+            )
+        return {
+            "consent_gate": "hub_policy",
+            "separate_chrome_dialog_may_apply": True,
+            "chrome_dialog_note": _owner_chrome_gate_note(),
+            "site_scope_supported": True,
+            "target_host_missing": host_missing,
+            "revocable": True,
+            "owner_actions": actions,
+            "next_step": next_step,
+        }
+    guidance: dict[str, Any] = {
+        "consent_gate": "hub_policy",
+        "revocable": True,
+        "next_step": (
+            "tell the owner once; after `ff_hub.py approve` or `grant add` matching actions run without asking "
+            "(revoke anytime with `ff_hub.py grant revoke <grant_id>`)"
+        ),
+    }
+    if risk_class == "browser_script":
+        guidance["site_scope_supported"] = True
+        guidance["target_host_missing"] = not bool(host)
+    return guidance
+
+
+def _format_grant_cli_output(grant: dict[str, Any]) -> dict[str, Any]:
+    out = {
+        **grant,
+        "consent_gate": "hub_policy",
+        "site_scoped": bool(grant.get("hosts")),
+        "revoke_command": f"ff_hub.py grant revoke {grant['grant_id']}",
+    }
+    if "owner_chrome_hidden_secondary" in (grant.get("classes") or []):
+        out["separate_chrome_dialog_may_apply"] = True
+        out["separate_chrome_dialog_note"] = _owner_chrome_gate_note()
+    return out
 
 
 class _BaseNodeRpcClient:
@@ -462,21 +551,28 @@ class Hub:
 
     # ---- permissions ---------------------------------------------------------------------
     def _permit(self, session: dict, risk_class: str, target: dict | None = None, *, action: str = "") -> dict:
-        decision = self.policy.decide(session["agent_id"], risk_class, target)
+        target_payload = target or {}
+        decision = self.policy.decide(session["agent_id"], risk_class, target_payload)
         self.store.audit("permission", agent_id=session["agent_id"], task_id=session["task_id"],
                          session_id=session["session_id"], risk_class=risk_class, action=action,
-                         target=target or {}, decision=decision["decision"], reason=decision["reason"],
+                         target=target_payload, decision=decision["decision"], reason=decision["reason"],
                          grant_id=decision.get("grant_id"))
         if decision["decision"] == "allow":
             return decision
-        pending = self.store.record_permission_request(session, risk_class, target or {}, action)
-        raise HubError("PERMISSION_REQUIRED", "the owner has not allowed this class of action for this target",
-                       risk_class=risk_class, reason=decision["reason"], target=target or {},
+        pending = self.store.record_permission_request(session, risk_class, target_payload, action)
+        guidance = _permission_owner_guidance(risk_class, session["agent_id"], pending["request_id"], target_payload)
+        message = (
+            "Hub local standing policy has not allowed owner_chrome_hidden_secondary for this target "
+            "(Gate 1; separate from Chrome's native remote debugging dialog)"
+            if risk_class == "owner_chrome_hidden_secondary"
+            else "the owner has not allowed this class of action for this target"
+        )
+        raise HubError("PERMISSION_REQUIRED", message,
+                       risk_class=risk_class, reason=decision["reason"], target=target_payload,
                        standing_grant_possible=decision.get("standing_grant_possible", False),
                        grant_must_name=decision.get("grant_must_name"), owner_request_id=pending["request_id"],
                        already_asked=pending["repeated"], retry_safe=True, execution_started=False,
-                       retry_requires="owner_policy_change",
-                       next_step="tell the owner once; after `ff_hub.py approve` or `grant add` the whole class runs without asking")
+                       retry_requires="owner_policy_change", **guidance)
 
     # ---- owner string shared with the browser manager: stable across session resume ------
     @staticmethod
@@ -606,8 +702,38 @@ class Hub:
         except OwnerChromeSecondaryError as exc:
             raise HubError(exc.code, exc.message, **exc.details) from None
 
+    @staticmethod
+    def _validate_owner_chrome_url(url: Any) -> str:
+        try:
+            return valid_owner_chrome_url(url)
+        except OwnerChromeSecondaryError as exc:
+            raise HubError(exc.code, exc.message, execution_started=False, **exc.details) from None
+
+    @classmethod
+    def _extract_preflight_host(cls, url: Any, host: Any) -> str:
+        url_host = ""
+        if url is not None and url != "":
+            validated = cls._validate_owner_chrome_url(url)
+            url_host = _extract_url_host(validated)
+        arg_host = ""
+        if host is not None and host != "":
+            if not isinstance(host, str):
+                raise HubError("ARGS_INVALID", "host must be a string", field="host", execution_started=False)
+            try:
+                cleaned = _clean_host_pattern(host)
+            except PermissionError_ as exc:
+                raise HubError("ARGS_INVALID", "host must be a concrete bare hostname", field="host",
+                               execution_started=False, **exc.details) from None
+            if cleaned.startswith("*."):
+                raise HubError("ARGS_INVALID", "host must be a concrete bare hostname, not a wildcard",
+                               field="host", execution_started=False)
+            arg_host = cleaned
+        if url_host and arg_host and url_host != arg_host:
+            raise HubError("ARGS_INVALID", "url host and host argument disagree", field="host", execution_started=False)
+        return url_host or arg_host
+
     def _owner_chrome_hidden(self, session: dict, args: dict) -> dict:
-        """Primary owner-auth route: windowless hidden target in already-running Chrome Profile 1."""
+        """Primary owner-auth route: windowless hidden target in already-running Chrome profile."""
         command = str(args.get("command") or "")
         if args.get("foreground") is True:
             raise HubError(
@@ -621,7 +747,8 @@ class Hub:
             profile_name = args.get("profile_dir_name")
             connect_ws = bool(args.get("connect_ws", False))
             if connect_ws:
-                self._permit(session, "owner_chrome_hidden_secondary", {"host": ""}, action="owner_chrome_hidden.preflight_connect")
+                host = self._extract_preflight_host(args.get("url"), args.get("host"))
+                self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action="owner_chrome_hidden.preflight_connect")
             payload: dict[str, Any] = {}
             if profile_name is not None:
                 payload["profile_dir_name"] = profile_name
@@ -650,12 +777,13 @@ class Hub:
                 ],
             }
         if command == "open":
-            url = args.get("url")
-            host = urllib.parse.urlsplit(str(url or "")).hostname or ""
+            validated_url = self._validate_owner_chrome_url(args.get("url"))
+            host = _extract_url_host(validated_url)
             self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action="owner_chrome_hidden.open")
             open_payload = {
                 "owner": owner,
                 **{k: v for k, v in args.items() if k != "command"},
+                "url": validated_url,
             }
             tab = self._call_owner_chrome_secondary("open", open_payload)
             tab_id = tab["tab_id"]
@@ -708,10 +836,6 @@ class Hub:
             return result
         if command == "screenshot":
             return self._call_owner_chrome_secondary("screenshot", base)
-        host = urllib.parse.urlsplit(str(args.get("url") or resource["meta"].get("url") or "")).hostname or ""
-        self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action=f"owner_chrome_hidden.{command}")
-        if command == "evaluate":
-            self._permit(session, "browser_script", {"host": host}, action="owner_chrome_hidden.evaluate")
         if command not in {"navigate", "observe", "read", "act", "evaluate"}:
             raise HubError(
                 "OWNER_CHROME_HIDDEN_COMMAND_UNSUPPORTED",
@@ -719,6 +843,16 @@ class Hub:
                 commands=["preflight", "status", "open", "list", "navigate", "observe", "read", "act", "evaluate", "screenshot", "close"],
                 execution_started=False,
             )
+        if command == "navigate":
+            validated_url = self._validate_owner_chrome_url(args.get("url"))
+            host = _extract_url_host(validated_url)
+            args = {**args, "url": validated_url}
+        else:
+            # Never allow an unused args["url"] to override the owned tab's actual current host.
+            host = _extract_url_host(resource["meta"].get("url"))
+        self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action=f"owner_chrome_hidden.{command}")
+        if command == "evaluate":
+            self._permit(session, "browser_script", {"host": host}, action="owner_chrome_hidden.evaluate")
         payload = {**base, **{k: v for k, v in args.items() if k not in {"command", "tab_id", "target_id"}}}
         result = self._call_owner_chrome_secondary(command, payload)
         new_url = result.get("url_after") or result.get("url")
@@ -1393,7 +1527,11 @@ class Hub:
                     "request_key_required": True,
                     "risk_class": "owner_chrome_hidden_secondary",
                     "commands": ["preflight", "status", "open", "list", "navigate", "observe", "read", "act", "evaluate", "screenshot", "close"],
-                    "transport": "Chrome >=158 browser-level loopback CDP Target.createTarget({hidden:true}) inside already-running owner Chrome Profile 1; zero cookie copy; zero visible HWNDs/taskbar/tab-strip side effects; screenshot unsupported; fail-closed if CDP or Profile 1 defaultBrowserContextId unavailable",
+                    "consent_gates": {
+                        "hub_policy": "Gate 1: local owner standing grant for owner_chrome_hidden_secondary (supports site-scoped --hosts <host>, --ttl, and immediate `ff_hub.py grant revoke <grant_id>`); checked before any Chrome connection",
+                        "chrome_remote_debugging_dialog": "Gate 2: Chrome's native browser confirmation dialog on loopback WebSocket attach when /json/version returns HTTP 404 (kWithApprovalOnly); separate from Hub policy and never clicked automatically",
+                    },
+                    "transport": "Chrome >=158 browser-level loopback CDP Target.createTarget({hidden:true}) inside already-running owner Chrome profile (e.g. Default or Profile 1); zero cookie copy; zero visible HWNDs/taskbar/tab-strip side effects; screenshot unsupported; fail-closed if CDP or profile defaultBrowserContextId unavailable",
                 },
                 "private_browser": {"mutating": "all except info/tabs/observe/read/screenshot/download_read", "request_key_required": True,
                     "optional_isolated_mode": True, "satisfies_owner_profile_auth": False,
@@ -2067,10 +2205,14 @@ def ensure_running(state_dir: Path | None = None, *, python: str | None = None, 
 def _ttl(text: str | None) -> float | None:
     if not text:
         return None
-    unit = {"m": 60, "h": 3600, "d": 86400}.get(text[-1].lower())
+    unit = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(text[-1].lower())
     if unit is None:
-        raise SystemExit("ttl looks like 30m, 8h or 30d")
-    return float(text[:-1]) * unit
+        raise SystemExit("ttl looks like 60s, 30m, 8h or 30d")
+    try:
+        value = float(text[:-1])
+    except ValueError:
+        raise SystemExit("ttl looks like 60s, 30m, 8h or 30d") from None
+    return value * unit
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2087,6 +2229,10 @@ def main(argv: list[str] | None = None) -> int:
     approve.add_argument("request_id")
     approve.add_argument("--ttl", default="30d")
     approve.add_argument("--all-agents", action="store_true")
+    approve.add_argument("--hosts", default="", help="comma separated site hostnames to scope the grant (e.g. example.com)")
+    approve.add_argument("--all-hosts", action="store_true", help="explicitly allow all hosts when target.host is empty")
+    reject = commands.add_parser("reject", help="dismiss a pending agent permission request without granting")
+    reject.add_argument("request_id")
     grant = commands.add_parser("grant").add_subparsers(dest="grant_command", required=True)
     add = grant.add_parser("add")
     add.add_argument("--classes", required=True, help="comma separated")
@@ -2138,29 +2284,105 @@ def main(argv: list[str] | None = None) -> int:
         elif options.command == "policy":
             show(policy.describe())
         elif options.command == "requests":
-            show(HubStore(store_path).permission_requests())
+            store = HubStore(store_path)
+            try:
+                rows = store.permission_requests()
+            finally:
+                store.close()
+            enriched = []
+            for item in rows:
+                guidance = _permission_owner_guidance(
+                    item["risk_class"], item["agent_id"], item["request_id"], item.get("target") or {}
+                )
+                enriched.append({**item, **guidance})
+            show(enriched)
+        elif options.command == "reject":
+            store = HubStore(store_path)
+            try:
+                pending = next((item for item in store.permission_requests() if item["request_id"] == options.request_id), None)
+                if pending is None:
+                    show({"error": "PENDING_REQUEST_NOT_FOUND", "request_id": options.request_id, "consent_gate": "hub_policy"})
+                    return 1
+                store.resolve_permission_request(options.request_id, "rejected")
+            finally:
+                store.close()
+            show({
+                "rejected": True,
+                "request_id": options.request_id,
+                "risk_class": pending["risk_class"],
+                "agent_id": pending["agent_id"],
+                "target": pending["target"],
+                "consent_gate": "hub_policy",
+            })
         elif options.command == "approve":
             store = HubStore(store_path)
-            pending = next((item for item in store.permission_requests() if item["request_id"] == options.request_id), None)
-            if pending is None:
-                raise SystemExit("no such pending request")
-            target = pending["target"]
-            show(policy.add_grant([pending["risk_class"]], agents=None if options.all_agents else [pending["agent_id"]],
-                                  paths=[target["path"]] if target.get("path") else None,
-                                  apps=[os.path.basename(target["app"]).lower()] if target.get("app") else None,
-                                  hosts=[target["host"]] if target.get("host") else None,
-                                  secrets=[target["secret"]] if target.get("secret") else None,
-                                  ttl_seconds=_ttl(options.ttl), note=f"approved request {options.request_id}"))
-            store.resolve_permission_request(options.request_id, "approved")
+            try:
+                pending = next((item for item in store.permission_requests() if item["request_id"] == options.request_id), None)
+                if pending is None:
+                    raise SystemExit("no such pending request")
+                target = pending["target"]
+                explicit_hosts = split(options.hosts)
+                if explicit_hosts and options.all_hosts:
+                    raise PermissionError_(
+                        "GRANT_SCOPE_INVALID",
+                        scope="hosts",
+                        reason="CONFLICTING_HOST_FLAGS",
+                        hint="use either --hosts <site-host> or --all-hosts, not both",
+                    )
+                if explicit_hosts:
+                    hosts: list[str] | None = explicit_hosts
+                elif options.all_hosts:
+                    hosts = None
+                elif target.get("host"):
+                    hosts = [target["host"]]
+                elif pending["risk_class"] in {"owner_chrome_hidden_secondary", "browser_script"}:
+                    raise PermissionError_(
+                        "APPROVE_HOST_SCOPE_REQUIRED",
+                        request_id=options.request_id,
+                        risk_class=pending["risk_class"],
+                        agent_id=pending["agent_id"],
+                        target=target,
+                        consent_gate="hub_policy",
+                        reason=(
+                            "pending request has an empty target.host (for example about:blank or hostless preflight); "
+                            "refusing to silently create an unscoped all-sites grant"
+                        ),
+                        site_scoped_approve_command=f"ff_hub.py approve {options.request_id} --hosts <site-host> --ttl 1h",
+                        site_scoped_grant_command=(
+                            f"ff_hub.py grant add --classes {pending['risk_class']} "
+                            f"--agents {pending['agent_id']} --hosts <site-host> --ttl 1h"
+                        ),
+                        reject_command=f"ff_hub.py reject {options.request_id}",
+                        all_hosts_override_flag="--all-hosts",
+                        **({"separate_chrome_dialog_note": _owner_chrome_gate_note()}
+                           if pending["risk_class"] == "owner_chrome_hidden_secondary" else {}),
+                    )
+                else:
+                    hosts = None
+                grant = policy.add_grant(
+                    [pending["risk_class"]],
+                    agents=None if options.all_agents else [pending["agent_id"]],
+                    paths=[target["path"]] if target.get("path") else None,
+                    apps=[os.path.basename(target["app"]).lower()] if target.get("app") else None,
+                    hosts=hosts,
+                    secrets=[target["secret"]] if target.get("secret") else None,
+                    ttl_seconds=_ttl(options.ttl),
+                    note=f"approved request {options.request_id}",
+                )
+                store.resolve_permission_request(options.request_id, "approved")
+            finally:
+                store.close()
+            show(_format_grant_cli_output(grant))
         elif options.command == "grant":
             if options.grant_command == "add":
-                show(policy.add_grant(split(options.classes), agents=split(options.agents) or None, paths=split(options.paths) or None,
-                                      apps=split(options.apps) or None, hosts=split(options.hosts) or None,
-                                      secrets=split(options.secrets) or None, ttl_seconds=_ttl(options.ttl), note=options.note))
+                grant = policy.add_grant(split(options.classes), agents=split(options.agents) or None, paths=split(options.paths) or None,
+                                         apps=split(options.apps) or None, hosts=split(options.hosts) or None,
+                                         secrets=split(options.secrets) or None, ttl_seconds=_ttl(options.ttl), note=options.note)
+                show(_format_grant_cli_output(grant))
             elif options.grant_command == "list":
                 show(policy.describe()["grants"])
             else:
-                show({"revoked": policy.revoke(options.grant_id)})
+                show({"revoked": policy.revoke(options.grant_id), "grant_id": options.grant_id, "consent_gate": "hub_policy"})
         elif options.command == "default":
             policy.set_default(options.risk_class, options.decision)
             show(policy.describe()["classes"][options.risk_class])

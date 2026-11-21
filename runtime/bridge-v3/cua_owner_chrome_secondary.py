@@ -198,7 +198,12 @@ def _loopback_json_version(port: int, timeout: float = 2.0) -> dict[str, Any]:
                 f"loopback CDP /json/version rejected with HTTP {code}",
                 http_status=code,
                 denied=True,
+                consent_gate="chrome_remote_debugging_dialog",
+                hub_policy_separate=True,
                 discovery_state="denied",
+                execution_started=False,
+                attempted=False,
+                retry_safe=True,
             ) from None
         raise OwnerChromeSecondaryError(
             "OWNER_CHROME_CDP_INVALID",
@@ -214,6 +219,9 @@ def _loopback_json_version(port: int, timeout: float = 2.0) -> dict[str, Any]:
                 refused=True,
                 discovery_state="connection_refused",
                 port=int(port),
+                execution_started=False,
+                attempted=False,
+                retry_safe=True,
             ) from None
         cause = type(getattr(exc, "reason", exc)).__name__
         raise OwnerChromeSecondaryError(
@@ -747,11 +755,17 @@ class OwnerChromeHiddenSecondaryManager:
             "cdp_discovered": True,
             "approval_required": True,
             "confirmation_required": True,
+            "consent_gate": "chrome_remote_debugging_dialog",
+            "hub_policy_separate": True,
+            "hub_risk_class": "owner_chrome_hidden_secondary",
             "discovery_mode": info.get("discovery_mode"),
             "http_discovery_status": info.get("http_discovery_status"),
             "chrome_version": info.get("chrome_version"),
             "remedy": "OWNER_CHROME_APPROVE_REMOTE_DEBUGGING_DIALOG",
             "automatic": False,
+            "execution_started": False,
+            "attempted": False,
+            "retry_safe": True,
         }
         if cause:
             details["cause"] = cause
@@ -770,15 +784,20 @@ class OwnerChromeHiddenSecondaryManager:
             if exc.status_code in {401, 403, 500} or exc.closed_before_response:
                 raise OwnerChromeSecondaryError(
                     "OWNER_CHROME_CDP_DENIED",
-                    "Chrome remote debugging WebSocket session was denied or closed before approval",
+                    "Chrome's native remote debugging WebSocket session was denied or closed before approval (separate from Hub policy)",
                     cdp_discovered=True,
                     denied=True,
+                    consent_gate="chrome_remote_debugging_dialog",
+                    hub_policy_separate=True,
                     discovery_state="denied",
                     discovery_mode=info.get("discovery_mode"),
                     http_discovery_status=info.get("http_discovery_status"),
                     chrome_version=info.get("chrome_version"),
                     ws_http_status=exc.status_code,
                     closed_before_response=exc.closed_before_response,
+                    execution_started=False,
+                    attempted=False,
+                    retry_safe=True,
                 ) from None
             if exc.status_code == 404:
                 raise OwnerChromeSecondaryError(
@@ -806,14 +825,17 @@ class OwnerChromeHiddenSecondaryManager:
                     discovery_mode=info.get("discovery_mode"),
                     http_discovery_status=info.get("http_discovery_status"),
                     port=info.get("port"),
+                    execution_started=False,
+                    attempted=False,
+                    retry_safe=True,
                 ) from None
             if _is_timeout_error(exc):
                 if info.get("approval_gated"):
                     raise self._approval_required_error(
                         info,
                         message=(
-                            "Chrome remote debugging confirmation is required; approve the browser prompt in Chrome "
-                            "(not clicked automatically)"
+                            "Chrome's native remote debugging confirmation dialog is pending; approve the browser prompt in Chrome "
+                            "(not clicked automatically; separate from Hub local standing policy)"
                         ),
                         cause="TimeoutError",
                     ) from None
@@ -827,14 +849,19 @@ class OwnerChromeHiddenSecondaryManager:
             if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError, EOFError)):
                 raise OwnerChromeSecondaryError(
                     "OWNER_CHROME_CDP_DENIED",
-                    "Chrome remote debugging session was closed or denied during WebSocket handshake",
+                    "Chrome's native remote debugging session was closed or denied during WebSocket handshake (separate from Hub policy)",
                     cdp_discovered=True,
                     denied=True,
+                    consent_gate="chrome_remote_debugging_dialog",
+                    hub_policy_separate=True,
                     discovery_state="denied",
                     discovery_mode=info.get("discovery_mode"),
                     http_discovery_status=info.get("http_discovery_status"),
                     chrome_version=info.get("chrome_version"),
                     cause=type(exc).__name__,
+                    execution_started=False,
+                    attempted=False,
+                    retry_safe=True,
                 ) from None
             raise OwnerChromeSecondaryError(
                 "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
@@ -857,34 +884,44 @@ class OwnerChromeHiddenSecondaryManager:
                     raise self._approval_required_error(
                         info,
                         message=(
-                            "Chrome remote debugging confirmation is required; approve the browser prompt in Chrome "
-                            "(not clicked automatically)"
+                            "Chrome's native remote debugging confirmation dialog is pending; approve the browser prompt in Chrome "
+                            "(not clicked automatically; separate from Hub local standing policy)"
                         ),
                         cause="TimeoutError",
                     ) from None
                 raise OwnerChromeSecondaryError(
                     "OWNER_CHROME_CDP_DENIED",
-                    "Chrome remote debugging session was closed or denied before Browser.getVersion completed",
+                    "Chrome's native remote debugging session was closed or denied before Browser.getVersion completed (separate from Hub policy)",
                     cdp_discovered=True,
                     denied=True,
+                    consent_gate="chrome_remote_debugging_dialog",
+                    hub_policy_separate=True,
                     discovery_state="denied",
                     discovery_mode=info.get("discovery_mode"),
                     http_discovery_status=info.get("http_discovery_status"),
                     chrome_version=info.get("chrome_version"),
                     cause=exc.details.get("cause") or exc.code,
+                    execution_started=False,
+                    attempted=False,
+                    retry_safe=True,
                 ) from None
             if exc.code == "OWNER_CHROME_CDP_REJECTED":
                 msg_low = exc.message.lower()
                 if any(tok in msg_low for tok in ("denied", "forbidden", "unauthorized", "not allowed", "rejected")):
                     raise OwnerChromeSecondaryError(
                         "OWNER_CHROME_CDP_DENIED",
-                        "Chrome remote debugging rejected Browser.getVersion",
+                        "Chrome's native remote debugging rejected Browser.getVersion (separate from Hub policy)",
                         cdp_discovered=True,
                         denied=True,
+                        consent_gate="chrome_remote_debugging_dialog",
+                        hub_policy_separate=True,
                         discovery_state="denied",
                         discovery_mode=info.get("discovery_mode"),
                         http_discovery_status=info.get("http_discovery_status"),
                         cdp_code=exc.details.get("cdp_code"),
+                        execution_started=False,
+                        attempted=False,
+                        retry_safe=True,
                     ) from None
                 raise OwnerChromeSecondaryError(
                     "OWNER_CHROME_CDP_INVALID",
@@ -938,7 +975,7 @@ class OwnerChromeHiddenSecondaryManager:
             if not isinstance(verdict, dict) or not verdict.get("matched"):
                 raise OwnerChromeSecondaryError(
                     "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH",
-                    str((verdict or {}).get("reason") or "Profile 1 does not own Chrome defaultBrowserContextId"),
+                    str((verdict or {}).get("reason") or f"{profile_dir_name} does not own Chrome defaultBrowserContextId"),
                     expected_profile=profile_dir_name,
                     default_browser_context_id=default_ctx,
                     page_contexts=page_contexts,
@@ -1092,7 +1129,8 @@ class OwnerChromeHiddenSecondaryManager:
                         info,
                         message=(
                             "Chrome loopback CDP is active via DevToolsActivePort (HTTP /json/version returned 404, "
-                            "approval-gated WebSocket-only mode); owner Chrome confirmation is required when attaching"
+                            "approval-gated WebSocket-only mode); Chrome's native remote debugging confirmation dialog is "
+                            "required when attaching (separate from Hub local standing policy `owner_chrome_hidden_secondary`)"
                         ),
                     )
                 verified = self._ensure_connected(
@@ -1129,7 +1167,7 @@ class OwnerChromeHiddenSecondaryManager:
                 "reason": (
                     "verified Chrome 158+ browser-level loopback CDP via DevToolsActivePort WebSocket (HTTP 404 mode)"
                     if verified.get("discovery_mode") == "devtools_active_port_ws_only"
-                    else "verified Chrome 158+ browser-level loopback CDP on Profile 1 default context"
+                    else f"verified Chrome 158+ browser-level loopback CDP on {target_profile} default context"
                 ),
                 "error_code": None,
                 "probe_ms": int((time.monotonic() - t0) * 1000),
@@ -1150,6 +1188,8 @@ class OwnerChromeHiddenSecondaryManager:
                 "discovery_mode": details.get("discovery_mode"),
                 "http_discovery_status": details.get("http_discovery_status"),
                 "chrome_version": details.get("chrome_version"),
+                **({"consent_gate": details["consent_gate"]} if details.get("consent_gate") else {}),
+                **({"hub_policy_separate": details["hub_policy_separate"]} if "hub_policy_separate" in details else {}),
                 **({"remedy": details["remedy"]} if details.get("remedy") else {}),
                 **({"automatic": details["automatic"]} if "automatic" in details else {}),
                 "route": ROUTE_NAME,
@@ -1420,10 +1460,11 @@ class OwnerChromeHiddenSecondaryManager:
                         dl = time.monotonic() + min(timeout, 10.0)
                         while time.monotonic() < dl:
                             ready = self._eval(rec, "({rs:document.readyState, url:location.href, title:document.title})", timeout_s=3.0)
-                            if isinstance(ready, dict) and ready.get("url") and ready["url"] != "about:blank" and ready.get("rs") in {"interactive", "complete"}:
+                            if isinstance(ready, dict) and ready.get("url") and ready["url"] != "about:blank":
                                 rec["url"] = str(ready["url"])
                                 rec["title"] = str(ready.get("title") or "")
-                                break
+                                if ready.get("rs") in {"interactive", "complete"}:
+                                    break
                             time.sleep(0.05)
                     self._targets[tab_id] = rec
                     return {

@@ -10,6 +10,7 @@ decision for each single action (money, messages to other people) cannot be made
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -28,7 +29,7 @@ RISK_CLASSES: dict[str, dict[str, Any]] = {
     "browser_own_tabs":   {"default": "allow", "grantable": True,  "scope": None,
                            "about": "navigate, read and act inside the agent's own background tabs"},
     "owner_chrome_hidden_secondary": {"default": "ask", "grantable": True, "scope": None,
-                           "about": "open and drive windowless hidden targets inside the owner's already-running Chrome Profile 1 via loopback CDP (inherits owner auth; zero cookie copy, zero visible side effects)"},
+                           "about": "open and drive windowless hidden targets inside the owner's already-running Chrome profile (e.g. Default or Profile 1) via loopback CDP (inherits owner auth; zero cookie copy, zero visible side effects); supports site-scoped --hosts grants, revocable via grant revoke; Hub local policy gate only (separate from Chrome's native remote debugging confirmation dialog)"},
     "browser_script":     {"default": "ask",   "grantable": True,  "scope": None,
                            "about": "run arbitrary JavaScript in the agent's own tab"},
     "project_write":      {"default": "ask",   "grantable": True,  "scope": "paths",
@@ -84,6 +85,51 @@ def _grant_must_name(spec: dict[str, Any]) -> str | list[str] | None:
     return scopes[0] if len(scopes) == 1 else list(scopes)
 
 
+def _clean_host_pattern(value: str) -> str:
+    raw = value.strip().lower()
+    if not raw or any(ch.isspace() for ch in raw) or any(ch in raw for ch in ("/", "\\", "?", "#", "@")):
+        raise PermissionError_(
+            "GRANT_SCOPE_INVALID",
+            scope="hosts",
+            reason="HOSTNAME_REQUIRED",
+            value=value,
+            hint="pass a bare hostname such as example.com or *.example.com (no scheme, path, or port)",
+        )
+    wildcard = raw.startswith("*.")
+    body = raw[2:] if wildcard else raw
+    body = body.rstrip(".")
+    if not body or "*" in body or body.startswith(".") or ".." in body:
+        raise PermissionError_(
+            "GRANT_SCOPE_INVALID",
+            scope="hosts",
+            reason="HOSTNAME_REQUIRED",
+            value=value,
+            hint="pass a bare hostname such as example.com or *.example.com (wildcards require *.domain)",
+        )
+    if ":" in body:
+        if wildcard:
+            raise PermissionError_(
+                "GRANT_SCOPE_INVALID",
+                scope="hosts",
+                reason="HOSTNAME_REQUIRED",
+                value=value,
+                hint="pass a bare hostname such as example.com or *.example.com (no scheme, path, or port)",
+            )
+        candidate = body.strip("[]")
+        try:
+            ipaddress.ip_address(candidate)
+        except ValueError:
+            raise PermissionError_(
+                "GRANT_SCOPE_INVALID",
+                scope="hosts",
+                reason="HOSTNAME_REQUIRED",
+                value=value,
+                hint="pass a bare hostname such as example.com or *.example.com (no scheme, path, or port)",
+            ) from None
+        return candidate
+    return f"*.{body}" if wildcard else body
+
+
 def _clean_scope_list(items: list[str] | None, field: str, *, path: bool = False, app: bool = False) -> list[str]:
     if items is None:
         return []
@@ -101,7 +147,7 @@ def _clean_scope_list(items: list[str] | None, field: str, *, path: bool = False
         elif app:
             cleaned.append(_norm_app(value))
         elif field == "hosts":
-            cleaned.append(value.lower())
+            cleaned.append(_clean_host_pattern(value))
         else:
             cleaned.append(value)
     return cleaned
@@ -256,6 +302,8 @@ class Policy:
                 "classes": {name: {"default": "ask" if error else data.get("defaults", {}).get(name, spec["default"]),
                                    "standing_grant_possible": spec["grantable"],
                                    "grant_must_name": _grant_must_name(spec),
+                                   "supports_host_scope": name in {"owner_chrome_hidden_secondary", "browser_script", "browser_own_tabs", "secret_use"},
+                                   "separate_chrome_dialog_may_apply": name == "owner_chrome_hidden_secondary",
                                    "about": spec["about"]} for name, spec in RISK_CLASSES.items()},
                 "grants": [{key: grant.get(key) for key in ("grant_id", "classes", "agents", "paths", "apps", "hosts",
                                                              "secrets", "expires_at", "note")}

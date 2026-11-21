@@ -116,19 +116,30 @@ credentials нужен явный `session_resume`; старые credentials о�
 ```text
 python ff_hub.py grant add --classes project_write --agents codex --paths <project>
 python ff_hub.py grant add --classes terminal_execute --agents codex --paths <project> --apps <python executable>
+python ff_hub.py grant add --classes owner_chrome_hidden_secondary --agents <agent> --hosts <site-host> --ttl 1h
+python ff_hub.py requests
+python ff_hub.py approve <request-id> --ttl 1h
+python ff_hub.py reject <request-id>
 python ff_hub.py grant list
 python ff_hub.py grant revoke <grant-id>
 ```
 
-Для `terminal_execute` обязательны и `paths`, и `apps`. Для `browser_script`
-можно ограничить `agents` и `hosts`, для `app_launch` — `agents` и `apps`.
+Для `terminal_execute` обязательны и `paths`, и `apps`. Для `owner_chrome_hidden_secondary` и
+`browser_script` рекомендуется ограничивать `agents` и `hosts` (только голые имена хостов,
+например `example.com` или `*.example.com`, без схемы и пути); для `app_launch` — `agents` и `apps`.
+Для запросов `owner_chrome_hidden_secondary` / `browser_script` с пустым `target.host` (например,
+`about:blank`) команда `ff_hub.py approve` отказывает fail-closed (`APPROVE_HOST_SCOPE_REQUIRED`),
+если не указан `--hosts <site-host>` (либо явный `--all-hosts`).
 Все заданные ограничения действуют одновременно. `--ttl` ограничивает срок;
 без TTL grant сохраняется до отзыва. Policy читается при каждом решении и
 сохраняется после restart. `permission_check` объясняет отказ; `permission_describe`
 показывает действующие классы. Повтор с прежним ключом после отказа допустим
 только когда отказ явно произошёл до исполнения и policy уже изменена владельцем.
 
-Разрешения Hub не отвечают на диалоги сторонних продуктов. Видимый ввод идёт
+Разрешения Hub (Рубеж 1, `consent_gate: "hub_policy"`) не отвечают на диалоги сторонних продуктов:
+в частности, для `owner_chrome_hidden_secondary` на Chrome 158+ с `chrome://inspect/#remote-debugging`
+(HTTP 404 `/json/version`) сохраняется отдельный нативный диалог подтверждения Chrome (Рубеж 2,
+`consent_gate: "chrome_remote_debugging_dialog"`). Видимый ввод идёт
 через прежний Bridge с chat-permission, сроком, точным окном, OWNER_ACTIVE,
 notice и Stop. Постоянных разрешений на `external_send` и `financial` нет.
 
