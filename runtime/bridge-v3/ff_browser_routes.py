@@ -1,4 +1,4 @@
-"""Live-probed browser and application route planner with sticky task affinity."""
+"""Live-probed browser and application route planner with strict isolated-first separation."""
 from __future__ import annotations
 
 import json
@@ -19,6 +19,9 @@ import ff_hub_apps as apps
 from ff_hub_store import HubError
 
 PACKAGE = Path(__file__).resolve().parent
+
+ISOLATED_BROWSER_ROUTES = ("persistent_playwright", "private_cdp")
+OWNER_CHROME_ROUTE = "owner_chrome_extension"
 
 KNOWN_EXTENSION_IDS = {
     "mmlmfjhmonkocbjadbfplnigmagldckm": "playwright_mcp",
@@ -264,33 +267,42 @@ def _read_hkcu_native_host(name: str) -> dict[str, Any]:
     }
 
 
-def inspect_extensions_and_companion(package_dir: Path | None = None) -> dict[str, Any]:
-    """Read-only inspection of Chrome extension settings & NativeMessagingHosts (never reads cookies)."""
+def inspect_extensions_and_companion(
+    package_dir: Path | None = None,
+    *,
+    read_owner_chrome_prefs: bool = False,
+) -> dict[str, Any]:
+    """Read-only inspection of NativeMessagingHosts & companion package.
+
+    Never reads owner Chrome User Data unless read_owner_chrome_prefs=True is
+    explicitly requested; never reads cookies, tokens, or DPAPI data.
+    """
     pkg = package_dir or PACKAGE
     detected_extensions: dict[str, dict[str, Any]] = {}
-    chrome_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
-    if chrome_root.is_dir():
-        for prof in ("Default", "Profile 1", "Profile 2", "Profile 3"):
-            for fname in ("Preferences", "Secure Preferences"):
-                pref = chrome_root / prof / fname
-                if not pref.is_file():
-                    continue
-                try:
-                    settings = ((json.loads(pref.read_text(encoding="utf-8")).get("extensions") or {}).get("settings")) or {}
-                except (OSError, ValueError):
-                    continue
-                if not isinstance(settings, dict):
-                    continue
-                for ext_id, alias in KNOWN_EXTENSION_IDS.items():
-                    meta = settings.get(ext_id)
-                    if isinstance(meta, dict):
-                        manifest = meta.get("manifest") or {}
-                        detected_extensions.setdefault(alias, {})[prof] = {
-                            "id": ext_id,
-                            "version": manifest.get("version"),
-                            "state": meta.get("state"),
-                            "path": meta.get("path"),
-                        }
+    if read_owner_chrome_prefs:
+        chrome_root = Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "User Data"
+        if chrome_root.is_dir():
+            for prof in ("Default", "Profile 1", "Profile 2", "Profile 3"):
+                for fname in ("Preferences", "Secure Preferences"):
+                    pref = chrome_root / prof / fname
+                    if not pref.is_file():
+                        continue
+                    try:
+                        settings = ((json.loads(pref.read_text(encoding="utf-8")).get("extensions") or {}).get("settings")) or {}
+                    except (OSError, ValueError):
+                        continue
+                    if not isinstance(settings, dict):
+                        continue
+                    for ext_id, alias in KNOWN_EXTENSION_IDS.items():
+                        meta = settings.get(ext_id)
+                        if isinstance(meta, dict):
+                            manifest = meta.get("manifest") or {}
+                            detected_extensions.setdefault(alias, {})[prof] = {
+                                "id": ext_id,
+                                "version": manifest.get("version"),
+                                "state": meta.get("state"),
+                                "path": meta.get("path"),
+                            }
 
     ff_host = _read_hkcu_native_host("com.ff.browser_companion")
     claude_host = _read_hkcu_native_host("com.anthropic.claude_browser_extension")
@@ -309,6 +321,7 @@ def inspect_extensions_and_companion(package_dir: Path | None = None) -> dict[st
 
     return {
         "extensions_detected": detected_extensions,
+        "owner_chrome_prefs_inspected": bool(read_owner_chrome_prefs),
         "native_hosts": {
             "com.ff.browser_companion": ff_host,
             "com.anthropic.claude_browser_extension": claude_host,
@@ -328,22 +341,41 @@ def choose_route(
     capability: str = "dom",
     prefer: str | None = None,
     sticky: dict[str, Any] | None = None,
+    allow_owner_chrome: bool = False,
 ) -> str | None:
-    """Deterministically choose the best healthy background route from probed candidates."""
+    """Deterministically choose an isolated route; never silently fall back to owner Chrome.
+
+    `owner_chrome_extension` is selected ONLY when explicitly requested via
+    `capability="extension_bridge"` or `prefer="owner_chrome_extension"` (and
+    usable). If a caller explicitly sets `prefer` to a route that is unavailable,
+    this function fails closed and returns None rather than silently switching routes.
+    """
     by_name = {item["route"]: item for item in routes}
 
     def usable(name: str) -> bool:
         entry = by_name.get(name)
         return bool(entry and entry.get("state") in {"READY", "ELIGIBLE"})
 
-    if prefer and usable(prefer):
-        return prefer
+    owner_explicit = (capability == "extension_bridge") or (prefer == OWNER_CHROME_ROUTE)
+
+    if prefer:
+        if prefer == OWNER_CHROME_ROUTE:
+            return OWNER_CHROME_ROUTE if usable(OWNER_CHROME_ROUTE) else None
+        return prefer if usable(prefer) else None
+
     if sticky and sticky.get("route") and usable(sticky["route"]):
-        if capability != "extension_bridge" or sticky["route"] == "owner_chrome_extension":
-            return str(sticky["route"])
-    if capability == "extension_bridge" and usable("owner_chrome_extension"):
-        return "owner_chrome_extension"
-    for candidate in ("persistent_playwright", "private_cdp", "owner_chrome_extension", "private_uia"):
+        sticky_route = str(sticky["route"])
+        if sticky_route == OWNER_CHROME_ROUTE:
+            if owner_explicit and allow_owner_chrome:
+                return OWNER_CHROME_ROUTE
+        elif capability != "extension_bridge":
+            return sticky_route
+
+    if capability == "extension_bridge":
+        return OWNER_CHROME_ROUTE if usable(OWNER_CHROME_ROUTE) else None
+
+    # Default isolated routes only: NEVER fall back to owner_chrome_extension.
+    for candidate in ("persistent_playwright", "private_cdp", "private_uia"):
         if usable(candidate):
             return candidate
     return None
@@ -357,6 +389,7 @@ def route_plan(
     capability: str = "dom",
     prefer: str | None = None,
     probe_owner_preflight: bool = True,
+    owner_chrome_authorized: bool | None = None,
 ) -> dict[str, Any]:
     """Compute a live-probed route plan for either 'browser' or 'app' control surface."""
     t0 = time.monotonic()
@@ -368,18 +401,33 @@ def route_plan(
     private_browser = (surface == "browser") and (("private_browser" in scopes) or not is_entry_token)
     private_app = (surface == "app") and (("private_app" in scopes) or not is_entry_token)
 
-    ext_diag = inspect_extensions_and_companion()
+    owner_explicit = (capability == "extension_bridge") or (prefer == OWNER_CHROME_ROUTE)
+    owner_allowed = (not is_entry_token) and (
+        owner_chrome_authorized if owner_chrome_authorized is not None else owner_explicit
+    )
+
+    ext_diag = inspect_extensions_and_companion(read_owner_chrome_prefs=False)
     pw_probe = probe_playwright(hub=hub) if surface == "browser" else {"ok": False, "probe_ms": 0, "reason": "APP_SURFACE"}
     chrome_res = apps.resolve("chrome") if surface == "browser" else {"found": False}
 
     if is_entry_token:
         owner_probe = {"ok": False, "reason": "the scoped entry cannot attach to the owner's Chrome", "probe_ms": 0}
         owner_state = "UNAVAILABLE"
-    elif surface == "browser" and probe_owner_preflight:
+    elif surface != "browser":
+        owner_probe = {"ok": False, "reason": "APP_SURFACE", "probe_ms": 0}
+        owner_state = "UNAVAILABLE"
+    elif not owner_allowed:
+        owner_probe = {
+            "ok": False,
+            "reason": "owner Chrome requires explicit owner-authorized route selection; isolated hidden routes are default",
+            "probe_ms": 0,
+        }
+        owner_state = "UNAVAILABLE"
+    elif probe_owner_preflight:
         owner_probe = probe_owner_chrome(hub=hub)
         owner_state = "READY" if owner_probe["ok"] else "UNAVAILABLE"
     else:
-        owner_probe = {"ok": False, "reason": "APP_SURFACE", "probe_ms": 0}
+        owner_probe = {"ok": False, "reason": "OWNER_PREFLIGHT_SKIPPED", "probe_ms": 0}
         owner_state = "UNAVAILABLE"
 
     pw_usable = private_browser and bool(pw_probe.get("ok"))
@@ -404,8 +452,9 @@ def route_plan(
             "probe_ms": 0,
         },
         {
-            "route": "owner_chrome_extension",
+            "route": OWNER_CHROME_ROUTE,
             "state": owner_state,
+            "explicit_opt_in_only": True,
             "reason": owner_probe.get("reason") or "owner Chrome extension relay passed live preflight",
             "probe_ms": owner_probe.get("probe_ms", 0),
         },
@@ -443,7 +492,24 @@ def route_plan(
         affinity_store.get(str(scope.get("agent_id") or ""), str(scope.get("task_id") or ""))
         if affinity_store and scope.get("agent_id") and scope.get("task_id") else None
     )
-    selected = choose_route(routes, capability=capability, prefer=prefer, sticky=sticky)
+    selected = choose_route(
+        routes,
+        capability=capability,
+        prefer=prefer,
+        sticky=sticky,
+        allow_owner_chrome=owner_allowed,
+    )
+
+    fallback_refused_reason: str | None = None
+    if selected is None and surface == "browser":
+        if prefer and prefer != OWNER_CHROME_ROUTE:
+            fallback_refused_reason = "PREFERRED_ROUTE_UNAVAILABLE"
+        elif owner_explicit and not owner_allowed:
+            fallback_refused_reason = "OWNER_CHROME_NOT_AUTHORIZED"
+        elif owner_explicit:
+            fallback_refused_reason = "OWNER_CHROME_UNAVAILABLE"
+        elif not pw_usable and not cdp_usable:
+            fallback_refused_reason = "ISOLATED_HIDDEN_ROUTES_UNAVAILABLE_NO_OWNER_FALLBACK"
 
     return {
         "surface": surface,
@@ -453,6 +519,9 @@ def route_plan(
         "health_probed": True,
         "probe_ms": int((time.monotonic() - t0) * 1000),
         "foreground_fallback": False,
+        "owner_chrome_fallback": False,
+        "owner_chrome_explicit_only": True,
+        "fallback_refused_reason": fallback_refused_reason,
         "sticky_affinity": sticky,
         "companion": ext_diag["companion"],
         "extensions_detected": native_exts,

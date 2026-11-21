@@ -1,13 +1,66 @@
 #!/usr/bin/env node
+import {execFileSync} from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import {createRequire} from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
+
+const PROFILE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
+const WINDOWS_DEVICE_RE = /^(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])(?:\.|$)/i;
+
+const OWNER_LOCALAPPDATA_SUBPATHS = [
+  ['Google', 'Chrome', 'User Data'],
+  ['Google', 'Chrome Beta', 'User Data'],
+  ['Google', 'Chrome SxS', 'User Data'],
+  ['Google', 'Chrome Dev', 'User Data'],
+  ['Chromium', 'User Data'],
+  ['Microsoft', 'Edge', 'User Data'],
+  ['Microsoft', 'Edge Beta', 'User Data'],
+  ['Microsoft', 'Edge Dev', 'User Data'],
+  ['Microsoft', 'Edge SxS', 'User Data'],
+  ['BraveSoftware', 'Brave-Browser', 'User Data'],
+  ['Vivaldi', 'User Data'],
+  ['Opera Software'],
+  ['Mozilla', 'Firefox'],
+  ['Yandex', 'YandexBrowser', 'User Data'],
+  ['Arc', 'User Data'],
+];
+
+const OWNER_APPDATA_SUBPATHS = [
+  ['Mozilla', 'Firefox'],
+  ['Opera Software'],
+];
+
+const OWNER_POSIX_SUBPATHS = [
+  ['.config', 'google-chrome'],
+  ['.config', 'google-chrome-beta'],
+  ['.config', 'google-chrome-unstable'],
+  ['.config', 'chromium'],
+  ['.config', 'microsoft-edge'],
+  ['.config', 'BraveSoftware', 'Brave-Browser'],
+  ['.config', 'vivaldi'],
+  ['.mozilla', 'firefox'],
+];
+
+const OWNER_PROFILE_PATTERNS = [
+  /(?:^|\/)google\/chrome(?:\s+(?:beta|dev|sxs))?\/user data(?:\/|$)/i,
+  /(?:^|\/)chromium\/user data(?:\/|$)/i,
+  /(?:^|\/)microsoft\/edge(?:\s+(?:beta|dev|sxs))?\/user data(?:\/|$)/i,
+  /(?:^|\/)bravesoftware\/brave-browser\/user data(?:\/|$)/i,
+  /(?:^|\/)vivaldi\/user data(?:\/|$)/i,
+  /(?:^|\/)yandex\/yandexbrowser\/user data(?:\/|$)/i,
+  /(?:^|\/)arc\/user data(?:\/|$)/i,
+  /(?:^|\/)opera software(?:\/|$)/i,
+  /(?:^|\/)mozilla\/firefox(?:\/|$)/i,
+  /(?:^|\/)\.config\/(?:google-chrome(?:-(?:beta|unstable))?|chromium|microsoft-edge|bravesoftware\/brave-browser|vivaldi)(?:\/|$)/i,
+  /(?:^|\/)\.mozilla\/firefox(?:\/|$)/i,
+];
 
 class ManagedError extends Error {
   constructor(code, message, details = {}) {
@@ -27,6 +80,274 @@ function parseArgs(argv) {
     }
   }
   return out;
+}
+
+function stripExtendedPrefix(raw) {
+  const value = String(raw || '');
+  if (value.startsWith('\\\\?\\UNC\\')) return '\\\\' + value.slice(8);
+  if (value.startsWith('\\\\?\\')) return value.slice(4);
+  return value;
+}
+
+function normKey(p) {
+  const cleaned = path.normalize(stripExtendedPrefix(p)).replace(/[\\/]+$/, '');
+  return process.platform === 'win32' ? cleaned.toLowerCase() : cleaned;
+}
+
+function slashNorm(p) {
+  return stripExtendedPrefix(p).replace(/\\/g, '/');
+}
+
+function pathOverlaps(a, b) {
+  if (!a || !b) return true;
+  if (a === b) return true;
+  const sep = path.sep;
+  return a.startsWith(b + sep) || b.startsWith(a + sep);
+}
+
+function getOwnerBrowserRoots() {
+  const roots = new Set();
+  const homeBases = new Set();
+  for (const key of ['USERPROFILE', 'HOME']) {
+    if (process.env[key]) homeBases.add(process.env[key]);
+  }
+  try { homeBases.add(os.homedir()); } catch {}
+
+  const localBases = new Set();
+  const roamingBases = new Set();
+  if (process.env.LOCALAPPDATA) localBases.add(process.env.LOCALAPPDATA);
+  if (process.env.APPDATA) roamingBases.add(process.env.APPDATA);
+
+  for (const home of homeBases) {
+    localBases.add(path.join(home, 'AppData', 'Local'));
+    roamingBases.add(path.join(home, 'AppData', 'Roaming'));
+    for (const sub of OWNER_POSIX_SUBPATHS) {
+      roots.add(normKey(path.join(home, ...sub)));
+    }
+  }
+  for (const base of localBases) {
+    for (const sub of OWNER_LOCALAPPDATA_SUBPATHS) {
+      roots.add(normKey(path.join(base, ...sub)));
+    }
+  }
+  for (const base of roamingBases) {
+    for (const sub of OWNER_APPDATA_SUBPATHS) {
+      roots.add(normKey(path.join(base, ...sub)));
+    }
+  }
+  return [...roots];
+}
+
+function isOwnerBrowserProfilePath(rawPath) {
+  if (typeof rawPath !== 'string' || !rawPath || rawPath.includes('\0')) return true;
+  const cleaned = stripExtendedPrefix(rawPath);
+  const candidates = [cleaned, path.resolve(cleaned)];
+  try { candidates.push(fs.realpathSync(cleaned)); } catch {}
+  const ownerRoots = getOwnerBrowserRoots();
+  for (const item of candidates) {
+    const slash = slashNorm(item);
+    if (OWNER_PROFILE_PATTERNS.some(re => re.test(slash))) return true;
+    const key = normKey(item);
+    for (const root of ownerRoots) {
+      if (pathOverlaps(key, root)) return true;
+    }
+  }
+  return false;
+}
+
+function assertNoLinksOnPath(targetPath) {
+  const resolved = path.resolve(stripExtendedPrefix(targetPath));
+  const root = path.parse(resolved).root;
+  const rel = resolved.slice(root.length);
+  const parts = rel.split(/[\\/]+/).filter(Boolean);
+  let cur = root;
+  let deepestExisting = null;
+  for (const part of parts) {
+    cur = path.join(cur, part);
+    let stat;
+    try { stat = fs.lstatSync(cur); } catch { continue; }
+    if (stat.isSymbolicLink()) {
+      let real = null;
+      try { real = fs.realpathSync(cur); } catch {}
+      if (real && isOwnerBrowserProfilePath(real)) {
+        throw new ManagedError('OWNER_BROWSER_PROFILE_FORBIDDEN', 'symlink/junction resolves into owner browser profile', {path: targetPath});
+      }
+      throw new ManagedError('PROFILE_LINK_FORBIDDEN', 'symlinks and junctions are forbidden in isolated browser profiles', {path: cur});
+    }
+    deepestExisting = cur;
+  }
+  if (deepestExisting) {
+    let real;
+    try { real = fs.realpathSync(deepestExisting); } catch { real = deepestExisting; }
+    if (normKey(real) !== normKey(deepestExisting)) {
+      if (isOwnerBrowserProfilePath(real)) {
+        throw new ManagedError('OWNER_BROWSER_PROFILE_FORBIDDEN', 'resolved path overlaps owner browser profile', {path: targetPath});
+      }
+      throw new ManagedError('PROFILE_LINK_FORBIDDEN', 'reparse point or link detected in isolated profile path', {path: deepestExisting});
+    }
+  }
+  return resolved;
+}
+
+function isStrictlyInside(child, parent) {
+  const childKey = normKey(child);
+  const parentKey = normKey(parent);
+  if (!childKey || !parentKey || childKey === parentKey) return false;
+  return childKey.startsWith(parentKey + path.sep);
+}
+
+function validateProfileId(raw) {
+  if (typeof raw !== 'string' || !PROFILE_ID_RE.test(raw) || raw.includes('..') || WINDOWS_DEVICE_RE.test(raw)) {
+    throw new ManagedError('PROFILE_ID_INVALID', 'profile_id must be 1..64 ASCII [A-Za-z0-9_-] without traversal or reserved device names', {profile_id: raw});
+  }
+  return raw;
+}
+
+function validateIsolatedRoot(rawRoot) {
+  if (typeof rawRoot !== 'string' || !rawRoot || rawRoot.includes('\0')) {
+    throw new ManagedError('PROFILE_ROOT_INVALID', 'isolated profile root is invalid');
+  }
+  const cleaned = stripExtendedPrefix(rawRoot);
+  if (cleaned.split(/[\\/]+/).includes('..')) {
+    throw new ManagedError('PROFILE_PATH_TRAVERSAL', 'isolated profile root must not contain traversal segments');
+  }
+  if (isOwnerBrowserProfilePath(cleaned)) {
+    throw new ManagedError('OWNER_BROWSER_PROFILE_FORBIDDEN', 'isolated profile root must never overlap an owner browser profile', {path: rawRoot});
+  }
+  return assertNoLinksOnPath(cleaned);
+}
+
+function resolveProfileSpec(args, persistentProfilesRoot, ephemeralProfilesRoot, id) {
+  if (args.headless === false || args.foreground === true) {
+    throw new ManagedError('FOREGROUND_ROUTE_REQUIRED', 'managed Playwright runs headless only and never falls back to foreground');
+  }
+  const rawId = args.profile_id !== undefined ? args.profile_id : args.profile_name;
+  const rawDir = args.profile_dir;
+  const wantPersistent = args.persistent_profile;
+
+  if (wantPersistent !== undefined && typeof wantPersistent !== 'boolean') {
+    throw new ManagedError('PROFILE_OPTION_INVALID', 'persistent_profile must be a boolean');
+  }
+  if (wantPersistent === false && (rawId !== undefined || rawDir !== undefined)) {
+    throw new ManagedError('PROFILE_OPTION_CONFLICT', 'cannot combine persistent_profile=false with profile_id or profile_dir');
+  }
+  if (wantPersistent === true && rawId === undefined && rawDir === undefined) {
+    throw new ManagedError('PROFILE_ID_REQUIRED', 'persistent_profile=true requires an explicit profile_id or isolated profile_dir');
+  }
+  if (rawId === undefined && rawDir === undefined) {
+    return {
+      persistent: false,
+      profileId: null,
+      profileDir: path.join(ephemeralProfilesRoot, id),
+    };
+  }
+
+  const validatedId = rawId !== undefined ? validateProfileId(rawId) : null;
+  if (rawDir !== undefined) {
+    if (typeof rawDir !== 'string' || !rawDir || rawDir.includes('\0')) {
+      throw new ManagedError('PROFILE_PATH_INVALID', 'profile_dir must be a non-empty absolute path');
+    }
+    const cleaned = stripExtendedPrefix(rawDir);
+    if (cleaned.split(/[\\/]+/).includes('..')) {
+      throw new ManagedError('PROFILE_PATH_TRAVERSAL', 'profile_dir must not contain path traversal segments', {profile_dir: rawDir});
+    }
+    if (isOwnerBrowserProfilePath(cleaned)) {
+      throw new ManagedError('OWNER_BROWSER_PROFILE_FORBIDDEN', 'owner browser profile directories are strictly forbidden', {profile_dir: rawDir});
+    }
+    if (!path.isAbsolute(cleaned)) {
+      throw new ManagedError('PROFILE_PATH_NOT_ABSOLUTE', 'profile_dir must be an absolute path', {profile_dir: rawDir});
+    }
+    const resolved = assertNoLinksOnPath(cleaned);
+    if (isOwnerBrowserProfilePath(resolved)) {
+      throw new ManagedError('OWNER_BROWSER_PROFILE_FORBIDDEN', 'owner browser profile directories are strictly forbidden', {profile_dir: rawDir});
+    }
+    if (!isStrictlyInside(resolved, persistentProfilesRoot)) {
+      throw new ManagedError('PROFILE_OUTSIDE_ISOLATED_ROOT', 'profile_dir must stay strictly inside the isolated persistent profiles root', {
+        profile_dir: resolved,
+        isolated_root: persistentProfilesRoot,
+      });
+    }
+    const base = path.basename(resolved);
+    if (!base || WINDOWS_DEVICE_RE.test(base) || base.endsWith('.') || base.endsWith(' ')) {
+      throw new ManagedError('PROFILE_ID_INVALID', 'invalid profile directory name', {profile_dir: rawDir});
+    }
+    if (validatedId !== null) {
+      const expected = path.resolve(persistentProfilesRoot, validatedId);
+      if (normKey(resolved) !== normKey(expected)) {
+        throw new ManagedError('PROFILE_OPTION_CONFLICT', 'profile_dir does not match profile_id');
+      }
+      return {persistent: true, profileId: validatedId, profileDir: expected};
+    }
+    return {persistent: true, profileId: base, profileDir: resolved};
+  }
+
+  const candidate = assertNoLinksOnPath(path.resolve(persistentProfilesRoot, validatedId));
+  if (isOwnerBrowserProfilePath(candidate)) {
+    throw new ManagedError('OWNER_BROWSER_PROFILE_FORBIDDEN', 'owner browser profile directories are strictly forbidden');
+  }
+  if (!isStrictlyInside(candidate, persistentProfilesRoot)) {
+    throw new ManagedError('PROFILE_OUTSIDE_ISOLATED_ROOT', 'resolved profile escaped isolated root');
+  }
+  return {persistent: true, profileId: validatedId, profileDir: candidate};
+}
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
+function forceKillProcessTree(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return;
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill.exe', ['/PID', String(pid), '/T', '/F'], {
+        stdio: 'ignore',
+        timeout: 5000,
+        windowsHide: true,
+      });
+      return;
+    } catch {}
+  }
+  try { process.kill(pid, 'SIGKILL'); } catch {}
+}
+
+async function waitPidExit(pid, timeoutMs = 5000) {
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!pidAlive(pid)) return true;
+    await new Promise(r => setTimeout(r, 50));
+  }
+  return !pidAlive(pid);
+}
+
+async function inspectBrowserPids(context) {
+  try {
+    const browser = typeof context.browser === 'function' ? context.browser() : null;
+    if (!browser || typeof browser.newBrowserCDPSession !== 'function') {
+      return {browserPid: null, allPids: []};
+    }
+    const cdp = await browser.newBrowserCDPSession();
+    try {
+      const info = await cdp.send('SystemInfo.getProcessInfo');
+      const list = Array.isArray(info?.processInfo) ? info.processInfo : [];
+      const browserEntry = list.find(item => item?.type === 'browser' && Number.isInteger(item?.id));
+      const allPids = [...new Set(list.map(item => item?.id).filter(id => Number.isInteger(id) && id > 0))];
+      return {
+        browserPid: browserEntry ? browserEntry.id : (allPids[0] || null),
+        allPids,
+      };
+    } finally {
+      await cdp.detach().catch(() => {});
+    }
+  } catch {
+    return {browserPid: null, allPids: []};
+  }
 }
 
 function loadPlaywright(playwrightRoot) {
@@ -111,25 +432,92 @@ async function main() {
 
   const key = process.env.FF_MANAGED_PW_KEY;
   if (!key || key.length < 24) throw new Error('FF_MANAGED_PW_KEY missing');
-  const stateDir = path.resolve(opts['state-dir'] || path.join(process.cwd(), 'managed-playwright'));
+  const stateDir = validateIsolatedRoot(path.resolve(opts['state-dir'] || path.join(process.cwd(), 'managed-playwright')));
   const endpointFile = path.resolve(opts['endpoint-file'] || path.join(stateDir, 'endpoint.json'));
   const profilesRoot = path.join(stateDir, 'profiles');
+  const persistentProfilesRoot = validateIsolatedRoot(
+    path.resolve(opts['persistent-profiles-root'] || process.env.FF_MANAGED_PW_PERSISTENT_ROOT || path.join(stateDir, 'persistent-profiles'))
+  );
+  const downloadsRoot = path.join(stateDir, 'downloads');
+  const locksRoot = path.join(stateDir, 'profile-locks');
   const ledgerFile = path.join(stateDir, 'ledger.json');
   fs.mkdirSync(profilesRoot, {recursive: true});
+  fs.mkdirSync(persistentProfilesRoot, {recursive: true});
+  fs.mkdirSync(downloadsRoot, {recursive: true});
+  fs.mkdirSync(locksRoot, {recursive: true});
 
   const {pw, version: pwVersion} = loadPlaywright(playwrightRoot);
   const contexts = new Map();
   const stickyByOwner = new Map();
+  const activeProfileDirs = new Map();
   let stopping = false;
+
+  const profileLockPath = dir => {
+    const digest = crypto.createHash('sha256').update(normKey(dir)).digest('hex').slice(0, 32);
+    return path.join(locksRoot, `${digest}.lock.json`);
+  };
+
+  const acquireProfileLease = (dir, browserId, owner) => {
+    const keyNorm = normKey(dir);
+    if (activeProfileDirs.has(keyNorm)) {
+      throw new ManagedError('PERSISTENT_PROFILE_IN_USE', 'persistent profile is already open in another session', {
+        profile_dir: dir,
+      });
+    }
+    const lockFile = profileLockPath(dir);
+    if (fs.existsSync(lockFile)) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+        if (existing?.pid && existing.pid !== process.pid && pidAlive(existing.pid)) {
+          throw new ManagedError('PERSISTENT_PROFILE_IN_USE', 'persistent profile is locked by another live process', {
+            profile_dir: dir,
+            owner_pid: existing.pid,
+          });
+        }
+      } catch (err) {
+        if (err instanceof ManagedError) throw err;
+      }
+      try { fs.unlinkSync(lockFile); } catch {}
+    }
+    fs.writeFileSync(lockFile, JSON.stringify({
+      pid: process.pid,
+      browser_id: browserId,
+      owner,
+      profile_dir: dir,
+      acquired_at: Date.now(),
+    }), 'utf8');
+    activeProfileDirs.set(keyNorm, browserId);
+    return lockFile;
+  };
+
+  const releaseProfileLease = (dir, browserId) => {
+    const keyNorm = normKey(dir);
+    if (activeProfileDirs.get(keyNorm) === browserId) {
+      activeProfileDirs.delete(keyNorm);
+    }
+    const lockFile = profileLockPath(dir);
+    try {
+      if (fs.existsSync(lockFile)) {
+        const cur = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+        if (cur?.pid === process.pid && cur?.browser_id === browserId) {
+          fs.unlinkSync(lockFile);
+        }
+      }
+    } catch {}
+  };
 
   const persistLedger = () => {
     const data = {
       pid: process.pid,
       updated_at: Date.now(),
+      persistent_profiles_root: persistentProfilesRoot,
       browsers: [...contexts.values()].map(ctx => ({
         browser_id: ctx.id,
         owner: ctx.owner,
         profile_dir: ctx.profileDir,
+        persistent_profile: ctx.persistent,
+        profile_id: ctx.profileId,
+        child_pid: ctx.browserPid,
         tabs: [...ctx.tabs.values()].map(t => ({
           tab_id: t.id,
           target_id: t.targetId || null,
@@ -143,10 +531,16 @@ async function main() {
     fs.renameSync(tmp, ledgerFile);
   };
 
-  // Clean up stale abandoned profile directories from any prior crashed instance.
+  // Clean up stale abandoned ephemeral profile/download dirs from any prior crashed instance.
+  // Never deletes persistent profiles under persistentProfilesRoot.
   for (const entry of fs.readdirSync(profilesRoot, {withFileTypes: true})) {
     if (entry.isDirectory() && entry.name.startsWith('pw-')) {
       fs.rmSync(path.join(profilesRoot, entry.name), {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
+    }
+  }
+  for (const entry of fs.readdirSync(downloadsRoot, {withFileTypes: true})) {
+    if (entry.isDirectory() && entry.name.startsWith('pw-')) {
+      fs.rmSync(path.join(downloadsRoot, entry.name), {recursive: true, force: true, maxRetries: 5, retryDelay: 50});
     }
   }
 
@@ -185,12 +579,12 @@ async function main() {
     ctx.tabs.set(id, tab);
     page.on('close', () => {
       ctx.tabs.delete(id);
-      persistLedger();
+      if (contexts.has(ctx.id)) persistLedger();
     });
     page.on('framenavigated', frame => {
       if (frame === page.mainFrame()) {
         tab.url = frame.url();
-        persistLedger();
+        if (contexts.has(ctx.id)) persistLedger();
       }
     });
     return tab;
@@ -286,15 +680,67 @@ async function main() {
   const closeContextRecord = async ctx => {
     contexts.delete(ctx.id);
     if (stickyByOwner.get(ctx.owner) === ctx.id) stickyByOwner.delete(ctx.owner);
-    try { await ctx.context.close(); } catch {}
-    const cleaned = removeDirVerified(ctx.profileDir);
+
+    const pidInfo = await inspectBrowserPids(ctx.context).catch(() => ({browserPid: ctx.browserPid, allPids: ctx.knownPids || []}));
+    const trackedPid = pidInfo.browserPid || ctx.browserPid || null;
+    const trackedAll = [...new Set([...(ctx.knownPids || []), ...(pidInfo.allPids || []), ...(trackedPid ? [trackedPid] : [])])];
+
+    // Graceful context close flushes cookies/localStorage to SQLite cleanly for persistent profiles.
+    const livePages = (() => {
+      try { return ctx.context.pages(); } catch { return []; }
+    })();
+    await Promise.race([
+      ctx.context.close().catch(() => {}),
+      new Promise(resolve => setTimeout(resolve, 10000)),
+    ]);
+
+    let childExited = true;
+    if (trackedPid) {
+      childExited = await waitPidExit(trackedPid, 5000);
+      if (!childExited) {
+        forceKillProcessTree(trackedPid);
+        childExited = await waitPidExit(trackedPid, 4000);
+      }
+    }
+    const leakedPids = [];
+    for (const p of trackedAll) {
+      if (pidAlive(p)) {
+        forceKillProcessTree(p);
+        const gone = await waitPidExit(p, 2000);
+        if (!gone) leakedPids.push(p);
+      }
+    }
+    if (leakedPids.length > 0) childExited = false;
+    const pagesClosedVerified = livePages.every(p => p.isClosed()) && ctx.tabs.size === 0;
+    ctx.tabs.clear();
+
+    const downloadsCleaned = removeDirVerified(ctx.downloadsDir);
+    let profileCleanupVerified;
+    let profilePreserved = false;
+    if (ctx.persistent) {
+      releaseProfileLease(ctx.profileDir, ctx.id);
+      profilePreserved = fs.existsSync(ctx.profileDir);
+      profileCleanupVerified = childExited && downloadsCleaned && pagesClosedVerified && profilePreserved;
+    } else {
+      const removed = removeDirVerified(ctx.profileDir);
+      profileCleanupVerified = childExited && removed && downloadsCleaned && pagesClosedVerified;
+    }
+
     persistLedger();
     return {
       closed: true,
       browser_id: ctx.id,
       route: 'persistent_playwright',
-      profile_cleanup_verified: cleaned,
-      downloads_cleaned: cleaned,
+      persistent_profile: ctx.persistent,
+      profile_id: ctx.profileId,
+      profile_dir: ctx.profileDir,
+      profile_preserved: profilePreserved,
+      profile_cleanup_verified: profileCleanupVerified,
+      downloads_cleaned: downloadsCleaned,
+      pages_closed_verified: pagesClosedVerified,
+      child_pid: trackedPid,
+      child_exited: childExited,
+      leaked_pids: leakedPids,
     };
   };
 
@@ -311,6 +757,15 @@ async function main() {
         playwright_version: pwVersion,
         contexts: contexts.size,
         sticky_owners: stickyByOwner.size,
+        persistent_profiles_root: persistentProfilesRoot,
+        active_browsers: [...contexts.values()].map(ctx => ({
+          browser_id: ctx.id,
+          owner: ctx.owner,
+          persistent_profile: ctx.persistent,
+          profile_id: ctx.profileId,
+          child_pid: ctx.browserPid,
+          tab_count: ctx.tabs.size,
+        })),
       };
     }
     const owner = String(args.owner || '');
@@ -318,28 +773,40 @@ async function main() {
 
     if (op === 'open') {
       const targetUrl = args.url ? checkUrl(args.url) : null;
+      const id = 'pw-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      const spec = resolveProfileSpec(args, persistentProfilesRoot, profilesRoot, id);
+
       const existingId = stickyByOwner.get(owner);
       if (args.sticky !== false && existingId && contexts.has(existingId)) {
         const existing = contexts.get(existingId);
-        const firstTab = [...existing.tabs.values()][0] || await attachTab(existing, await existing.context.newPage());
-        if (targetUrl) {
-          await firstTab.page.goto(targetUrl, {waitUntil: 'domcontentloaded', timeout: 30000});
-          firstTab.url = firstTab.page.url();
-          firstTab.title = await firstTab.page.title().catch(() => '');
+        const sameProfile = spec.persistent
+          ? (existing.persistent && normKey(existing.profileDir) === normKey(spec.profileDir))
+          : !existing.persistent;
+        if (sameProfile) {
+          const firstTab = [...existing.tabs.values()][0] || await attachTab(existing, await existing.context.newPage());
+          if (targetUrl) {
+            await firstTab.page.goto(targetUrl, {waitUntil: 'domcontentloaded', timeout: 30000});
+            firstTab.url = firstTab.page.url();
+            firstTab.title = await firstTab.page.title().catch(() => '');
+          }
+          persistLedger();
+          return {
+            browser_id: existing.id,
+            route: 'persistent_playwright',
+            headless: true,
+            isolated_profile: true,
+            persistent_profile: existing.persistent,
+            profile_id: existing.profileId,
+            profile_dir: existing.profileDir,
+            child_pid: existing.browserPid,
+            affinity_reused: true,
+            tab_id: firstTab.id,
+            target_id: firstTab.targetId,
+            url: firstTab.url,
+            title: firstTab.title,
+            tabs: [...existing.tabs.values()].map(describeTab),
+          };
         }
-        persistLedger();
-        return {
-          browser_id: existing.id,
-          route: 'persistent_playwright',
-          headless: true,
-          isolated_profile: true,
-          affinity_reused: true,
-          tab_id: firstTab.id,
-          target_id: firstTab.targetId,
-          url: firstTab.url,
-          title: firstTab.title,
-          tabs: [...existing.tabs.values()].map(describeTab),
-        };
       }
       if ([...contexts.values()].filter(c => c.owner === owner).length >= 2) {
         throw new ManagedError('BROWSER_LIMIT_OWNER', 'owner already holds max persistent Playwright contexts');
@@ -347,30 +814,48 @@ async function main() {
       if (contexts.size >= 10) {
         throw new ManagedError('BROWSER_LIMIT_TOTAL', 'managed Playwright pool is at capacity');
       }
-      const id = 'pw-' + crypto.randomUUID().replace(/-/g, '').slice(0, 16);
-      const profileDir = path.join(profilesRoot, id);
-      const downloadsDir = path.join(profileDir, 'downloads');
-      fs.mkdirSync(downloadsDir, {recursive: true});
-      const {executablePath} = resolveChromiumExecutable(pw);
-      const context = await pw.chromium.launchPersistentContext(profileDir, {
-        ...(executablePath && fs.existsSync(executablePath) ? {executablePath} : {}),
-        headless: true,
-        acceptDownloads: true,
-        downloadsPath: downloadsDir,
-        viewport: {width: 1280, height: 800},
-        args: [
-          '--no-first-run',
-          '--no-default-browser-check',
-          '--disable-background-timer-throttling',
-          '--disable-renderer-backgrounding',
-        ],
-      });
+
+      const profileDir = spec.profileDir;
+      const downloadsDir = spec.persistent ? path.join(downloadsRoot, id) : path.join(profileDir, 'downloads');
+      if (spec.persistent) {
+        acquireProfileLease(profileDir, id, owner);
+      }
+      let context = null;
+      try {
+        fs.mkdirSync(profileDir, {recursive: true});
+        fs.mkdirSync(downloadsDir, {recursive: true});
+        const {executablePath} = resolveChromiumExecutable(pw);
+        context = await pw.chromium.launchPersistentContext(profileDir, {
+          ...(executablePath && fs.existsSync(executablePath) ? {executablePath} : {}),
+          headless: true,
+          acceptDownloads: true,
+          downloadsPath: downloadsDir,
+          viewport: {width: 1280, height: 800},
+          args: [
+            '--no-first-run',
+            '--no-default-browser-check',
+            '--disable-background-timer-throttling',
+            '--disable-renderer-backgrounding',
+          ],
+        });
+      } catch (err) {
+        if (spec.persistent) releaseProfileLease(profileDir, id);
+        else removeDirVerified(profileDir);
+        removeDirVerified(downloadsDir);
+        throw err;
+      }
+
+      const pidInfo = await inspectBrowserPids(context);
       const ctx = {
         id,
         owner,
+        persistent: spec.persistent,
+        profileId: spec.profileId,
         profileDir,
         downloadsDir,
         context,
+        browserPid: pidInfo.browserPid,
+        knownPids: pidInfo.allPids,
         tabs: new Map(),
         downloads: new Map(),
         createdAt: Date.now(),
@@ -391,6 +876,10 @@ async function main() {
           route: 'persistent_playwright',
           headless: true,
           isolated_profile: true,
+          persistent_profile: ctx.persistent,
+          profile_id: ctx.profileId,
+          profile_dir: ctx.profileDir,
+          child_pid: ctx.browserPid,
           affinity_reused: false,
           tab_id: tab.id,
           target_id: tab.targetId,
@@ -407,13 +896,25 @@ async function main() {
     if (op === 'close_owner') {
       const owned = [...contexts.values()].filter(c => c.owner === owner);
       let closedCount = 0;
+      const unconfirmed = [];
       const errors = [];
+      const preservedProfiles = [];
       for (const ctx of owned) {
         const res = await closeContextRecord(ctx);
-        if (res.profile_cleanup_verified) closedCount++;
-        else errors.push({browser_id: ctx.id, code: 'PROFILE_CLEANUP_INCOMPLETE'});
+        if (res.profile_preserved && res.profile_id) preservedProfiles.push(res.profile_id);
+        if (res.profile_cleanup_verified) {
+          closedCount++;
+        } else {
+          unconfirmed.push(ctx.id);
+          errors.push({
+            browser_id: ctx.id,
+            code: res.child_exited ? 'PROFILE_CLEANUP_INCOMPLETE' : 'BROWSER_CHILD_STILL_ALIVE',
+            child_exited: res.child_exited,
+            leaked_pids: res.leaked_pids,
+          });
+        }
       }
-      return {closed: closedCount, errors};
+      return {closed: closedCount, unconfirmed, errors, preserved_profiles: preservedProfiles};
     }
 
     const ctx = requireContext(owner, args.browser_id);
@@ -425,6 +926,10 @@ async function main() {
         route: 'persistent_playwright',
         headless: true,
         isolated_profile: true,
+        persistent_profile: ctx.persistent,
+        profile_id: ctx.profileId,
+        profile_dir: ctx.profileDir,
+        child_pid: ctx.browserPid,
         tabs: [...ctx.tabs.values()].map(describeTab),
         downloads: [...ctx.downloads.keys()],
       };
@@ -479,7 +984,7 @@ async function main() {
       };
     }
     if (op === 'read') {
-      const limit = Math.min(Math.max(Number(args.max_chars ?? 60000), 100), 400000);
+      const limit = Math.min(Math.max(Number(args.max_chars ?? 60000), 1000), 400000);
       const text = args.target
         ? await (await locateTarget(page, args.target)).evaluate(el => el.innerText ?? el.textContent ?? '')
         : await page.evaluate(() => document.body?.innerText ?? '');
@@ -667,19 +1172,27 @@ async function main() {
 
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const addr = server.address();
-  const endpointPayload = {pid: process.pid, port: addr.port, playwright_version: pwVersion};
+  const endpointPayload = {
+    pid: process.pid,
+    port: addr.port,
+    playwright_version: pwVersion,
+    persistent_profiles_root: persistentProfilesRoot,
+  };
   const tmpEndpoint = `${endpointFile}.${crypto.randomUUID()}.tmp`;
   fs.writeFileSync(tmpEndpoint, JSON.stringify(endpointPayload), 'utf8');
   fs.renameSync(tmpEndpoint, endpointFile);
 
   let shutdownStarted = false;
-  const shutdown = async () => {
+  const shutdown = async (exitCode = 0) => {
     if (shutdownStarted) return;
     shutdownStarted = true;
     stopping = true;
-    server.close();
+    try { server.close(); } catch {}
     for (const ctx of [...contexts.values()]) {
-      await closeContextRecord(ctx).catch(() => {});
+      await closeContextRecord(ctx).catch(() => {
+        if (ctx.browserPid) forceKillProcessTree(ctx.browserPid);
+        if (ctx.persistent) releaseProfileLease(ctx.profileDir, ctx.id);
+      });
     }
     try {
       if (fs.existsSync(endpointFile)) {
@@ -687,14 +1200,34 @@ async function main() {
         if (cur?.pid === process.pid) fs.unlinkSync(endpointFile);
       }
     } catch {}
-    process.exit(0);
+    process.exit(exitCode);
+  };
+
+  const emergencyTeardown = () => {
+    for (const ctx of [...contexts.values()]) {
+      if (ctx.browserPid) forceKillProcessTree(ctx.browserPid);
+      for (const p of ctx.knownPids || []) {
+        if (pidAlive(p)) forceKillProcessTree(p);
+      }
+      if (ctx.persistent) releaseProfileLease(ctx.profileDir, ctx.id);
+    }
   };
 
   process.stdin.resume();
-  process.stdin.on('end', () => void shutdown());
-  process.stdin.on('close', () => void shutdown());
-  process.on('SIGINT', () => void shutdown());
-  process.on('SIGTERM', () => void shutdown());
+  process.stdin.on('end', () => void shutdown(0));
+  process.stdin.on('close', () => void shutdown(0));
+  process.on('SIGINT', () => void shutdown(0));
+  process.on('SIGTERM', () => void shutdown(0));
+  process.on('uncaughtException', err => {
+    console.error(err);
+    emergencyTeardown();
+    process.exit(1);
+  });
+  process.on('unhandledRejection', err => {
+    console.error(err);
+    emergencyTeardown();
+    process.exit(1);
+  });
 }
 
 main().catch(err => {
