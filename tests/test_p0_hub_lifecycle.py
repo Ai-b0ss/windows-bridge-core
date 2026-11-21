@@ -641,10 +641,13 @@ class RealIsolatedHubMcpTests(unittest.TestCase):
 
         # Verify unified route metadata across workflows & gateway has zero silent visible Playwright fallback
         wf = agent_workflows()
-        self.assertEqual(wf["browser_workflow"]["preferred_route"], "shared_hub.isolated_hidden_browser")
+        self.assertEqual(wf["browser_workflow"]["preferred_route"], "shared_hub.owner_chrome_profile1_hidden_secondary")
+        self.assertTrue(wf["browser_workflow"]["primary_owner_auth_route"]["silent_fallback_to_isolated_forbidden"])
+        self.assertIs(wf["browser_workflow"]["optional_isolated_mode"]["satisfies_primary_p0_owner_chrome_profile1"], False)
         self.assertTrue(wf["browser_workflow"]["legacy_fallback"]["never_silently_fallback"])
         gw = HubGateway(self.root).discovery()
-        self.assertEqual(gw["default_browser_route"], "isolated_hidden_browser")
+        self.assertEqual(gw["primary_owner_auth_browser_route"], "owner_chrome_profile1_hidden_secondary")
+        self.assertTrue(gw["isolated_substitution_forbidden"])
         self.assertFalse(gw["silent_playwright_fallback"])
 
     def test_deduplication_mismatched_payload_and_hub_restart_recovery(self) -> None:
@@ -1131,6 +1134,499 @@ class TwoPhaseRetentionAndShutdownTests(unittest.TestCase):
         finally:
             hub.shutdown()
             hub.store.close()
+
+
+class OwnerChromeHiddenSecondaryHubTests(unittest.TestCase):
+    """Gate 2A / Track C E2E tests for owner_chrome_hidden through Hub, /agent/v1, and MCP."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_owner_chrome_hidden_fail_closed_no_cdp_mismatch_and_two_phase_retention(self) -> None:
+        from cua_owner_chrome_secondary import OwnerChromeHiddenSecondaryManager, OwnerChromeSecondaryError, ROUTE_NAME
+        from ff_agent_entry import entry_call
+
+        # 1. No CDP available -> route_plan fails closed (selected=None, zero silent substitution to isolated!)
+        empty_ud = self.root / "no-cdp-userdata"
+        empty_ud.mkdir()
+        mgr_no_cdp = OwnerChromeHiddenSecondaryManager(
+            self.root / "hub-nocdp",
+            profile_dir_name="Profile 1",
+            user_data_dir=empty_ud,
+        )
+        hub_nocdp = Hub(self.root / "hub-nocdp", owner_chrome_secondary=mgr_no_cdp)
+        try:
+            Policy(self.root / "hub-nocdp" / "policy.json").add_grant(
+                ["owner_chrome_hidden_secondary"], agents=["a1"], ttl_seconds=300
+            )
+            rp = hub_nocdp.dispatch({
+                "op": "route_plan",
+                "args": {"surface": "browser", "capability": "owner_profile_hidden", "profile_dir_name": "Profile 1"},
+            })
+            self.assertIsNone(rp["selected"])
+            self.assertTrue(rp["isolated_substitution_forbidden"])
+            self.assertEqual(rp["primary_owner_auth_route"], ROUTE_NAME)
+
+            sess = hub_nocdp.dispatch({"op": "session_open", "args": {"agent_id": "a1", "task_id": "t1"}})
+            with self.assertRaises(HubError) as no_cdp_err:
+                hub_nocdp.dispatch({
+                    "op": "owner_chrome_hidden",
+                    "session_id": sess["session_id"],
+                    "session_secret": sess["session_secret"],
+                    "request_key": "nocdp-open-0001",
+                    "args": {"command": "open", "url": "http://127.0.0.1:1/"},
+                })
+            self.assertIn(
+                no_cdp_err.exception.code,
+                {"OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE", "OWNER_CHROME_NOT_RUNNING"},
+            )
+            self.assertEqual(hub_nocdp.store.resources(), [])
+        finally:
+            hub_nocdp.shutdown()
+            hub_nocdp.store.close()
+
+        # 2. Multi-profile mismatch + two-phase unconfirmed retention + Hub.shutdown consistency
+        class _StubSecondary:
+            def __init__(self) -> None:
+                self.is_running = True
+                self.mismatch = False
+                self.confirm_close = False
+                self.calls: list[tuple[str, dict]] = []
+                self.shutdown_args: list[bool] = []
+
+            def running(self) -> bool:
+                return self.is_running
+
+            def shutdown(self, *, close_targets: bool = True) -> dict:
+                self.shutdown_args.append(close_targets)
+                self.is_running = False
+                return {"closed": 0}
+
+            def call(self, op: str, args: dict | None = None, *, timeout: float = 30.0) -> dict:
+                args = dict(args or {})
+                self.calls.append((op, args))
+                if op == "preflight":
+                    return {"ok": not self.mismatch, "route": ROUTE_NAME, "profile_dir_name": "Profile 1"}
+                if op == "open":
+                    if self.mismatch:
+                        raise OwnerChromeSecondaryError("OWNER_CHROME_PROFILE_CONTEXT_MISMATCH", "Default owns context")
+                    return {
+                        "tab_id": "och-retained-1",
+                        "target_id": "TGT-OCH-1",
+                        "route": ROUTE_NAME,
+                        "profile_dir_name": "Profile 1",
+                        "url": args.get("url") or "about:blank",
+                        "hidden": True,
+                        "windowless": True,
+                        "auth_inherited": True,
+                        "profile_copied": False,
+                    }
+                if op == "list":
+                    return {"route": ROUTE_NAME, "tabs": [{"tab_id": "och-retained-1", "target_id": "TGT-OCH-1", "url": "http://127.0.0.1/"}]}
+                if op == "screenshot":
+                    raise OwnerChromeSecondaryError("HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED", "windowless target")
+                if op == "close_owner":
+                    if self.confirm_close:
+                        return {"closed": 1, "unconfirmed": [], "errors": [], "results": [], "primary_window_untouched": True}
+                    return {"closed": 0, "unconfirmed": ["och-retained-1"], "errors": [], "results": [], "primary_window_untouched": True}
+                return {"ok": True}
+
+        stub = _StubSecondary()
+        state2 = self.root / "hub-retain"
+        hub2 = Hub(state2, owner_chrome_secondary=stub)
+        try:
+            sess = hub2.dispatch({"op": "session_open", "args": {"agent_id": "sec-a", "task_id": "sec-t"}})
+            auth = {"session_id": sess["session_id"], "session_secret": sess["session_secret"]}
+
+            # Without owner grant -> PERMISSION_REQUIRED (zero calls to secondary manager!)
+            with self.assertRaises(HubError) as perm_err:
+                hub2.dispatch({**auth, "op": "owner_chrome_hidden", "request_key": "sec-nogrant-01", "args": {"command": "open", "url": "http://127.0.0.1/"}})
+            self.assertEqual(perm_err.exception.code, "PERMISSION_REQUIRED")
+            self.assertEqual(perm_err.exception.details["risk_class"], "owner_chrome_hidden_secondary")
+            self.assertEqual(stub.calls, [])
+
+            # Grant standing owner_chrome_hidden_secondary permission
+            Policy(state2 / "policy.json").add_grant(["owner_chrome_hidden_secondary"], agents=["sec-a"], ttl_seconds=300)
+
+            # Multi-profile mismatch fails closed
+            stub.mismatch = True
+            with self.assertRaises(HubError) as mm_err:
+                hub2.dispatch({**auth, "op": "owner_chrome_hidden", "request_key": "sec-mismatch-01", "args": {"command": "open", "url": "http://127.0.0.1/"}})
+            self.assertEqual(mm_err.exception.code, "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH")
+            self.assertEqual(hub2.store.resources(), [])
+
+            # Open succeeds; screenshot fails closed; unconfirmed close retains resource in SQLite
+            stub.mismatch = False
+            opened = hub2.dispatch({**auth, "op": "owner_chrome_hidden", "request_key": "sec-open-0001", "args": {"command": "open", "url": "http://127.0.0.1/"}})
+            self.assertEqual(opened["tab_id"], "och-retained-1")
+            with self.assertRaises(HubError) as shot_err:
+                hub2.dispatch({**auth, "op": "owner_chrome_hidden", "args": {"command": "screenshot", "tab_id": "och-retained-1"}})
+            self.assertEqual(shot_err.exception.code, "HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED")
+
+            # Managed kind cannot be manually claimed/released
+            with self.assertRaises(HubError) as mgd_err:
+                hub2.dispatch({**auth, "op": "resource_claim", "request_key": "sec-adopt-0001", "args": {"kind": "owner_chrome_hidden_target", "key": "och-retained-1"}})
+            self.assertEqual(mgd_err.exception.code, "RESOURCE_KIND_MANAGED")
+
+            # Unconfirmed close passes forget_unconfirmed=False and retains row in SQLite
+            c_unconf = hub2.dispatch({**auth, "op": "session_close", "request_key": "sec-close-0001"})
+            self.assertFalse(c_unconf["cleanup_verified"])
+            self.assertEqual(c_unconf["resources_retained"], 1)
+            co_args = next(a for op, a in stub.calls if op == "close_owner")
+            self.assertIs(co_args["forget_unconfirmed"], False)
+            self.assertEqual(len(hub2.store.resources(kind="owner_chrome_hidden_target")), 1)
+
+            # Hub.shutdown while target is held in SQLite passes close_targets=False
+            hub2.shutdown()
+            self.assertEqual(stub.shutdown_args, [False])
+
+            # /agent/v1 scoped check: private_browser scope MUST NOT allow owner_chrome_hidden
+            ea = EntryAuthority(state2)
+            _, tok_iso = ea.issue(client_id="c-iso", agent_id="sec-a", task_id="t-iso", scopes=["private_browser"], apps=[], ttl=120)
+            s_iso = entry_call(hub2, ea, f"Bearer {tok_iso}", {"op": "session_open"})["session_id"]
+            with self.assertRaises(HubError) as scope_err:
+                entry_call(hub2, ea, f"Bearer {tok_iso}", {"op": "owner_chrome_hidden", "session_id": s_iso, "args": {"command": "status"}})
+            self.assertEqual(scope_err.exception.code, "ENTRY_SCOPE_DENIED")
+        finally:
+            hub2.store.close()
+
+    @unittest.skipUnless(os.name == "nt", "Real Windows Chrome 158 synthetic Profile 1 E2E")
+    def test_real_synthetic_chrome158_profile1_hidden_secondary_via_hub_entry_and_mcp(self) -> None:
+        import ctypes
+        from ctypes import wintypes as wt
+        import http.server
+        import secrets
+        from types import SimpleNamespace
+        import cua_hidden_chrome as hidden_chrome
+        from cua_owner_chrome_secondary import OwnerChromeHiddenSecondaryManager, ROUTE_NAME
+        from cua_sidecar_supervisor import _bind_windows_kill_on_close_job, _close_windows_job_handle
+        from ff_agent_entry import entry_call
+
+        chrome_exe = hidden_chrome.chrome_path()
+        if not chrome_exe:
+            self.skipTest("Chrome executable not installed")
+
+        # Ephemeral local 127.0.0.1 HTTP auth server (HttpOnly cookie + localStorage + POST action)
+        auth_token = "p0-hub-synth-token-158"
+        posts: list[dict] = []
+        login_served = threading.Event()
+
+        class _AuthHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                return
+
+            def do_GET(self):
+                if self.path == "/login":
+                    body = (
+                        "<!doctype html><html><head><title>Primary Login</title></head><body>"
+                        "<script>localStorage.setItem('hub_p1_auth', 'ls-inherited-ok');</script>"
+                        "<div id='login'>SIGNED_IN</div></body></html>"
+                    ).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Set-Cookie", f"hub_sid={auth_token}; HttpOnly; Path=/")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    login_served.set()
+                    return
+                cookie_ok = f"hub_sid={auth_token}" in (self.headers.get("Cookie") or "")
+                body = (
+                    "<!doctype html><html><head><title>App</title></head><body>"
+                    f"<div id='auth'>COOKIE={'YES' if cookie_ok else 'NO'}</div>"
+                    "<div id='ls'></div>"
+                    "<input id='msg' type='text' value=''>"
+                    "<button id='go' onclick=\"fetch('/action',{method:'POST',body:document.getElementById('msg').value})"
+                    ".then(r=>r.text()).then(t=>{document.getElementById('out').textContent=t;})\">Submit</button>"
+                    "<div id='out'>IDLE</div>"
+                    "<script>document.getElementById('ls').textContent=localStorage.getItem('hub_p1_auth')||'NONE';</script>"
+                    "</body></html>"
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length", "0"))
+                val = self.rfile.read(length).decode("utf-8", "replace")
+                cookie_ok = f"hub_sid={auth_token}" in (self.headers.get("Cookie") or "")
+                posts.append({"value": val, "cookie_ok": cookie_ok})
+                reply = f"ACK:{val}:AUTH={'YES' if cookie_ok else 'NO'}".encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(reply)))
+                self.end_headers()
+                self.wfile.write(reply)
+
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _AuthHandler)
+        port = httpd.server_address[1]
+        srv_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        srv_thread.start()
+
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32.CreateDesktopW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, ctypes.c_void_p, wt.DWORD, wt.DWORD, ctypes.c_void_p]
+        u32.CreateDesktopW.restype = wt.HANDLE
+        u32.CloseDesktop.argtypes = [wt.HANDLE]
+        k32.CreateProcessW.argtypes = [
+            wt.LPCWSTR, wt.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wt.BOOL, wt.DWORD,
+            ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(hidden_chrome._WinStartupInfo),
+            ctypes.POINTER(hidden_chrome._WinProcessInfo),
+        ]
+        k32.CreateProcessW.restype = wt.BOOL
+        k32.ResumeThread.argtypes = [wt.HANDLE]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+        k32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+        k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+
+        synth_ud = self.root / "synth-chrome-ud"
+        synth_ud.mkdir()
+        desktop = None
+        job = None
+        hproc = None
+        hub = None
+        try:
+            # Launch synthetic Chrome 158 on an isolated Win32 private desktop (ZERO owner desktop impact)
+            desktop_name = "FFBridge-HubGate2A-" + secrets.token_hex(8)
+            desktop = u32.CreateDesktopW(desktop_name, None, None, 0, 0x01FF, None)
+            self.assertTrue(bool(desktop), "CreateDesktopW failed")
+            argv = [
+                str(chrome_exe),
+                f"--user-data-dir={synth_ud}",
+                "--profile-directory=Profile 1",
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=0",
+                "--no-first-run",
+                "--no-default-browser-check",
+                f"http://127.0.0.1:{port}/login",
+            ]
+            cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+            si = hidden_chrome._WinStartupInfo()
+            si.cb = ctypes.sizeof(hidden_chrome._WinStartupInfo)
+            si.lpDesktop = "winsta0\\" + desktop_name
+            si.dwFlags = 1
+            si.wShowWindow = 4
+            pi = hidden_chrome._WinProcessInfo()
+            created = k32.CreateProcessW(
+                None, cmdline, None, None, False, 0x08000004, None, str(synth_ud),
+                ctypes.byref(si), ctypes.byref(pi),
+            )
+            self.assertTrue(bool(created), "CreateProcessW for synthetic Profile 1 Chrome failed")
+            hproc = pi.hProcess
+            chrome_pid = int(pi.pid)
+            job = _bind_windows_kill_on_close_job(SimpleNamespace(pid=chrome_pid))
+            k32.ResumeThread(pi.hThread)
+            k32.CloseHandle(pi.hThread)
+
+            # Wait for DevToolsActivePort + /login cookie/localStorage in primary window
+            marker = synth_ud / "DevToolsActivePort"
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline and (not marker.is_file() or not login_served.is_set()):
+                time.sleep(0.05)
+            self.assertTrue(marker.is_file(), "Synthetic Chrome did not write DevToolsActivePort")
+            self.assertTrue(login_served.is_set(), "Synthetic Chrome did not load /login")
+            lines = marker.read_text(encoding="ascii").splitlines()
+            cdp_port, ws_path = int(lines[0]), lines[1].strip()
+            ws_url = f"ws://127.0.0.1:{cdp_port}{ws_path}"
+            time.sleep(0.5)
+
+            hub_state = self.root / "live-hub-state"
+            mgr = OwnerChromeHiddenSecondaryManager(
+                hub_state,
+                profile_dir_name="Profile 1",
+                cdp_endpoint=ws_url,
+                user_data_dir=synth_ud,
+                chrome_pid=chrome_pid,
+            )
+            hub = Hub(hub_state, owner_chrome_secondary=mgr)
+
+            # 1. Negative: without standing grant -> PERMISSION_REQUIRED
+            ea = EntryAuthority(hub_state)
+            _, token = ea.issue(
+                client_id="c-och",
+                agent_id="och-agent",
+                task_id="och-task",
+                scopes=["owner_chrome_hidden"],
+                apps=[],
+                ttl=180,
+            )
+            bearer = f"Bearer {token}"
+            caps = entry_call(hub, ea, bearer, {"op": "capabilities"})
+            self.assertTrue(caps["owner_chrome_hidden_available"])
+            self.assertTrue(caps["isolated_substitution_forbidden"])
+
+            rp = entry_call(hub, ea, bearer, {
+                "op": "route_plan",
+                "args": {"surface": "browser", "capability": "owner_profile_hidden", "profile_dir_name": "Profile 1"},
+            })
+            self.assertEqual(rp["selected"], ROUTE_NAME)
+            self.assertTrue(rp["isolated_substitution_forbidden"])
+
+            sid = entry_call(hub, ea, bearer, {"op": "session_open"})["session_id"]
+            with self.assertRaises(HubError) as deny_err:
+                entry_call(hub, ea, bearer, {
+                    "op": "owner_chrome_hidden",
+                    "session_id": sid,
+                    "request_key": "och-deny-open-001",
+                    "args": {"command": "open", "url": f"http://127.0.0.1:{port}/app"},
+                })
+            self.assertEqual(deny_err.exception.code, "PERMISSION_REQUIRED")
+
+            # Forbidden override args at /agent/v1 rejected fail-closed
+            for bad_args in (
+                {"command": "open", "foreground": True},
+                {"command": "open", "new_window": True},
+                {"command": "evaluate", "tab_id": "och-x", "expression": "1+1"},
+            ):
+                with self.assertRaises(HubError) as forbid_err:
+                    entry_call(hub, ea, bearer, {
+                        "op": "owner_chrome_hidden",
+                        "session_id": sid,
+                        "request_key": "och-forbid-0001",
+                        "args": bad_args,
+                    })
+                self.assertEqual(forbid_err.exception.code, "ENTRY_BROWSER_COMMAND_DENIED")
+
+            # 2. Grant standing owner_chrome_hidden_secondary -> E2E auth inheritance + DOM act + clean teardown
+            Policy(hub_state / "policy.json").add_grant(
+                ["owner_chrome_hidden_secondary"], agents=["och-agent"], hosts=["127.0.0.1"], ttl_seconds=180
+            )
+            opened = entry_call(hub, ea, bearer, {
+                "op": "owner_chrome_hidden",
+                "session_id": sid,
+                "request_key": "och-open-live-001",
+                "args": {"command": "open", "url": f"http://127.0.0.1:{port}/app"},
+            })
+            self.assertTrue(opened["hidden"])
+            self.assertTrue(opened["windowless"])
+            self.assertTrue(opened["auth_inherited"])
+            self.assertFalse(opened["profile_copied"])
+            self.assertFalse(opened["visible_window_created"])
+            self.assertFalse(opened["owner_tab_strip_modified"])
+            tab_id = opened["tab_id"]
+
+            # Wait briefly for page script to populate #ls, then read inherited auth state
+            read_res = entry_call(hub, ea, bearer, {
+                "op": "owner_chrome_hidden",
+                "session_id": sid,
+                "args": {"command": "read", "tab_id": tab_id},
+            })
+            self.assertIn("COOKIE=YES", read_res["text"])
+            self.assertIn("ls-inherited-ok", read_res["text"])
+
+            # Fill input and click button -> triggers authenticated POST /action
+            entry_call(hub, ea, bearer, {
+                "op": "owner_chrome_hidden",
+                "session_id": sid,
+                "request_key": "och-fill-live-001",
+                "args": {"command": "act", "tab_id": tab_id, "operation": "fill", "selector": "#msg", "value": "hub-p0-ok"},
+            })
+            entry_call(hub, ea, bearer, {
+                "op": "owner_chrome_hidden",
+                "session_id": sid,
+                "request_key": "och-click-live-001",
+                "args": {
+                    "command": "act",
+                    "tab_id": tab_id,
+                    "operation": "click",
+                    "selector": "#go",
+                    "postcondition": {"type": "text_includes", "value": "ACK:hub-p0-ok:AUTH=YES"},
+                },
+            })
+            self.assertTrue(any(p["value"] == "hub-p0-ok" and p["cookie_ok"] for p in posts))
+
+            # Screenshot fails closed
+            with self.assertRaises(HubError) as shot_err:
+                entry_call(hub, ea, bearer, {
+                    "op": "owner_chrome_hidden",
+                    "session_id": sid,
+                    "args": {"command": "screenshot", "tab_id": tab_id},
+                })
+            self.assertEqual(shot_err.exception.code, "HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED")
+
+            # session_close tears down ONLY the hidden target cleanly (leaving primary Chrome intact!)
+            closed = entry_call(hub, ea, bearer, {
+                "op": "session_close",
+                "session_id": sid,
+                "request_key": "och-close-live-001",
+            })
+            self.assertTrue(closed["closed"])
+            self.assertTrue(closed["cleanup_verified"])
+            self.assertEqual(closed["resources_retained"], 0)
+            self.assertEqual(closed["owner_chrome_hidden_targets_closed"], 1)
+            self.assertEqual(hub.store.resources(), [])
+
+            # 3. Verify MCP Adapter can also drive owner_chrome_hidden cleanly and unlink checkpoint
+            class _DirectClient:
+                def raw(self, req):
+                    try:
+                        return {"ok": True, "result": hub.dispatch(req)}
+                    except HubError as exc:
+                        return {"ok": False, "error_code": exc.code, "message": exc.message, "details": exc.details}
+
+            adapter = Adapter(hub_state, "och-agent", client=_DirectClient())
+            try:
+                mcp_caps = adapter.call({"op": "capabilities"})
+                self.assertIn("owner_chrome_hidden", mcp_caps["operations"])
+                self.assertEqual(mcp_caps["mcp"]["primary_owner_auth_route"], ROUTE_NAME)
+                adapter.call({"op": "session_open", "task_id": "mcp-och-task"})
+                m_open = adapter.call({
+                    "op": "owner_chrome_hidden",
+                    "task_id": "mcp-och-task",
+                    "request_key": "mcp-och-open-001",
+                    "args": {"command": "open", "url": f"http://127.0.0.1:{port}/app"},
+                })
+                m_read = adapter.call({
+                    "op": "owner_chrome_hidden",
+                    "task_id": "mcp-och-task",
+                    "args": {"command": "read", "tab_id": m_open["tab_id"]},
+                })
+                self.assertIn("COOKIE=YES", m_read["text"])
+                m_close = adapter.call({
+                    "op": "session_close",
+                    "task_id": "mcp-och-task",
+                    "request_key": "mcp-och-close-001",
+                })
+                self.assertTrue(m_close["cleanup_verified"])
+                self.assertEqual(m_close["resources_retained"], 0)
+                self.assertEqual(m_close["owner_chrome_hidden_targets_closed"], 1)
+            finally:
+                adapter.close()
+        finally:
+            if hub is not None:
+                hub.shutdown()
+                hub.store.close()
+            if job is not None:
+                try:
+                    k32.TerminateJobObject(job, 1)
+                except Exception:
+                    pass
+                try:
+                    _close_windows_job_handle(job)
+                except Exception:
+                    pass
+            if hproc is not None:
+                try:
+                    k32.WaitForSingleObject(hproc, 5000)
+                except Exception:
+                    pass
+                try:
+                    k32.CloseHandle(hproc)
+                except Exception:
+                    pass
+            if desktop is not None:
+                try:
+                    u32.CloseDesktop(desktop)
+                except Exception:
+                    pass
+            httpd.shutdown()
+            httpd.server_close()
 
 
 if __name__ == "__main__":

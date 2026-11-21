@@ -225,6 +225,33 @@ class P0BridgeOwnershipRetryTests(unittest.TestCase):
         self.assertIn(s_b1["surface_id"], plane._surfaces)
         self.assertTrue(any(op == "close" and args.get("surface_id") == s_a1["surface_id"] for op, args in ext.calls))
 
+    def test_extension_transport_fails_closed_on_hidden_secondary_requests_without_isolated_fallback(self):
+        iso = _FakeBrowserSupervisor()
+        ext = _FakeBrowserSupervisor()
+        plane = _make_plane({"isolated": iso, "extension": ext})
+
+        cases = [
+            {"transport": "extension", "owner_chrome_explicit": True, "invisible_required": True},
+            {"transport": "extension", "owner_chrome_explicit": True, "hidden_secondary": True},
+            {"transport": "extension", "owner_chrome_explicit": True, "new_window_hidden": True},
+            {"transport": "extension", "owner_chrome_explicit": True, "window_mode": "hidden_secondary"},
+            {"transport": "extension", "owner_chrome_explicit": True, "options": {"invisible_required": True}},
+            {"transport": "extension", "owner_chrome_explicit": True, "options": {"newWindowHidden": True}},
+            {"route_mode": "owner_chrome_profile1_hidden_secondary"},
+            {"invisible_required": True},
+            {"hidden_secondary": True},
+        ]
+        for extra in cases:
+            with self.assertRaises(CuaBridgeError) as ctx:
+                plane._attach({"surface_kind": "browser", **extra})
+            self.assertEqual(ctx.exception.code, "OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT")
+            self.assertFalse(ctx.exception.details["hidden_secondary_window_supported"])
+            self.assertFalse(ctx.exception.details["isolated_fallback"])
+            self.assertFalse(ctx.exception.details["attempted"])
+            self.assertEqual(ctx.exception.details["recommended_route"], "owner_chrome_profile1_hidden_secondary")
+        self.assertEqual(len(ext.calls), 0, "must never spawn extension connect.html/about:blank")
+        self.assertEqual(len(iso.calls), 0, "must never silently fall back to isolated browser")
+
     def test_task_preflight_recommends_shared_hub_and_hidden_browser(self):
         class _PreflightPlane(CuaBridgeControlPlane):
             def __init__(self):
@@ -237,7 +264,11 @@ class P0BridgeOwnershipRetryTests(unittest.TestCase):
 
         plane = _PreflightPlane()
         res = plane._task_preflight({"app": "Chrome", "task": "open dashboard"})
-        self.assertEqual(res["browser_routing"]["recommended_route"], "shared_hub_hidden_browser")
+        self.assertEqual(res["browser_routing"]["recommended_route"], "owner_chrome_profile1_hidden_secondary")
+        self.assertEqual(res["browser_routing"]["primary_owner_auth_route"], "owner_chrome_profile1_hidden_secondary")
+        self.assertFalse(res["browser_routing"]["extension_supports_hidden_secondary"])
+        self.assertTrue(res["browser_routing"]["extension_visible_tab_strip"])
+        self.assertFalse(res["browser_routing"]["isolated_fallback_for_owner_auth_allowed"])
         self.assertFalse(res["browser_routing"]["direct_owner_chrome_fallback_allowed"])
         self.assertTrue(res["browser_routing"]["requires_explicit_owner_chrome_opt_in"])
         self.assertEqual(res["next_step"], "use_shared_hub_or_hidden_browser_before_explicit_owner_chrome")

@@ -1332,9 +1332,49 @@ class CuaBridgeControlPlane:
         if kind == "browser":
             self.reap_idle_browser_surfaces()
             raw_transport = args.get("transport")
+            raw_options = args.get("options", {})
+            opt_map = raw_options if isinstance(raw_options, Mapping) else {}
+            requested_window_mode = str(
+                args.get("window_mode")
+                or args.get("windowMode")
+                or opt_map.get("window_mode")
+                or opt_map.get("windowMode")
+                or args.get("route_mode")
+                or args.get("browser_mode")
+                or ""
+            ).strip().lower()
+            wants_hidden_secondary = (
+                args.get("invisible_required") is True
+                or args.get("invisibleRequired") is True
+                or args.get("hidden_secondary") is True
+                or args.get("hiddenSecondary") is True
+                or args.get("new_window_hidden") is True
+                or args.get("newWindowHidden") is True
+                or opt_map.get("invisible_required") is True
+                or opt_map.get("invisibleRequired") is True
+                or opt_map.get("hidden_secondary") is True
+                or opt_map.get("hiddenSecondary") is True
+                or opt_map.get("new_window_hidden") is True
+                or opt_map.get("newWindowHidden") is True
+                or requested_window_mode in {"hidden_secondary", "owner_chrome_profile1_hidden_secondary"}
+            )
+            if wants_hidden_secondary:
+                req_transport = (str(raw_transport).strip() if raw_transport is not None else "") or "extension"
+                raise CuaBridgeError(
+                    "OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT",
+                    "Playwright sidecar / extension transport cannot create a zero-visible-side-effect owner Chrome hidden secondary target; use Hub owner_chrome_profile1_hidden_secondary (browser-level CDP hidden:true) instead",
+                    details={
+                        "transport": req_transport,
+                        "recommended_route": "owner_chrome_profile1_hidden_secondary",
+                        "hidden_secondary_window_supported": False,
+                        "visible_tab_strip": req_transport == "extension",
+                        "isolated_fallback": False,
+                        "attempted": False,
+                        "retry_safe": False,
+                    },
+                )
             # Default to isolated hidden browser; never silently pick direct visible owner Chrome.
             transport = (str(raw_transport).strip() if raw_transport is not None else "") or "isolated"
-            raw_options = args.get("options", {})
             if transport == "isolated":
                 if not isinstance(raw_options, Mapping):
                     raise CuaBridgeError("ISOLATED_BROWSER_OPTIONS_INVALID")
@@ -1770,13 +1810,19 @@ class CuaBridgeControlPlane:
                 and candidates.get("task_execute_contract")):
             step = "run_explicit_git_status_task_execute_with_repo_path_and_check_receipt"
         browser_routing = {
-            "recommended_route": "shared_hub_hidden_browser",
+            "recommended_route": "owner_chrome_profile1_hidden_secondary",
+            "primary_owner_auth_route": "owner_chrome_profile1_hidden_secondary",
+            "optional_isolated_routes": ["persistent_playwright", "private_cdp"],
             "preferred_order": [
                 "official_api_cli_sdk_mcp",
+                "owner_chrome_profile1_hidden_secondary",
                 "shared_hub_hidden_browser",
                 "isolated_headless_playwright",
                 "explicit_owner_chrome_extension_via_hub",
             ],
+            "extension_supports_hidden_secondary": False,
+            "extension_visible_tab_strip": True,
+            "isolated_fallback_for_owner_auth_allowed": False,
             "direct_owner_chrome_fallback_allowed": False,
             "requires_explicit_owner_chrome_opt_in": True,
         }

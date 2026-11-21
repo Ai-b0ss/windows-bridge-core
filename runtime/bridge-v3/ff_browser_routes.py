@@ -1,4 +1,19 @@
-"""Live-probed browser and application route planner with strict isolated-first separation."""
+"""Live-probed browser and application route planner with strict P0 route separation.
+
+Route hierarchy & invariants:
+1. Primary owner-auth route: `owner_chrome_profile1_hidden_secondary` (already-running
+   Chrome 158+ `Profile 1` windowless hidden CDP target with auth inheritance and zero
+   visible side effects). When explicitly requested (`capability="owner_profile_hidden"`
+   or `prefer="owner_chrome_profile1_hidden_secondary"`), fails closed if unavailable
+   and NEVER silently substitutes an isolated profile or visible extension tab.
+2. Owner Chrome visible-tab extension route: `owner_chrome_extension` (Playwright MCP
+   extension 0.5.0 background tab in owner's primary window tab strip). Explicitly
+   reports `hidden_secondary_window_supported: False`, `visible_tab_strip: True` and
+   requires explicit `capability="extension_bridge"` or `prefer="owner_chrome_extension"`.
+3. Optional isolated modes: `persistent_playwright` and `private_cdp` (fresh or
+   persistent isolated agent profiles, zero owner profile access). Explicitly labeled
+   `mode: "optional_isolated_mode"`, `satisfies_owner_profile_auth: False`.
+"""
 from __future__ import annotations
 
 import json
@@ -20,8 +35,11 @@ from ff_hub_store import HubError
 
 PACKAGE = Path(__file__).resolve().parent
 
-ISOLATED_BROWSER_ROUTES = ("persistent_playwright", "private_cdp")
+OWNER_CHROME_HIDDEN_SECONDARY_ROUTE = "owner_chrome_profile1_hidden_secondary"
 OWNER_CHROME_ROUTE = "owner_chrome_extension"
+OPTIONAL_ISOLATED_BROWSER_ROUTES = ("persistent_playwright", "private_cdp")
+ISOLATED_BROWSER_ROUTES = OPTIONAL_ISOLATED_BROWSER_ROUTES
+OWNER_AUTH_HIDDEN_CAPABILITIES = frozenset({"owner_profile_hidden", "owner_auth_hidden", "hidden_secondary"})
 
 KNOWN_EXTENSION_IDS = {
     "mmlmfjhmonkocbjadbfplnigmagldckm": "playwright_mcp",
@@ -115,7 +133,7 @@ def probe_playwright(
     hub: Any = None,
     timeout_s: float = 4.0,
 ) -> dict[str, Any]:
-    """Probe persistent Playwright + Chromium readiness on this host."""
+    """Probe optional isolated persistent Playwright + Chromium readiness on this host."""
     t0 = time.monotonic()
     resolved_root = _resolve_playwright_root(hub=hub, playwright_root=playwright_root)
     script = PACKAGE / "ff_playwright_managed.mjs"
@@ -180,6 +198,28 @@ def probe_playwright(
             "playwright_root": resolved_root,
             "probe_ms": int((time.monotonic() - t0) * 1000),
         }
+
+
+def probe_owner_chrome_hidden_secondary(
+    *,
+    hub: Any = None,
+    profile_dir_name: str = "Profile 1",
+    cdp_endpoint: str | None = None,
+    user_data_dir: str | Path | None = None,
+    timeout_s: float = 3.0,
+) -> dict[str, Any]:
+    """Read-only probe of already-running Chrome Profile 1 hidden secondary CDP readiness."""
+    mgr = (getattr(hub, "owner_chrome_hidden", None) or getattr(hub, "owner_chrome_secondary", None)) if hub else None
+    if mgr is not None and hasattr(mgr, "preflight"):
+        return mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s)
+    from cua_owner_chrome_secondary import OwnerChromeHiddenSecondaryManager
+
+    probe_mgr = OwnerChromeHiddenSecondaryManager(
+        profile_dir_name=profile_dir_name,
+        cdp_endpoint=cdp_endpoint,
+        user_data_dir=user_data_dir,
+    )
+    return probe_mgr.preflight(profile_dir_name=profile_dir_name, timeout_s=timeout_s)
 
 
 def probe_owner_chrome(
@@ -343,12 +383,18 @@ def choose_route(
     sticky: dict[str, Any] | None = None,
     allow_owner_chrome: bool = False,
 ) -> str | None:
-    """Deterministically choose an isolated route; never silently fall back to owner Chrome.
+    """Deterministically choose a route with strict separation and zero silent fallback.
 
-    `owner_chrome_extension` is selected ONLY when explicitly requested via
-    `capability="extension_bridge"` or `prefer="owner_chrome_extension"` (and
-    usable). If a caller explicitly sets `prefer` to a route that is unavailable,
-    this function fails closed and returns None rather than silently switching routes.
+    - Primary owner-auth hidden mode (`capability in OWNER_AUTH_HIDDEN_CAPABILITIES` or
+      `prefer == "owner_chrome_profile1_hidden_secondary"`) selects ONLY
+      `owner_chrome_profile1_hidden_secondary` when usable, and fails closed (`None`)
+      otherwise — NEVER silently substituting `persistent_playwright`, `private_cdp`,
+      or visible-tab `owner_chrome_extension`.
+    - `owner_chrome_extension` is selected ONLY when explicitly requested via
+      `capability == "extension_bridge"` or `prefer == "owner_chrome_extension"`.
+    - When `prefer` is explicitly set and unavailable, fails closed (`None`).
+    - Default `capability == "dom"` selects isolated routes (`persistent_playwright`,
+      `private_cdp`, `private_uia`) and NEVER silently falls back to owner Chrome.
     """
     by_name = {item["route"]: item for item in routes}
 
@@ -356,7 +402,11 @@ def choose_route(
         entry = by_name.get(name)
         return bool(entry and entry.get("state") in {"READY", "ELIGIBLE"})
 
-    owner_explicit = (capability == "extension_bridge") or (prefer == OWNER_CHROME_ROUTE)
+    owner_hidden_req = (capability in OWNER_AUTH_HIDDEN_CAPABILITIES) or (prefer == OWNER_CHROME_HIDDEN_SECONDARY_ROUTE)
+    owner_ext_req = (capability == "extension_bridge") or (prefer == OWNER_CHROME_ROUTE)
+
+    if owner_hidden_req:
+        return OWNER_CHROME_HIDDEN_SECONDARY_ROUTE if usable(OWNER_CHROME_HIDDEN_SECONDARY_ROUTE) else None
 
     if prefer:
         if prefer == OWNER_CHROME_ROUTE:
@@ -366,15 +416,18 @@ def choose_route(
     if sticky and sticky.get("route") and usable(sticky["route"]):
         sticky_route = str(sticky["route"])
         if sticky_route == OWNER_CHROME_ROUTE:
-            if owner_explicit and allow_owner_chrome:
+            if owner_ext_req and allow_owner_chrome:
                 return OWNER_CHROME_ROUTE
+        elif sticky_route == OWNER_CHROME_HIDDEN_SECONDARY_ROUTE:
+            if owner_hidden_req and allow_owner_chrome:
+                return OWNER_CHROME_HIDDEN_SECONDARY_ROUTE
         elif capability != "extension_bridge":
             return sticky_route
 
     if capability == "extension_bridge":
         return OWNER_CHROME_ROUTE if usable(OWNER_CHROME_ROUTE) else None
 
-    # Default isolated routes only: NEVER fall back to owner_chrome_extension.
+    # Optional isolated routes only for default `capability="dom"`: NEVER fall back to owner Chrome.
     for candidate in ("persistent_playwright", "private_cdp", "private_uia"):
         if usable(candidate):
             return candidate
@@ -390,6 +443,7 @@ def route_plan(
     prefer: str | None = None,
     probe_owner_preflight: bool = True,
     owner_chrome_authorized: bool | None = None,
+    profile_dir_name: str = "Profile 1",
 ) -> dict[str, Any]:
     """Compute a live-probed route plan for either 'browser' or 'app' control surface."""
     t0 = time.monotonic()
@@ -400,15 +454,49 @@ def route_plan(
     scopes = set(scope.get("scopes") or ())
     private_browser = (surface == "browser") and (("private_browser" in scopes) or not is_entry_token)
     private_app = (surface == "app") and (("private_app" in scopes) or not is_entry_token)
+    entry_owner_hidden_scope = is_entry_token and ("owner_chrome_hidden" in scopes)
 
-    owner_explicit = (capability == "extension_bridge") or (prefer == OWNER_CHROME_ROUTE)
-    owner_allowed = (not is_entry_token) and (
-        owner_chrome_authorized if owner_chrome_authorized is not None else owner_explicit
+    owner_hidden_explicit = (capability in OWNER_AUTH_HIDDEN_CAPABILITIES) or (prefer == OWNER_CHROME_HIDDEN_SECONDARY_ROUTE)
+    owner_ext_explicit = (capability == "extension_bridge") or (prefer == OWNER_CHROME_ROUTE)
+
+    owner_ext_allowed = (not is_entry_token) and (
+        owner_chrome_authorized if owner_chrome_authorized is not None else owner_ext_explicit
+    )
+    owner_hidden_allowed = (
+        (entry_owner_hidden_scope or not is_entry_token)
+        and (owner_chrome_authorized if owner_chrome_authorized is not None else owner_hidden_explicit)
     )
 
     ext_diag = inspect_extensions_and_companion(read_owner_chrome_prefs=False)
     pw_probe = probe_playwright(hub=hub) if surface == "browser" else {"ok": False, "probe_ms": 0, "reason": "APP_SURFACE"}
     chrome_res = apps.resolve("chrome") if surface == "browser" else {"found": False}
+
+    # Probe primary P0 owner Chrome Profile 1 hidden secondary route only when authorized/requested.
+    if surface != "browser":
+        owner_hidden_probe: dict[str, Any] = {"ok": False, "reason": "APP_SURFACE", "probe_ms": 0}
+        owner_hidden_state = "UNAVAILABLE"
+    elif is_entry_token and not entry_owner_hidden_scope:
+        owner_hidden_probe = {
+            "ok": False,
+            "reason": "the scoped entry lacks owner_chrome_hidden scope",
+            "error_code": "ENTRY_OWNER_CHROME_SCOPE_REQUIRED",
+            "probe_ms": 0,
+        }
+        owner_hidden_state = "UNAVAILABLE"
+    elif not owner_hidden_allowed:
+        owner_hidden_probe = {
+            "ok": False,
+            "reason": "owner Chrome Profile 1 hidden secondary route requires explicit owner-authorized selection",
+            "error_code": "OWNER_CHROME_NOT_AUTHORIZED",
+            "probe_ms": 0,
+        }
+        owner_hidden_state = "UNAVAILABLE"
+    elif probe_owner_preflight:
+        owner_hidden_probe = probe_owner_chrome_hidden_secondary(hub=hub, profile_dir_name=profile_dir_name)
+        owner_hidden_state = "READY" if owner_hidden_probe.get("ok") else "UNAVAILABLE"
+    else:
+        owner_hidden_probe = {"ok": False, "reason": "OWNER_PREFLIGHT_SKIPPED", "probe_ms": 0}
+        owner_hidden_state = "UNAVAILABLE"
 
     if is_entry_token:
         owner_probe = {"ok": False, "reason": "the scoped entry cannot attach to the owner's Chrome", "probe_ms": 0}
@@ -416,10 +504,10 @@ def route_plan(
     elif surface != "browser":
         owner_probe = {"ok": False, "reason": "APP_SURFACE", "probe_ms": 0}
         owner_state = "UNAVAILABLE"
-    elif not owner_allowed:
+    elif not owner_ext_allowed:
         owner_probe = {
             "ok": False,
-            "reason": "owner Chrome requires explicit owner-authorized route selection; isolated hidden routes are default",
+            "reason": "owner Chrome extension route requires explicit owner-authorized selection (adds tab to primary window)",
             "probe_ms": 0,
         }
         owner_state = "UNAVAILABLE"
@@ -452,8 +540,27 @@ def route_plan(
             "probe_ms": 0,
         },
         {
+            "route": OWNER_CHROME_HIDDEN_SECONDARY_ROUTE,
+            "state": owner_hidden_state,
+            "mode": "primary_owner_profile_hidden_secondary",
+            "profile_dir_name": profile_dir_name,
+            "satisfies_owner_profile_auth": True,
+            "auth_inheritance": True,
+            "profile_copied": False,
+            "visible_side_effect_free": True,
+            "hidden_target_supported": bool(owner_hidden_probe.get("hidden_target_supported")),
+            "screenshot_supported": False,
+            "explicit_opt_in_only": True,
+            "error_code": owner_hidden_probe.get("error_code"),
+            "reason": owner_hidden_probe.get("reason") or "verified Chrome 158+ hidden target on Profile 1",
+            "probe_ms": owner_hidden_probe.get("probe_ms", 0),
+        },
+        {
             "route": OWNER_CHROME_ROUTE,
             "state": owner_state,
+            "mode": "owner_chrome_visible_tab_strip",
+            "hidden_secondary_window_supported": False,
+            "visible_tab_strip": True,
             "explicit_opt_in_only": True,
             "reason": owner_probe.get("reason") or "owner Chrome extension relay passed live preflight",
             "probe_ms": owner_probe.get("probe_ms", 0),
@@ -461,22 +568,27 @@ def route_plan(
         {
             "route": "persistent_playwright",
             "state": ("READY" if pw_probe.get("running") else "ELIGIBLE") if pw_usable else "UNAVAILABLE",
+            "mode": "optional_isolated_mode",
+            "satisfies_owner_profile_auth": False,
             "reason": (
-                f"managed isolated Playwright persistent context ({pw_probe.get('playwright_version')})"
+                f"optional isolated headless Playwright persistent context ({pw_probe.get('playwright_version')}); "
+                "does NOT inherit owner Chrome Profile 1 auth"
                 if pw_usable else str(pw_probe.get("reason") or "Playwright managed adapter unavailable")
             ),
             "playwright_version": pw_probe.get("playwright_version"),
-            "authorization": "managed isolated headless Playwright context; no owner profile",
+            "authorization": "optional isolated headless Playwright context; no owner profile",
             "probe_ms": pw_probe.get("probe_ms", 0),
         },
         {
             "route": "private_cdp",
             "state": "ELIGIBLE" if cdp_usable else "UNAVAILABLE",
+            "mode": "optional_isolated_mode",
+            "satisfies_owner_profile_auth": False,
             "reason": (
-                "requires installed Chrome and local app_launch policy"
+                "optional isolated Chrome on private Win32 desktop; does NOT inherit owner Chrome Profile 1 auth"
                 if cdp_usable else "private Chrome executable unavailable or scope missing"
             ),
-            "authorization": "managed private desktop profile, no owner Chrome grant",
+            "authorization": "optional isolated private desktop profile; no owner Chrome Profile 1 access",
             "probe_ms": 0,
         },
         {
@@ -497,16 +609,24 @@ def route_plan(
         capability=capability,
         prefer=prefer,
         sticky=sticky,
-        allow_owner_chrome=owner_allowed,
+        allow_owner_chrome=bool(owner_ext_allowed or owner_hidden_allowed),
     )
 
     fallback_refused_reason: str | None = None
     if selected is None and surface == "browser":
-        if prefer and prefer != OWNER_CHROME_ROUTE:
+        if owner_hidden_explicit:
+            if not owner_hidden_allowed:
+                fallback_refused_reason = "OWNER_CHROME_NOT_AUTHORIZED"
+            else:
+                fallback_refused_reason = (
+                    owner_hidden_probe.get("error_code")
+                    or "OWNER_CHROME_HIDDEN_SECONDARY_UNAVAILABLE_NO_ISOLATED_FALLBACK"
+                )
+        elif prefer and prefer != OWNER_CHROME_ROUTE:
             fallback_refused_reason = "PREFERRED_ROUTE_UNAVAILABLE"
-        elif owner_explicit and not owner_allowed:
+        elif owner_ext_explicit and not owner_ext_allowed:
             fallback_refused_reason = "OWNER_CHROME_NOT_AUTHORIZED"
-        elif owner_explicit:
+        elif owner_ext_explicit:
             fallback_refused_reason = "OWNER_CHROME_UNAVAILABLE"
         elif not pw_usable and not cdp_usable:
             fallback_refused_reason = "ISOLATED_HIDDEN_ROUTES_UNAVAILABLE_NO_OWNER_FALLBACK"
@@ -515,6 +635,8 @@ def route_plan(
         "surface": surface,
         "capability": capability,
         "selected": selected,
+        "primary_owner_auth_route": OWNER_CHROME_HIDDEN_SECONDARY_ROUTE,
+        "isolated_substitution_forbidden": True,
         "routes": routes,
         "health_probed": True,
         "probe_ms": int((time.monotonic() - t0) * 1000),

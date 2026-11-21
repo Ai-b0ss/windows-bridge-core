@@ -27,6 +27,8 @@ RISK_CLASSES: dict[str, dict[str, Any]] = {
                            "about": "the agent's own tabs, hidden windows, processes, temporary files"},
     "browser_own_tabs":   {"default": "allow", "grantable": True,  "scope": None,
                            "about": "navigate, read and act inside the agent's own background tabs"},
+    "owner_chrome_hidden_secondary": {"default": "ask", "grantable": True, "scope": None,
+                           "about": "open and drive windowless hidden targets inside the owner's already-running Chrome Profile 1 via loopback CDP (inherits owner auth; zero cookie copy, zero visible side effects)"},
     "browser_script":     {"default": "ask",   "grantable": True,  "scope": None,
                            "about": "run arbitrary JavaScript in the agent's own tab"},
     "project_write":      {"default": "ask",   "grantable": True,  "scope": "paths",

@@ -22,7 +22,8 @@ ORPHAN_TTL_SECONDS = 1800.0
 JOURNAL_KEEP_SECONDS = 14 * 86400.0
 AUDIT_KEEP_ROWS = 50000
 RESOURCE_KINDS = frozenset({
-    "browser_tab", "window", "process", "terminal", "file", "directory", "app_session", "connection", "custom",
+    "browser_tab", "owner_chrome_hidden_target", "window", "process", "terminal",
+    "file", "directory", "app_session", "connection", "custom",
 })
 
 _SCHEMA = """

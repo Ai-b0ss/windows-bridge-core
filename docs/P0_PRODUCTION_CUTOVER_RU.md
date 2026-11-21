@@ -11,9 +11,10 @@
 Переключение устраняет следующие подтверждённые дефекты эксплуатации:
 
 1. **Split-brain контуров runtime:** консолидация всех сервисов (`39073` Primary Bridge, `39076` Prelogin Bridge, `39090` Shared Agent Hub, Browser Hub `ff_browser_hub.mjs` и всех MCP-клиентов AGY / Claude Desktop / Codex / Cursor / OpenCode) на **единый проверенный 40-символьный Git SHA** и **единый чистый корень `playwright-core 1.65.1`**.
-2. **Защита от тихого отката после перезагрузки:** переход от ручной правки `$agent` в `ff_win_v3_keeper.ps1` к атомарному проверенному указателю `<BRIDGE_ROOT>\state\active-release.json` (`schema: ff-bridge-active-release/v1`), который хранитель проверяет по SHA-256 манифеста и каждого файла перед запуском.
-3. **Достоверное происхождение релизов (`release-manifest.json` / `installed-runtime-manifest.json`):** исключение устаревших предковых коммитов (`c034e527...`, `abd6666...`, `8f510489...`) и принудительная проверка реального 40-символьного Git SHA.
-4. **Гигиена безопасности Playwright (`coreBundle.js`):** замена локально пропатченного `bridge-v3\node_modules\playwright-core\lib\coreBundle.js` (отладочный `writeFileSync` URL/токена в `pw_connect_url.txt`) на чистый закреплённый `playwright-core 1.65.1` и ротация токена расширения Chrome **только с явного подтверждения владельца**.
+2. **Основной скрытый owner-auth маршрут браузера (`owner_chrome_profile1_hidden_secondary`):** скрытый windowless-контекст внутри **уже запущенного Google Chrome (`Profile 1`)** с наследованием авторизованных сессий, без копирования профиля/cookies, без видимых окон/вкладок и с жёстким fail-closed при нарушении предусловий — с чётким отделением от дополнительного изолированного режима (`managed_browser` / `private_browser`) и видимой группы вкладок расширения (`browser` / `owner_chrome_extension`).
+3. **Защита от тихого отката после перезагрузки:** переход от ручной правки `$agent` в `ff_win_v3_keeper.ps1` к атомарному проверенному указателю `<BRIDGE_ROOT>\state\active-release.json` (`schema: ff-bridge-active-release/v1`), который хранитель проверяет по SHA-256 манифеста и каждого файла перед запуском.
+4. **Достоверное происхождение релизов (`release-manifest.json` / `installed-runtime-manifest.json`):** исключение устаревших предковых коммитов (`c034e527...`, `abd6666...`, `8f510489...`) и принудительная проверка реального 40-символьного Git SHA.
+5. **Гигиена безопасности Playwright (`coreBundle.js`):** замена локально пропатченного `bridge-v3\node_modules\playwright-core\lib\coreBundle.js` (отладочный `writeFileSync` URL/токена в `pw_connect_url.txt`) на чистый закреплённый `playwright-core 1.65.1` и ротация токена расширения Chrome **только с явного подтверждения владельца**.
 
 ---
 
@@ -107,7 +108,34 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
 
 ---
 
-## 4. Шаг 3 — Согласованная очистка устаревшего debug-патча Playwright и ротация токена (ТОЛЬКО с подтверждения владельца)
+## 4. Шаг 3 — Включение основного маршрута `owner_chrome_profile1_hidden_secondary` (только с явного opt-in владельца)
+
+Основной P0-маршрут для авторизованной работы в уже открытом Chrome владельца реализован модулем `runtime/bridge-v3/cua_owner_chrome_secondary.py` и подключён через Hub (`op: "owner_chrome_hidden"`, класс риска `owner_chrome_hidden_secondary`, явный opt-in `/agent/v1` scope `owner_chrome_hidden` и MCP-инструменты).
+
+### 4.1 Обязательные предусловия и механизм работы
+1. **Google Chrome `158+` (`>= 158.0.8127.2`)** с уже открытым окном нужного профиля **`Profile 1`**.
+2. **Явный локальный opt-in владельца в Chrome:** открыть `chrome://inspect/#remote-debugging` в рабочем Chrome и включить loopback browser-level remote debugging (только `127.0.0.1`, без запуска второго процесса `chrome.exe` на том же `User Data` и без копирования каких-либо файлов профиля или cookies).
+3. **Требование единого активного `defaultBrowserContextId` (`Profile 1`):**
+   - Механизм `Target.createTarget({url: "about:blank", hidden: true})` + `Emulation.setDeviceMetricsOverride(1280x800)` привязывается к `defaultBrowserContextId` запущенного Chrome.
+   - Если в Chrome одновременно активен другой профиль (например, `Default`) или более одного профильного контекста, модуль гарантированно завершается **fail-closed** с ошибкой `OWNER_CHROME_PROFILE_CONTEXT_MISMATCH`.
+4. **Гарантии незаметности и fail-closed:**
+   - **0** новых Win32 HWND, **0** записей на панели задач, **0** новых вкладок в полосе вкладок основного окна владельца, **0** перехватов фокуса и курсора.
+   - Полное наследование авторизации `Profile 1` (`HttpOnly` cookies + `localStorage`) без повторного логина и без копирования профиля (`OWNER_PROFILE_COPY_FORBIDDEN`, `SECOND_CHROME_PROCESS_SAME_PROFILE_FORBIDDEN`).
+   - Скриншоты на windowless hidden target не имеют композиторной поверхности ОС и честно отклоняются fail-closed с кодом `HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED`.
+   - Закрытие целей выполняется через `Target.closeTarget` с подтверждением исчезновения `target_id` в `Target.getTargets`; при неподтверждённом закрытии цель удерживается в SQLite (`forget_unconfirmed: false`, `TARGET_CLEANUP_UNCONFIRMED`, `resources_retained > 0`).
+   - Если Chrome не запущен, версия ниже `158.0.8127.2` или `chrome://inspect/#remote-debugging` выключен, маршрут завершается **fail-closed** (`OWNER_CHROME_NOT_RUNNING`, `OWNER_CHROME_VERSION_UNSUPPORTED`, `OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE`) **без молчаливой подмены** другим маршрутом.
+
+### 4.2 Строгое разделение трёх браузерных режимов (запрет молчаливого fallback)
+
+| Режим / маршрут | Назначение | Наследование auth `Profile 1` | Видимые окна / вкладки | Молчаливый fallback из `owner_chrome_profile1_hidden_secondary` |
+|---|---|---|---|---|
+| **Основной:** `owner_chrome_profile1_hidden_secondary` (`owner_chrome_hidden`) | Авторизованные сайты в уже открытом Chrome `Profile 1` через windowless CDP `hidden: true` | **Да** (без копирования профиля/cookies) | **Нет** (`windowless=true`, 0 HWND, 0 вкладок) | — (fail-closed при недоступности) |
+| **Дополнительный изолированный:** `managed_browser` / `private_browser` (`persistent_playwright` / `private_cdp`) | Отдельный изолированный/персистентный профиль агента для задач без сессии владельца | **Нет** (`satisfies_owner_profile_auth: false`) | **Нет** (headless / Win32 Private Desktop) | **Запрещён** (`isolated_substitution_forbidden: true`) |
+| **Явный видимый extension:** `browser` (`owner_chrome_extension` / `ff_browser_hub.mjs`) | Работа через Playwright Chrome Extension в видимой группе вкладок Chrome | **Да** (через расширение Chrome) | **Да** (`visible_tab_strip: true`, `hidden_secondary_window_supported: false`) | **Запрещён** (`OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT`) |
+
+---
+
+## 5. Шаг 4 — Согласованная очистка устаревшего debug-патча Playwright и ротация токена (ТОЛЬКО с подтверждения владельца)
 
 Аудит зафиксировал, что в legacy-каталоге `<BRIDGE_ROOT>\bridge-v3\node_modules\playwright-core\lib\coreBundle.js` присутствовал локальный отладочный патч `writeFileSync`, записывавший URL подключения расширения (с query-параметром `token`) во внешний файл `pw_connect_url.txt`.
 
@@ -125,7 +153,7 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
 
 ---
 
-## 5. Шаг 4 — Контролируемое переключение (`39073`, `39076`, `39090` и MCP-клиенты)
+## 6. Шаг 5 — Контролируемое переключение (`39073`, `39076`, `39090` и MCP-клиенты)
 
 > Всегда сохраняйте нетронутыми пользовательские файлы состояния: `<BRIDGE_ROOT>\state\chat-permission.json`, `<BRIDGE_ROOT>\state\chat-permission\stop.flag` (никогда не удалять!), `<BRIDGE_ROOT>\bridge-v3\secret`, а также посторонние пользовательские приложения и VPN-клиенты.
 
@@ -153,7 +181,7 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
 
 ---
 
-## 6. Шаг 5 — Верификация после переключения (обязательно)
+## 7. Шаг 6 — Верификация после переключения (обязательно)
 
 Выполните и сохраните результаты следующих проверок:
 
@@ -172,11 +200,12 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
      --playwright-root <PLAYWRIGHT_ROOT> `
      --disk
    ```
-2. **Проверка RPC-методов Bridge (`127.0.0.1:39073`):**
+2. **Проверка RPC-методов Bridge (`127.0.0.1:39073`) и Hub (`127.0.0.1:39090`):**
    - `ping` — подтвердить `ok: true`, новый `pid` и ожидаемый `agent_sha256`.
    - `capabilities` — подтвердить `features.atomic_release_pointer == true` и `features.universal_agent_runtime`.
    - `release_provenance` — подтвердить `ok: true`, `pointer_present: true`, `source_head == <TARGET_SHA>`.
-   - `agent_workflows` — подтвердить наличие `browser_workflow` и `shared_hub_browser_background` в `route_preference`.
+   - `agent_workflows` — подтвердить наличие `browser_workflow` с приоритетным `owner_chrome_profile1_hidden_secondary` (и разделением с дополнительным изолированным режимом и видимой группой вкладок расширения) в `route_preference`.
+   - Hub `owner_chrome_hidden` (`op: "preflight"`, `profile_dir_name: "Profile 1"`) — подтвердить `available: true` при включённом `chrome://inspect/#remote-debugging` на Chrome 158+ с единственным активным контекстом `Profile 1` (или честный fail-closed код без подмены, если опция не включена).
    - `chat_permission_status` и `scope_report` — подтвердить сохранность всех защитных ограничений (`stop.flag`, `OWNER_ACTIVE`, `chat-permission.json`).
 3. **Проверка отсутствия split-brain в живых процессах (`Win32_Process`):**
    - Убедитесь, что `39073`, `39076`, `39090`, Browser Hub и запущенные MCP-адаптеры `ff_hub_mcp.py` исполняются из **одного и того же `<RELEASE_DIR>`**.
@@ -185,7 +214,7 @@ python <CHECKOUT>\tools\cua_cold_rollback_bundle.py verify-kit `
 
 ---
 
-## 7. Шаг 6 — Безопасный откат (Rollback)
+## 8. Шаг 7 — Безопасный откат (Rollback)
 
 ### Вариант A: быстрый атомарный откат через `state\active-release.json` (если предыдущий релиз находится в `runtime-releases`)
 

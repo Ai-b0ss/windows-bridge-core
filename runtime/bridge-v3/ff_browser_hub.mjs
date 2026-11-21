@@ -201,17 +201,20 @@ export async function backgroundCapability(
 ) {
   const required = {chrome: MIN_BACKGROUND_CHROME.join('.'), extension: MIN_BACKGROUND_EXTENSION.join('.'),
     playwright: MIN_BACKGROUND_PLAYWRIGHT.join('.'), already_running: true};
+  // Playwright Extension 0.5.0 relay always creates tabs inside the existing Chrome window
+  // (chrome.tabs.create) and drops newWindow/hidden/windowState -> never a hidden secondary window.
+  const transportFlags = {hidden_secondary_window_supported: false, visible_tab_strip: true};
   try {
     const verified = await preflight();
     const runtime = runtimeLoader(playwrightRoot);
     if (!runtime.backgroundSupported) throw new HubError('BACKGROUND_MODE_UNSUPPORTED');
-    return {available: true, live_verified: false, token_checked: false, required,
+    return {available: true, live_verified: false, token_checked: false, ...transportFlags, required,
       chrome_versions: verified.chrome_versions, extension_version: verified.extension_version, playwright_version: runtime.version};
   } catch (error) {
     const reason = error.code || 'BACKGROUND_PREFLIGHT_UNAVAILABLE';
     // The only supported remedy for an older Chrome is the owner's own ordinary update and
     // relaunch. The Hub never updates, restarts or reconfigures the owner's browser.
-    return {available: false, live_verified: false, token_checked: false, required, reason, fallback: null,
+    return {available: false, live_verified: false, token_checked: false, ...transportFlags, required, reason, fallback: null,
       ...(reason === 'BACKGROUND_CONNECT_UNSAFE' ? {remedy: 'OWNER_CHROME_UPDATE_AND_RELAUNCH', automatic: false} : {})};
   }
 }
@@ -231,9 +234,27 @@ export function loadPlaywright(root) {
   }
 }
 
+function wantsHiddenSecondaryWindow(args = {}) {
+  if (!args || typeof args !== 'object') return false;
+  const mode = String(args.window_mode ?? args.windowMode ?? args.route_mode ?? args.routeMode ?? args.route ?? '').trim().toLowerCase();
+  return args.invisible_required === true || args.invisibleRequired === true ||
+    args.hidden_secondary === true || args.hiddenSecondary === true ||
+    args.new_window_hidden === true || args.newWindowHidden === true ||
+    mode === 'hidden_secondary' || mode === 'owner_chrome_profile1_hidden_secondary';
+}
+
 // The default connector: the official extension transport. Tests inject their own.
 export function extensionConnector({playwrightRoot, profileDirName, clientName = 'FF Bridge agents', background = true,
-  preflight = backgroundChromePreflight, runtimeLoader = loadPlaywright, profileBindingFile = null}) {
+  preflight = backgroundChromePreflight, runtimeLoader = loadPlaywright, profileBindingFile = null,
+  invisible_required = false, hidden_secondary = false, new_window_hidden = false}) {
+  if (wantsHiddenSecondaryWindow({invisible_required, hidden_secondary, new_window_hidden})) {
+    throw new HubError(
+      'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT',
+      'Playwright Extension relay creates tabs inside the existing Chrome window and cannot create an invisible secondary window',
+      {transport: 'playwright-extension', hidden_secondary_window_supported: false, visible_tab_strip: true,
+        isolated_fallback: false, attempted: false, retry_safe: false},
+    );
+  }
   const runtime = runtimeLoader(playwrightRoot);
   if (background && !runtime.backgroundSupported)
     throw new HubError('BACKGROUND_MODE_UNSUPPORTED', 'this Playwright cannot keep owner Chrome tabs in the background',
@@ -241,6 +262,7 @@ export function extensionConnector({playwrightRoot, profileDirName, clientName =
   let binding = null;
   return {
     describe: () => ({transport: 'playwright-extension', playwright: runtime.version, background,
+      hidden_secondary_window_supported: false, visible_tab_strip: true,
       owner_profile: binding?.profile || profileDirName || 'last-used', profile_pinned: Boolean(binding), isolated_profile: false}),
     async connect() {
       if (!process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN)
@@ -882,11 +904,32 @@ export class BrowserHub {
     }
   }
 
+  _rejectUnsupportedHiddenSecondary(args) {
+    if (!wantsHiddenSecondaryWindow(args)) return;
+    const routeInfo = this.connector.describe?.() || {};
+    if (routeInfo.hidden_secondary_window_supported === true) return;
+    throw new HubError(
+      'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT',
+      'Playwright Extension relay creates tabs inside the existing Chrome window and cannot create an invisible secondary window; use browser-level CDP owner_chrome_profile1_hidden_secondary instead',
+      {
+        transport: routeInfo.transport || 'playwright-extension',
+        hidden_secondary_window_supported: false,
+        visible_tab_strip: true,
+        isolated_fallback: false,
+        attempted: false,
+        retry_safe: false,
+      },
+    );
+  }
+
   // ---- public operations ---------------------------------------------------------------
   status() {
     const at = this.clock();
+    const route = this.connector.describe();
     return {version: VERSION, pid: process.pid, stopping: this.stopping, connected: Boolean(this.connection?.browser.isConnected()),
-      connection_generation: this.generation, route: this.connector.describe(),
+      connection_generation: this.generation, route,
+      hidden_secondary_window_supported: route?.hidden_secondary_window_supported === true,
+      visible_tab_strip: route?.visible_tab_strip !== false,
       circuit_open: at < this.circuitOpenUntil, retry_after_ms: Math.max(0, Math.max(this.circuitOpenUntil, this.nextAttemptAt) - at),
       consecutive_failures: this.failures, last_error: this.lastError,
       tabs: {live: [...this.tabs.values()].filter(tab => tab.state === 'live').length,
@@ -898,9 +941,15 @@ export class BrowserHub {
       limits: this.limits, stats: {...this.stats, uptime_ms: at - this.stats.started_at}};
   }
 
-  async connect() { await this._ensureConnected(); return this.status(); }
+  async connect(args = {}) {
+    this._rejectUnsupportedHiddenSecondary(args);
+    await this._ensureConnected();
+    return this.status();
+  }
 
-  async tabOpen({owner, url}) {
+  async tabOpen(args = {}) {
+    this._rejectUnsupportedHiddenSecondary(args);
+    const {owner, url} = args;
     const tab = await this._openPage(owner, url || null, {});
     return this._describe(tab);
   }
@@ -1210,7 +1259,7 @@ export class BrowserHub {
   dispatch(op, args = {}) {
     switch (op) {
       case 'status': return this.status();
-      case 'connect': return this.connect();
+      case 'connect': return this.connect(args);
       case 'tab_open': return this.tabOpen(args);
       case 'tab_list': return this.tabList(args);
       case 'tab_close': return this.tabClose(args);

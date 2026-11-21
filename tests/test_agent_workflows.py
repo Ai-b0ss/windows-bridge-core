@@ -41,11 +41,24 @@ class TestAgentWorkflowManifest(unittest.TestCase):
     def test_shared_hub_isolated_hidden_browser_default_and_mandatory_cleanup(self):
         data = agent_workflows()
         browser = data["browser_workflow"]
-        self.assertEqual(browser["preferred_route"], "shared_hub.isolated_hidden_browser")
-        self.assertEqual(browser["default_ops"], ["managed_browser", "private_browser"])
-        self.assertEqual(browser["default_isolation"], "isolated_hidden_profile")
-        self.assertTrue(browser["owner_chrome_route"]["explicit_selection_required"])
-        self.assertIs(browser["owner_chrome_route"]["silent_fallback_from_hidden"], False)
+        self.assertEqual(browser["preferred_route"], "shared_hub.owner_chrome_profile1_hidden_secondary")
+        primary = browser["primary_owner_auth_route"]
+        self.assertEqual(primary["route"], "owner_chrome_profile1_hidden_secondary")
+        self.assertEqual(primary["hub_op"], "owner_chrome_hidden")
+        self.assertTrue(primary["auth_inheritance"])
+        self.assertTrue(primary["profile_copy_forbidden"])
+        self.assertTrue(primary["second_chrome_process_same_profile_forbidden"])
+        self.assertTrue(primary["zero_visible_side_effects"])
+        self.assertTrue(primary["fail_closed_if_unavailable"])
+        self.assertTrue(primary["silent_fallback_to_isolated_forbidden"])
+        self.assertIs(primary["screenshot_supported"], False)
+        optional_iso = browser["optional_isolated_mode"]
+        self.assertEqual(optional_iso["hub_ops"], ["managed_browser", "private_browser"])
+        self.assertIs(optional_iso["satisfies_primary_p0_owner_chrome_profile1"], False)
+        ext = browser["owner_chrome_visible_tab_route"]
+        self.assertIs(ext["hidden_secondary_window_supported"], False)
+        self.assertTrue(ext["visible_tab_strip"])
+        self.assertTrue(ext["explicit_selection_required"])
         self.assertTrue(browser["background_tabs"])
         self.assertIs(browser["focus_or_foreground_input"], False)
         self.assertEqual(browser["cleanup"]["operation"], "session_close")
@@ -55,14 +68,15 @@ class TestAgentWorkflowManifest(unittest.TestCase):
         )
         self.assertEqual(
             browser["cleanup"]["verify_fields"],
-            ["cleanup_verified", "resources_retained", "browser_tabs_closed"],
+            ["cleanup_verified", "resources_retained", "owner_chrome_hidden_targets_closed", "browser_tabs_closed"],
         )
         self.assertTrue(browser["legacy_fallback"]["never_silently_fallback"])
+        self.assertIn("shared_hub_owner_chrome_profile1_hidden_secondary", data["route_preference"])
         self.assertIn("shared_hub_isolated_hidden_browser", data["route_preference"])
         self.assertIn("shared_hub_browser_background", data["route_preference"])
         self.assertLess(
+            data["route_preference"].index("shared_hub_owner_chrome_profile1_hidden_secondary"),
             data["route_preference"].index("shared_hub_isolated_hidden_browser"),
-            data["route_preference"].index("shared_hub_browser_background"),
         )
 
     def test_advertised_preflight_is_not_assumed_to_be_live_supported(self):

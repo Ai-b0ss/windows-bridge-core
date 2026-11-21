@@ -30,8 +30,10 @@ sys.path.insert(0, str(RUNTIME))
 
 import cua_browser_profiles as profiles  # noqa: E402
 import cua_hidden_chrome as hidden_chrome  # noqa: E402
+import cua_owner_chrome_secondary as owner_secondary  # noqa: E402
 import cua_private_browser as private_browser  # noqa: E402
 import ff_browser_routes as routes_mod  # noqa: E402
+from cua_sidecar_supervisor import _bind_windows_kill_on_close_job, _close_windows_job_handle  # noqa: E402
 from ff_win_process_identity import process_creation_token, process_identity_matches  # noqa: E402
 
 
@@ -1030,6 +1032,577 @@ class RealWindowsPrivateDesktopChromeLiveTests(unittest.TestCase):
             },
             "pass": True,
         })
+
+
+# ---- Part 3: Gate 2A Primary P0 (Owner Chrome Profile 1 Hidden Secondary) ----
+
+class OwnerChromeHiddenSecondaryUnitTests(unittest.TestCase):
+    """Fail-closed unit & route separation tests for primary P0 owner Chrome Profile 1 route."""
+
+    def test_fail_closed_refusals_for_new_window_minimized_spawn_copy_foreground(self):
+        mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(profile_dir_name="Profile 1")
+        with self.assertRaises(owner_secondary.OwnerChromeSecondaryError) as exc:
+            owner_secondary.reject_second_chrome_process_same_profile("synthetic-udd", "Profile 1")
+        self.assertEqual(exc.exception.code, "SECOND_CHROME_PROCESS_SAME_PROFILE_FORBIDDEN")
+
+        for extra, expected_code in (
+            ({"spawn_new_process": True}, "SECOND_CHROME_PROCESS_SAME_PROFILE_FORBIDDEN"),
+            ({"copy_profile": True}, "OWNER_PROFILE_COPY_FORBIDDEN"),
+            ({"foreground": True}, "FOREGROUND_ROUTE_REQUIRED"),
+            ({"new_window": True}, "OWNER_CHROME_NEW_WINDOW_HIDDEN_UNSUPPORTED"),
+            ({"window_state": "minimized"}, "OWNER_CHROME_MINIMIZED_VISIBLE_SIDE_EFFECT_FORBIDDEN"),
+            ({"profile_dir_name": "../escape"}, "OWNER_CHROME_PROFILE_INVALID"),
+        ):
+            with self.subTest(extra=extra), self.assertRaises(owner_secondary.OwnerChromeSecondaryError) as raised:
+                mgr.call("open", {"owner": "agent\x1ftask", **extra})
+            self.assertEqual(raised.exception.code, expected_code)
+
+    def test_fail_closed_missing_cdp_not_running_and_old_chrome_version(self):
+        with tempfile.TemporaryDirectory(prefix="ff-p0-sec-nocdp-") as td:
+            udd = Path(td)
+            mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(
+                profile_dir_name="Profile 1", user_data_dir=udd
+            )
+            with patch.object(owner_secondary, "_is_chrome_running_on_windows", return_value=False):
+                pf_down = mgr.preflight()
+            self.assertFalse(pf_down["ok"])
+            self.assertEqual(pf_down["error_code"], "OWNER_CHROME_NOT_RUNNING")
+
+            with patch.object(owner_secondary, "_is_chrome_running_on_windows", return_value=True):
+                pf_nocdp = mgr.preflight()
+            self.assertFalse(pf_nocdp["ok"])
+            self.assertEqual(pf_nocdp["error_code"], "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE")
+
+            (udd / "DevToolsActivePort").write_text("54321\n/devtools/browser/old\n", encoding="ascii")
+            with patch.object(owner_secondary, "_find_listener_pid_for_port", return_value=1234), \
+                 patch.object(owner_secondary, "_loopback_json_version", return_value={
+                     "Browser": "Chrome/157.0.0.1",
+                     "webSocketDebuggerUrl": "ws://127.0.0.1:54321/devtools/browser/old",
+                 }):
+                pf_old = mgr.preflight()
+            self.assertFalse(pf_old["ok"])
+            self.assertEqual(pf_old["error_code"], "OWNER_CHROME_VERSION_UNSUPPORTED")
+
+    def test_fail_closed_multi_profile_default_context_mismatch(self):
+        with tempfile.TemporaryDirectory(prefix="ff-p0-sec-mp-") as td:
+            udd = Path(td)
+            (udd / "DevToolsActivePort").write_text("54321\n/devtools/browser/mp\n", encoding="ascii")
+            mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(
+                profile_dir_name="Profile 1", user_data_dir=udd
+            )
+
+            # Case 1: Chrome running single profile 'Default' when 'Profile 1' requested -> MISMATCH
+            fake_cdp = Mock()
+            fake_cdp.send.side_effect = [
+                {"browserContextIds": [], "defaultBrowserContextId": "CTX-DEFAULT"},
+                {"targetInfos": [{"type": "page", "targetId": "T1", "browserContextId": "CTX-DEFAULT"}]},
+            ]
+            mgr._cdp = fake_cdp
+            with patch.object(owner_secondary, "_find_listener_pid_for_port", return_value=1234), \
+                 patch.object(owner_secondary, "_loopback_json_version", return_value={
+                     "Browser": "Chrome/158.0.8127.36",
+                     "webSocketDebuggerUrl": "ws://127.0.0.1:54321/devtools/browser/mp",
+                 }), \
+                 patch.object(owner_secondary, "_query_process_cmdline_windows", return_value='"chrome.exe" --profile-directory=Default'):
+                pf_default = mgr.preflight()
+            self.assertFalse(pf_default["ok"])
+            self.assertEqual(pf_default["error_code"], "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH")
+
+            # Case 2: Multiple profile contexts open simultaneously -> ALWAYS MISMATCH (dynamic context shift)
+            fake_cdp2 = Mock()
+            fake_cdp2.send.side_effect = [
+                {"browserContextIds": [], "defaultBrowserContextId": "CTX-DEFAULT"},
+                {"targetInfos": [
+                    {"type": "page", "targetId": "T1", "browserContextId": "CTX-DEFAULT"},
+                    {"type": "page", "targetId": "T2", "browserContextId": "CTX-PROFILE1"},
+                ]},
+            ]
+            mgr._cdp = fake_cdp2
+            with patch.object(owner_secondary, "_find_listener_pid_for_port", return_value=1234), \
+                 patch.object(owner_secondary, "_loopback_json_version", return_value={
+                     "Browser": "Chrome/158.0.8127.36",
+                     "webSocketDebuggerUrl": "ws://127.0.0.1:54321/devtools/browser/mp",
+                 }), \
+                 patch.object(owner_secondary, "_query_process_cmdline_windows", return_value='"chrome.exe" --profile-directory="Profile 1"'):
+                pf_multi = mgr.preflight()
+            self.assertFalse(pf_multi["ok"])
+            self.assertEqual(pf_multi["error_code"], "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH")
+
+    def test_route_plan_primary_owner_auth_never_substitutes_isolated_or_extension(self):
+        with patch.object(routes_mod, "probe_playwright", return_value={"ok": True, "running": True, "playwright_version": "1.65.1", "probe_ms": 1}), \
+             patch.object(routes_mod.apps, "resolve", return_value={"found": True}), \
+             patch.object(routes_mod, "probe_owner_chrome", return_value={"ok": True, "running": True, "probe_ms": 1}), \
+             patch.object(routes_mod, "probe_owner_chrome_hidden_secondary", return_value={
+                 "ok": False, "available": False, "hidden_target_supported": False,
+                 "error_code": "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE",
+                 "reason": "no loopback CDP", "probe_ms": 1,
+             }):
+            plan = routes_mod.route_plan(
+                {"agent_id": "a1", "task_id": "t1"},
+                surface="browser",
+                capability="owner_profile_hidden",
+            )
+            self.assertIsNone(plan["selected"])
+            self.assertTrue(plan["isolated_substitution_forbidden"])
+            self.assertEqual(plan["primary_owner_auth_route"], routes_mod.OWNER_CHROME_HIDDEN_SECONDARY_ROUTE)
+            self.assertEqual(plan["fallback_refused_reason"], "OWNER_CHROME_HIDDEN_SECONDARY_CDP_UNAVAILABLE")
+
+            by_name = {r["route"]: r for r in plan["routes"]}
+            self.assertEqual(by_name["persistent_playwright"]["mode"], "optional_isolated_mode")
+            self.assertFalse(by_name["persistent_playwright"]["satisfies_owner_profile_auth"])
+            self.assertEqual(by_name["private_cdp"]["mode"], "optional_isolated_mode")
+            self.assertFalse(by_name["private_cdp"]["satisfies_owner_profile_auth"])
+            self.assertFalse(by_name["owner_chrome_extension"]["hidden_secondary_window_supported"])
+            self.assertTrue(by_name["owner_chrome_extension"]["visible_tab_strip"])
+
+            # Scoped entry without owner_chrome_hidden scope fails closed
+            scoped_denied = routes_mod.route_plan(
+                {"agent_id": "a1", "task_id": "t1", "scopes": {"private_browser"}},
+                surface="browser",
+                capability="owner_profile_hidden",
+            )
+            self.assertIsNone(scoped_denied["selected"])
+
+        # When primary owner_chrome_profile1_hidden_secondary IS READY -> selected cleanly
+        with patch.object(routes_mod, "probe_playwright", return_value={"ok": True, "running": True, "playwright_version": "1.65.1", "probe_ms": 1}), \
+             patch.object(routes_mod.apps, "resolve", return_value={"found": True}), \
+             patch.object(routes_mod, "probe_owner_chrome_hidden_secondary", return_value={
+                 "ok": True, "available": True, "hidden_target_supported": True,
+                 "error_code": None, "reason": "ready", "probe_ms": 1,
+             }):
+            ready_plan = routes_mod.route_plan(
+                {"agent_id": "a1", "task_id": "t1"},
+                surface="browser",
+                capability="owner_profile_hidden",
+            )
+            self.assertEqual(ready_plan["selected"], routes_mod.OWNER_CHROME_HIDDEN_SECONDARY_ROUTE)
+
+            scoped_ok = routes_mod.route_plan(
+                {"agent_id": "a1", "task_id": "t1", "scopes": {"owner_chrome_hidden"}},
+                surface="browser",
+                capability="owner_profile_hidden",
+            )
+            self.assertEqual(scoped_ok["selected"], routes_mod.OWNER_CHROME_HIDDEN_SECONDARY_ROUTE)
+
+    def test_close_single_target_polls_async_chromium_teardown_and_still_fails_closed(self):
+        mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(profile_dir_name="Profile 1")
+        rec1 = {"tab_id": "hsec-1", "target_id": "TID-1", "owner": "a\x1ft"}
+        mgr._targets["hsec-1"] = rec1
+        # Simulate Chromium listing TID-1 on first 2 polls, then unregistering it on 3rd poll.
+        cdp_ok = Mock()
+        cdp_ok.send.side_effect = [
+            {"success": True},
+            {"targetInfos": [{"targetId": "TID-1"}]},
+            {"targetInfos": [{"targetId": "TID-1"}]},
+            {"targetInfos": []},
+        ]
+        mgr._cdp = cdp_ok
+        res_ok = mgr.call("close_owner", {"owner": "a\x1ft", "forget_unconfirmed": False})
+        self.assertEqual(res_ok["closed"], 1)
+        self.assertEqual(res_ok["unconfirmed"], [])
+        self.assertEqual(res_ok["errors"], [])
+        self.assertNotIn("hsec-1", mgr._targets)
+
+        # Simulate target stuck alive past bounded deadline -> still fails closed & retained!
+        rec2 = {"tab_id": "hsec-2", "target_id": "TID-2", "owner": "a\x1ft"}
+        mgr._targets["hsec-2"] = rec2
+        cdp_stuck = Mock()
+        cdp_stuck.send.side_effect = lambda method, params=None, **kw: (
+            {"success": True} if method == "Target.closeTarget" else {"targetInfos": [{"targetId": "TID-2"}]}
+        )
+        mgr._cdp = cdp_stuck
+        res_stuck = mgr.call("close_owner", {"owner": "a\x1ft", "forget_unconfirmed": False}, timeout=0.2)
+        self.assertEqual(res_stuck["closed"], 0)
+        self.assertEqual(res_stuck["unconfirmed"], ["hsec-2"])
+        self.assertEqual(res_stuck["errors"][0]["code"], "TARGET_CLEANUP_UNCONFIRMED")
+        self.assertIn("hsec-2", mgr._targets)
+
+    def test_close_single_target_polls_boundedly_and_still_fails_closed_if_stuck(self):
+        mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(profile_dir_name="Profile 1")
+        rec1 = {"tab_id": "hsec-race-1", "target_id": "TGT-RACE-1", "owner": "agent\x1ftask"}
+        mgr._targets[rec1["tab_id"]] = rec1
+        fake_cdp = Mock()
+        fake_cdp.send.side_effect = [
+            {"success": True},
+            {"targetInfos": [{"targetId": "TGT-RACE-1"}]},  # still closing on 1st poll
+            {"targetInfos": [{"targetId": "TGT-RACE-1"}]},  # still closing on 2nd poll
+            {"targetInfos": []},                            # gone on 3rd poll
+        ]
+        mgr._cdp = fake_cdp
+        res_ok = mgr.call("close_owner", {"owner": "agent\x1ftask", "forget_unconfirmed": False})
+        self.assertEqual(res_ok["closed"], 1)
+        self.assertEqual(res_ok["unconfirmed"], [])
+        self.assertEqual(res_ok["errors"], [])
+        self.assertNotIn(rec1["tab_id"], mgr._targets)
+
+        # Stuck target that never disappears still fails closed and stays retained!
+        rec2 = {"tab_id": "hsec-stuck-2", "target_id": "TGT-STUCK-2", "owner": "agent\x1ftask"}
+        mgr._targets[rec2["tab_id"]] = rec2
+        fake_cdp2 = Mock()
+        fake_cdp2.send.side_effect = lambda method, params=None, **kw: (
+            {"success": True} if method == "Target.closeTarget" else {"targetInfos": [{"targetId": "TGT-STUCK-2"}]}
+        )
+        mgr._cdp = fake_cdp2
+        res_stuck = mgr._close_single_target(rec2, timeout_s=0.25)
+        self.assertFalse(res_stuck["target_closed_in_browser"])
+        self.assertEqual(res_stuck["error_code"], "TARGET_CLEANUP_UNCONFIRMED")
+        self.assertIn(rec2["tab_id"], mgr._targets)
+
+
+class RealWindowsOwnerChromeProfile1Gate2ALiveTests(unittest.TestCase):
+    """Real Chrome 158+ synthetic Profile 1 Gate 2A live test (disposable private desktop, zero owner touch)."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not _has_interactive_desktop():
+            raise unittest.SkipTest("Interactive Windows desktop unavailable")
+        cls.exe = hidden_chrome.chrome_path()
+        if cls.exe is None:
+            raise unittest.SkipTest("Chrome executable not installed")
+        cls.server, cls.server_thread, cls.base_url = _start_httponly_auth_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "server"):
+            cls.server.shutdown()
+            cls.server.server_close()
+
+    def test_gate2a_real_chrome158_profile1_hidden_secondary_auth_zero_visible_and_fail_closed(self):
+        before_owner = _snapshot_owner_desktop()
+        tmp_dir = tempfile.mkdtemp(prefix="ff-p0-gate2a-p1-")
+        user_data = Path(tmp_dir) / "UserData"
+        user_data.mkdir()
+
+        u32 = ctypes.WinDLL("user32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        u32.CreateDesktopW.argtypes = [wt.LPCWSTR, wt.LPCWSTR, ctypes.c_void_p, wt.DWORD, wt.DWORD, ctypes.c_void_p]
+        u32.CreateDesktopW.restype = wt.HANDLE
+        u32.CloseDesktop.argtypes = [wt.HANDLE]
+        u32.EnumDesktopWindows.argtypes = [wt.HANDLE, ctypes.c_void_p, wt.LPARAM]
+        u32.EnumDesktopWindows.restype = wt.BOOL
+        u32.IsWindowVisible.argtypes = [wt.HWND]
+        u32.IsWindowVisible.restype = wt.BOOL
+        u32.IsIconic.argtypes = [wt.HWND]
+        u32.IsIconic.restype = wt.BOOL
+        u32.GetWindowThreadProcessId.argtypes = [wt.HWND, ctypes.POINTER(wt.DWORD)]
+        u32.GetWindowThreadProcessId.restype = wt.DWORD
+        u32.GetClassNameW.argtypes = [wt.HWND, wt.LPWSTR, ctypes.c_int]
+        u32.GetClassNameW.restype = ctypes.c_int
+        u32.GetWindowRect.argtypes = [wt.HWND, ctypes.POINTER(wt.RECT)]
+        u32.GetWindowRect.restype = wt.BOOL
+        u32.GetWindowLongW.argtypes = [wt.HWND, ctypes.c_int]
+        u32.GetWindowLongW.restype = ctypes.c_long
+        u32.GetWindow.argtypes = [wt.HWND, wt.UINT]
+        u32.GetWindow.restype = wt.HWND
+
+        k32.CreateProcessW.argtypes = [
+            wt.LPCWSTR, wt.LPWSTR, ctypes.c_void_p, ctypes.c_void_p, wt.BOOL, wt.DWORD,
+            ctypes.c_void_p, wt.LPCWSTR, ctypes.POINTER(hidden_chrome._WinStartupInfo),
+            ctypes.POINTER(hidden_chrome._WinProcessInfo),
+        ]
+        k32.CreateProcessW.restype = wt.BOOL
+        k32.ResumeThread.argtypes = [wt.HANDLE]
+        k32.CloseHandle.argtypes = [wt.HANDLE]
+        k32.TerminateJobObject.argtypes = [wt.HANDLE, wt.UINT]
+        k32.WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
+
+        def enum_desktop_chrome(desktop_handle, pid_filter: int) -> list[dict]:
+            found: list[dict] = []
+            cb_type = ctypes.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+
+            @cb_type
+            def cb(hwnd, _):
+                cls_buf = ctypes.create_unicode_buffer(128)
+                u32.GetClassNameW(hwnd, cls_buf, len(cls_buf))
+                if cls_buf.value != "Chrome_WidgetWin_1":
+                    return True
+                pid = wt.DWORD()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if int(pid.value) != pid_filter:
+                    return True
+                rect = wt.RECT()
+                u32.GetWindowRect(hwnd, ctypes.byref(rect))
+                ex = int(u32.GetWindowLongW(hwnd, -20))
+                owner = int(u32.GetWindow(hwnd, 4) or 0)
+                vis = bool(u32.IsWindowVisible(hwnd))
+                ico = bool(u32.IsIconic(hwnd))
+                width = int(rect.right - rect.left)
+                taskbar = vis and (bool(ex & 0x00040000) or (owner == 0 and not (ex & 0x00000080))) and (width > 0 or ico)
+                found.append({"hwnd": int(hwnd), "visible": vis, "iconic": ico, "taskbar": taskbar, "width": width})
+                return True
+
+            u32.EnumDesktopWindows(desktop_handle, cb, 0)
+            return found
+
+        desktop_name = "FFBridge-Gate2A-" + secrets.token_hex(8)
+        desktop = u32.CreateDesktopW(desktop_name, None, None, 0, 0x01FF, None)
+        self.assertTrue(bool(desktop), "CreateDesktopW failed")
+        job = hproc = None
+        mgr = None
+        try:
+            argv = [
+                str(self.exe),
+                "--user-data-dir=" + str(user_data),
+                "--profile-directory=Profile 1",
+                "--remote-debugging-address=127.0.0.1",
+                "--remote-debugging-port=0",
+                "--no-first-run",
+                "--no-default-browser-check",
+                self.base_url + "login",
+            ]
+            cmdline = ctypes.create_unicode_buffer(subprocess.list2cmdline(argv))
+            si = hidden_chrome._WinStartupInfo()
+            si.cb = ctypes.sizeof(hidden_chrome._WinStartupInfo)
+            si.lpDesktop = "winsta0\\" + desktop_name
+            si.dwFlags = 1
+            si.wShowWindow = 4
+            pi = hidden_chrome._WinProcessInfo()
+            created = k32.CreateProcessW(
+                None, cmdline, None, None, False, 0x08000004, None, str(user_data),
+                ctypes.byref(si), ctypes.byref(pi),
+            )
+            self.assertTrue(bool(created), "CreateProcessW for synthetic Profile 1 Chrome failed")
+            hproc = pi.hProcess
+            chrome_pid = int(pi.pid)
+            job = _bind_windows_kill_on_close_job(SimpleNamespace(pid=chrome_pid))
+            k32.ResumeThread(pi.hThread)
+            k32.CloseHandle(pi.hThread)
+
+            # Wait for DevToolsActivePort + Primary Window #1 login cookie to land
+            deadline = time.monotonic() + 20.0
+            while time.monotonic() < deadline:
+                if (user_data / "DevToolsActivePort").is_file() and getattr(self.server, "token", None):
+                    break
+                time.sleep(0.1)
+            self.assertIsNotNone(getattr(self.server, "token", None), "Primary Profile 1 /login did not complete")
+            # Brief settle for localStorage script in Primary Window #1
+            time.sleep(0.6)
+            auth_token = self.server.token  # type: ignore[attr-defined]
+            baseline_windows = enum_desktop_chrome(desktop, chrome_pid)
+            baseline_hwnds = {w["hwnd"] for w in baseline_windows}
+            self.assertGreaterEqual(len(baseline_hwnds), 1)
+
+            # Start 5ms Win32 observer on BOTH synthetic Chrome desktop & owner visible desktop
+            stop_obs = threading.Event()
+            obs_stats = {"samples": 0, "new_hwnds": [], "any_visible": False, "any_taskbar": False, "owner_leaks": []}
+
+            def poll_windows():
+                seen = set()
+                while not stop_obs.is_set():
+                    obs_stats["samples"] += 1
+                    for item in enum_desktop_chrome(desktop, chrome_pid):
+                        if item["hwnd"] not in baseline_hwnds:
+                            if item["hwnd"] not in seen:
+                                seen.add(item["hwnd"])
+                                obs_stats["new_hwnds"].append(item)
+                            if item["visible"] and (item["width"] > 0 or item["iconic"]):
+                                obs_stats["any_visible"] = True
+                            if item["taskbar"]:
+                                obs_stats["any_taskbar"] = True
+                    cur_owner = _snapshot_owner_desktop()
+                    leaks = set(cur_owner["visible_chrome_hwnds"]) - set(before_owner["visible_chrome_hwnds"])
+                    if leaks:
+                        obs_stats["owner_leaks"].extend(sorted(leaks))
+                    time.sleep(0.005)
+
+            obs_thread = threading.Thread(target=poll_windows, daemon=True)
+            obs_thread.start()
+            try:
+                mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(
+                    profile_dir_name="Profile 1",
+                    user_data_dir=user_data,
+                    chrome_pid=chrome_pid,
+                )
+                pf = mgr.preflight()
+                self.assertTrue(pf["ok"], pf)
+                self.assertTrue(pf["profile_context_verified"])
+                self.assertTrue(pf["visible_side_effect_free"])
+                self.assertFalse(pf["screenshot_supported"])
+
+                # Wrong profile request against the SAME live Chrome 158 fails closed!
+                wrong_mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(
+                    profile_dir_name="Default",
+                    user_data_dir=user_data,
+                    chrome_pid=chrome_pid,
+                )
+                wrong_pf = wrong_mgr.preflight()
+                self.assertFalse(wrong_pf["ok"])
+                self.assertEqual(wrong_pf["error_code"], "OWNER_CHROME_PROFILE_CONTEXT_MISMATCH")
+
+                # Open hidden managed secondary target on Profile 1 (zero visible windows/tabs!)
+                opened = mgr.call("open", {"owner": "agent-a\x1ftask-2a", "url": self.base_url + "check"})
+                tab_id = opened["tab_id"]
+                self.assertTrue(opened["hidden"])
+                self.assertTrue(opened["windowless"])
+                self.assertTrue(opened["auth_inherited"])
+                self.assertFalse(opened["profile_copied"])
+                self.assertFalse(opened["visible_window_created"])
+                self.assertFalse(opened["taskbar_window_created"])
+                self.assertFalse(opened["owner_tab_strip_modified"])
+
+                # Prove HttpOnly cookie + localStorage auth inheritance (ZERO cookie/profile copying!)
+                auth_read = mgr.call("read", {"owner": "agent-a\x1ftask-2a", "tab_id": tab_id, "selector": "#auth"})
+                auth_payload = json.loads(auth_read["text"])
+                self.assertIn(f"p1_httponly={auth_token}", auth_payload["server_cookie"])
+                self.assertNotIn(auth_token, auth_payload["doc_cookie"])
+                self.assertEqual(auth_payload["ls_token"], auth_token)
+                self.assertEqual(auth_payload["innerWidth"], 1280)
+                self.assertEqual(auth_payload["innerHeight"], 800)
+
+                # Real DOM observe + fill + click + read on the windowless hidden target
+                obs = mgr.call("observe", {"owner": "agent-a\x1ftask-2a", "tab_id": tab_id})
+                inp_ref = next(c["ref"] for c in obs["controls"] if c.get("id") == "inp")
+                btn_ref = next(c["ref"] for c in obs["controls"] if c.get("id") == "btn")
+                mgr.call("act", {
+                    "owner": "agent-a\x1ftask-2a",
+                    "tab_id": tab_id,
+                    "operation": "fill",
+                    "snapshot": obs["snapshot"],
+                    "ref": inp_ref,
+                    "value": "gate2a-verified",
+                    "postcondition": {"type": "value_equals", "selector": "#inp", "value": "gate2a-verified"},
+                })
+                obs2 = mgr.call("observe", {"owner": "agent-a\x1ftask-2a", "tab_id": tab_id})
+                btn_ref2 = next(c["ref"] for c in obs2["controls"] if c.get("id") == "btn")
+                mgr.call("act", {
+                    "owner": "agent-a\x1ftask-2a",
+                    "tab_id": tab_id,
+                    "operation": "click",
+                    "snapshot": obs2["snapshot"],
+                    "ref": btn_ref2,
+                    "postcondition": {"type": "text_includes", "value": "DONE:gate2a-verified"},
+                })
+
+                # Cross-owner isolation: foreign agent cannot read or close target
+                with self.assertRaises(owner_secondary.OwnerChromeSecondaryError) as foreign:
+                    mgr.call("read", {"owner": "agent-b\x1ftask-other", "tab_id": tab_id})
+                self.assertEqual(foreign.exception.code, "TARGET_NOT_OWNED")
+
+                # Screenshot fails closed cleanly instead of hanging or opening a visible window
+                with self.assertRaises(owner_secondary.OwnerChromeSecondaryError) as shot_err:
+                    mgr.call("screenshot", {"owner": "agent-a\x1ftask-2a", "tab_id": tab_id})
+                self.assertEqual(shot_err.exception.code, "HIDDEN_TARGET_SCREENSHOT_UNSUPPORTED")
+
+                # Clean teardown via close_owner leaves Primary Window #1 completely intact!
+                closed = mgr.call("close_owner", {"owner": "agent-a\x1ftask-2a", "forget_unconfirmed": False})
+                self.assertEqual(closed["closed"], 1)
+                self.assertEqual(closed["unconfirmed"], [])
+                self.assertEqual(closed["errors"], [])
+                self.assertTrue(closed["primary_window_untouched"])
+                self.assertEqual(mgr.call("list", {"owner": "agent-a\x1ftask-2a"})["tabs"], [])
+            finally:
+                stop_obs.set()
+                obs_thread.join(timeout=2.0)
+
+            # Assert ZERO visible/taskbar/owner-desktop side effects across entire 5ms observation window!
+            self.assertGreater(obs_stats["samples"], 20)
+            self.assertEqual(obs_stats["new_hwnds"], [])
+            self.assertFalse(obs_stats["any_visible"])
+            self.assertFalse(obs_stats["any_taskbar"])
+            self.assertEqual(obs_stats["owner_leaks"], [])
+            # Primary Window #1 still alive on synthetic desktop
+            after_primary_windows = enum_desktop_chrome(desktop, chrome_pid)
+            self.assertTrue(baseline_hwnds.issubset({w["hwnd"] for w in after_primary_windows}))
+
+            after_owner = _snapshot_owner_desktop()
+            self.assertEqual(
+                set(after_owner["visible_chrome_hwnds"]) - set(before_owner["visible_chrome_hwnds"]),
+                set(),
+            )
+            self.assertEqual(after_owner["foreground_hwnd"], before_owner["foreground_hwnd"])
+
+            _record_live_evidence("gate2a_owner_chrome_profile1_hidden_secondary", {
+                "engine": "chrome158_owner_profile1_hidden_target_cdp",
+                "chrome_version": pf["chrome_version"],
+                "profile_dir_name": "Profile 1",
+                "profile_verified_by": pf["profile_verified_by"],
+                "httponly_cookie_inherited": True,
+                "localstorage_inherited": True,
+                "profile_copied": False,
+                "observer_5ms_samples": obs_stats["samples"],
+                "new_hwnds_count": len(obs_stats["new_hwnds"]),
+                "any_new_visible_window": obs_stats["any_visible"],
+                "any_new_taskbar_window": obs_stats["any_taskbar"],
+                "owner_desktop_leaks": len(obs_stats["owner_leaks"]),
+                "wrong_profile_mismatch_code": wrong_pf["error_code"],
+                "screenshot_fail_closed_code": shot_err.exception.code,
+                "close_owner_closed": closed["closed"],
+                "close_owner_unconfirmed": closed["unconfirmed"],
+                "primary_window_intact": True,
+                "pass": True,
+            })
+        finally:
+            if mgr is not None:
+                mgr.shutdown(close_targets=True)
+            if job:
+                k32.TerminateJobObject(job, 1)
+                if hproc:
+                    k32.WaitForSingleObject(hproc, 5000)
+                    k32.CloseHandle(hproc)
+                _close_windows_job_handle(job)
+            if desktop:
+                u32.CloseDesktop(desktop)
+            time.sleep(0.3)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _start_httponly_auth_server() -> tuple[ThreadingHTTPServer, threading.Thread, str]:
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_GET(self):
+            cookie = self.headers.get("Cookie", "")
+            if self.path == "/login":
+                token = "p1-httponly-" + secrets.token_hex(6)
+                self.server.token = token  # type: ignore[attr-defined]
+                html = f"""<!doctype html><title>Primary Profile 1</title><body>
+<div id="status">LOGGED_IN:{token}</div>
+<script>localStorage.setItem('p1_ls', {json.dumps(token)});</script></body>""".encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Set-Cookie", f"p1_httponly={token}; Path=/; Max-Age=3600; HttpOnly; SameSite=Lax")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            if self.path.startswith("/check"):
+                html = f"""<!doctype html><title>Gate 2A Hidden Check</title><body>
+<input id="inp" type="text" value="" />
+<button id="btn" onclick="document.getElementById('out').textContent='DONE:' + document.getElementById('inp').value">Submit</button>
+<div id="out">WAIT</div>
+<pre id="auth"></pre>
+<script>
+  document.getElementById('auth').textContent = JSON.stringify({{
+    server_cookie: {json.dumps(cookie)},
+    doc_cookie: document.cookie,
+    ls_token: localStorage.getItem('p1_ls'),
+    innerWidth: window.innerWidth,
+    innerHeight: window.innerHeight,
+  }});
+</script></body>""".encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
+            self.send_response(404)
+            self.end_headers()
+
+    class QuietServer(ThreadingHTTPServer):
+        def handle_error(self, request, client_address):
+            exc = sys.exc_info()[1]
+            if isinstance(exc, (ConnectionResetError, ConnectionAbortedError, BrokenPipeError)):
+                return
+            super().handle_error(request, client_address)
+
+    srv = QuietServer(("127.0.0.1", 0), Handler)
+    srv.token = None  # type: ignore[attr-defined]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    return srv, thread, f"http://127.0.0.1:{srv.server_port}/"
 
 
 def _record_live_evidence(section: str, payload: dict) -> None:

@@ -21,6 +21,7 @@ SCHEMA = "ff-agent-entry-v1"
 BASE_OPS = {"capabilities", "route_plan", "session_open", "session_status",
             "session_heartbeat", "session_close", "request_status", "task_cancel", "audit_read"}
 SCOPES = {
+    "owner_chrome_hidden": {"owner_chrome_hidden"},
     "private_browser": {"private_browser", "managed_browser"},
     "private_app": {"app_discover", "app_open", "app_windows", "app_observe",
                     "app_find", "app_act", "app_capture", "app_document", "app_close"},
@@ -30,8 +31,14 @@ SCOPES = {
 BROWSER_COMMANDS = ("open", "info", "close", "tabs", "tab_open", "tab_close", "navigate",
                     "observe", "snapshot", "read", "act", "upload", "download_prepare", "download_read", "screenshot")
 READ_ONLY = {"info", "tabs", "observe", "snapshot", "read", "download_read", "screenshot"}
+OWNER_CHROME_HIDDEN_COMMANDS = ("preflight", "status", "open", "list", "navigate", "observe", "read", "act", "screenshot", "close")
+OWNER_CHROME_HIDDEN_READ_ONLY = {"preflight", "status", "list", "observe", "read", "screenshot"}
 MUTATIONS = {"session_close", "task_cancel", "resource_claim", "resource_release", "app_open", "app_act", "app_close"}
 FORBIDDEN_BROWSER_ARGS = frozenset({"route", "foreground", "headless", "profile_dir"})
+FORBIDDEN_OWNER_CHROME_HIDDEN_ARGS = frozenset({
+    "route", "foreground", "new_window", "newWindow", "window_state", "windowState",
+    "copy_profile", "spawn_new_process", "second_process", "user_data_dir", "cdp_endpoint",
+})
 SAFE_APPS = DEFAULT_SAFE_APPS
 LOCK_KINDS = {"custom", "file", "directory"}
 GRANT_ID = re.compile(r"eg-[0-9a-f]{32}\Z", re.ASCII)
@@ -324,9 +331,17 @@ def route_plan(
     hub: object | None = None,
     capability: str = "dom",
     prefer: str | None = None,
+    profile_dir_name: str = "Profile 1",
 ) -> dict:
     from ff_browser_routes import route_plan as live_route_plan
-    return live_route_plan(scope, surface=surface, hub=hub, capability=capability, prefer=prefer)
+    return live_route_plan(
+        scope,
+        surface=surface,
+        hub=hub,
+        capability=capability,
+        prefer=prefer,
+        profile_dir_name=profile_dir_name,
+    )
 
 
 class EntryArtifacts:
@@ -414,14 +429,19 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op == "capabilities":
         return {"schema": SCHEMA, "http_path": ENTRY_PATH, "mcp_transport": "stdio",
                 "operations": sorted(operations),
+                "owner_chrome_hidden_commands": list(OWNER_CHROME_HIDDEN_COMMANDS) if "owner_chrome_hidden" in operations else [],
                 "browser_commands": list(BROWSER_COMMANDS) if "private_browser" in operations else [],
                 "managed_browser_commands": list(BROWSER_COMMANDS) if "managed_browser" in operations else [],
                 "managed_browser_profile_args": ["profile_id", "profile_name", "persistent_profile"] if "managed_browser" in operations else [],
                 "file_commands": ["list", "put", "read"] if "task_file" in operations else [],
                 "apps": sorted(scope["apps"]), "client_id": scope["client_id"], "agent_id": scope["agent_id"],
                 "task_id": scope["task_id"], "expires_at": scope["expires_at"],
-                "default_browser_route": "isolated_hidden_browser",
-                "owner_chrome_available": False,
+                "primary_owner_auth_route": "owner_chrome_profile1_hidden_secondary",
+                "owner_chrome_hidden_available": "owner_chrome_hidden" in operations,
+                "optional_isolated_mode_available": bool({"managed_browser", "private_browser"} & operations),
+                "default_browser_route": "owner_chrome_profile1_hidden_secondary" if "owner_chrome_hidden" in operations else "isolated_hidden_browser",
+                "owner_chrome_available": "owner_chrome_hidden" in operations,
+                "isolated_substitution_forbidden": True,
                 "silent_playwright_fallback": False,
                 "cleanup_receipt_fields": ["closed", "cleanup_verified", "resources_retained"],
                 "foreground_fallback": False, "automatic_mutation_replay": False}
@@ -432,6 +452,7 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
             hub=hub,
             capability=args.get("capability", "dom"),
             prefer=args.get("prefer"),
+            profile_dir_name=str(args.get("profile_dir_name") or "Profile 1"),
         )
     if op == "session_open":
         if args:
@@ -440,6 +461,9 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op == "audit_read":
         args = {**args, "task_id": scope["task_id"]}
     command = args.get("command")
+    if op == "owner_chrome_hidden" and (
+            command not in OWNER_CHROME_HIDDEN_COMMANDS or FORBIDDEN_OWNER_CHROME_HIDDEN_ARGS & args.keys()):
+        raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)
     if op in {"private_browser", "managed_browser"} and (
             command not in BROWSER_COMMANDS or FORBIDDEN_BROWSER_ARGS & args.keys()):
         raise HubError("ENTRY_BROWSER_COMMAND_DENIED", execution_started=False)
@@ -457,6 +481,7 @@ def entry_call(hub, authority: EntryAuthority, authorization: str, request: dict
     if op in {"resource_claim", "resource_release"} and args.get("kind") not in sorted(LOCK_KINDS):
         raise HubError("ENTRY_LOCK_KIND_DENIED", execution_started=False)
     if (op in MUTATIONS
+            or (op == "owner_chrome_hidden" and command not in OWNER_CHROME_HIDDEN_READ_ONLY)
             or (op in {"private_browser", "managed_browser"} and command not in READ_ONLY)
             or (op == "task_file" and command == "put")
             or (op == "app_document" and command != "read")):

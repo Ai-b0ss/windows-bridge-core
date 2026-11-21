@@ -39,6 +39,11 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ff_hub_apps as apps
+from cua_owner_chrome_secondary import (
+    OwnerChromeHiddenSecondaryManager,
+    OwnerChromeSecondaryError,
+    ROUTE_NAME as OWNER_CHROME_HIDDEN_ROUTE,
+)
 from ff_agent_entry import ENTRY_PATH, SCHEMA as ENTRY_SCHEMA, EntryArtifacts, EntryAuthority, entry_call
 from ff_browser_routes import RouteAffinityStore, route_plan as live_route_plan
 from ff_hub_permissions import RISK_CLASSES, PermissionError_, Policy
@@ -352,6 +357,7 @@ class ManagedBrowserManager(_BaseNodeRpcClient):
 # ---- the hub -----------------------------------------------------------------------------
 class Hub:
     def __init__(self, state_dir: str | Path, *, browser: Any = None, managed_browser: Any = None,
+                 owner_chrome_secondary: Any = None,
                  hidden_factory: Callable[[], Any] | None = None, store: HubStore | None = None,
                  session_ttl: float | None = None, orphan_ttl: float | None = None,
                  maintain_interval: float | None = None):
@@ -392,6 +398,13 @@ class Hub:
         self.managed_browser = managed_browser or ManagedBrowserManager(
             self.state_dir, playwright_root=config.get("playwright_root")
         )
+        self.owner_chrome_secondary = owner_chrome_secondary or OwnerChromeHiddenSecondaryManager(
+            self.state_dir,
+            profile_dir_name=str(config.get("owner_chrome_profile") or config.get("chrome_profile") or "Profile 1"),
+            cdp_endpoint=config.get("owner_chrome_cdp_endpoint"),
+            user_data_dir=config.get("owner_chrome_user_data_dir"),
+        )
+        self.owner_chrome_hidden = self.owner_chrome_secondary
         self.route_affinity = RouteAffinityStore(self.state_dir)
         self._hidden_factory = hidden_factory
         self._hidden: dict[str, Any] = {}
@@ -584,6 +597,126 @@ class Hub:
         url = result.get("url_after") or result.get("url")
         if url and url != resource["meta"].get("url"):
             self.store.update_resource_meta(resource["resource_id"], {**resource["meta"], "url": url})
+        return result
+
+    # ---- owner Chrome Profile 1 hidden secondary target (browser-level loopback CDP) -----
+    def _call_owner_chrome_secondary(self, op: str, args: dict | None = None, *, timeout: float = 30.0) -> dict:
+        try:
+            return self.owner_chrome_secondary.call(op, args or {}, timeout=timeout)
+        except OwnerChromeSecondaryError as exc:
+            raise HubError(exc.code, exc.message, **exc.details) from None
+
+    def _owner_chrome_hidden(self, session: dict, args: dict) -> dict:
+        """Primary owner-auth route: windowless hidden target in already-running Chrome Profile 1."""
+        command = str(args.get("command") or "")
+        if args.get("foreground") is True:
+            raise HubError(
+                "FOREGROUND_ROUTE_REQUIRED",
+                "owner_chrome_hidden never falls back to foreground input; use the guarded Bridge desktop route",
+                execution_started=False,
+                retry_safe=False,
+            )
+        owner = self._owner(session)
+        if command == "preflight":
+            profile_name = args.get("profile_dir_name")
+            payload = {"profile_dir_name": profile_name} if profile_name is not None else {}
+            return self._call_owner_chrome_secondary("preflight", payload)
+        if command == "status":
+            st = self._call_owner_chrome_secondary("status", {})
+            mine = [item["key"] for item in self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target")]
+            return {**st, "my_targets": mine}
+        if command == "list":
+            mine = self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target")
+            live = {item["tab_id"]: item for item in self._call_owner_chrome_secondary("list", {"owner": owner}).get("tabs", [])}
+            return {
+                "route": OWNER_CHROME_HIDDEN_ROUTE,
+                "tabs": [
+                    {
+                        "tab_id": item["key"],
+                        **(
+                            live[item["key"]]
+                            if item["key"] in live
+                            else {"state": "lost", "url": item["meta"].get("url"), "target_id": item["meta"].get("target_id")}
+                        ),
+                    }
+                    for item in mine
+                ],
+            }
+        if command == "open":
+            url = args.get("url")
+            host = urllib.parse.urlsplit(str(url or "")).hostname or ""
+            self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action="owner_chrome_hidden.open")
+            open_payload = {
+                "owner": owner,
+                **{k: v for k, v in args.items() if k != "command"},
+            }
+            tab = self._call_owner_chrome_secondary("open", open_payload)
+            tab_id = tab["tab_id"]
+            try:
+                self.store.claim(
+                    session,
+                    "owner_chrome_hidden_target",
+                    tab_id,
+                    meta={
+                        "url": tab.get("url"),
+                        "target_id": tab.get("target_id"),
+                        "profile_dir_name": tab.get("profile_dir_name"),
+                        "route": OWNER_CHROME_HIDDEN_ROUTE,
+                    },
+                )
+            except BaseException:
+                try:
+                    self._call_owner_chrome_secondary("close", {"owner": owner, "tab_id": tab_id})
+                except Exception:
+                    pass
+                raise
+            self.route_affinity.record(
+                session["agent_id"],
+                session["task_id"],
+                route=OWNER_CHROME_HIDDEN_ROUTE,
+                tab_id=tab_id,
+                target_id=tab.get("target_id"),
+            )
+            return tab
+
+        raw_tab_id = args.get("tab_id") or args.get("target_id")
+        if not isinstance(raw_tab_id, str) or not raw_tab_id:
+            raise HubError("TAB_ID_REQUIRED", execution_started=False)
+        resource = self.store.require_owned(session, "owner_chrome_hidden_target", raw_tab_id)
+        tab_id = resource["key"]
+        base = {"owner": owner, "tab_id": tab_id}
+        if command == "close":
+            result = self._call_owner_chrome_secondary("close", base)
+            if result.get("closed") is False or result.get("target_closed_in_browser") is False:
+                raise HubError(
+                    "TARGET_CLEANUP_UNCONFIRMED",
+                    "owner Chrome hidden target closure could not be verified",
+                    tab_id=tab_id,
+                    target_closed_in_browser=False,
+                    retry_safe=False,
+                )
+            self.store.release(session, resource_id=resource["resource_id"])
+            if not self.store.resources(session_id=session["session_id"], kind="owner_chrome_hidden_target"):
+                self.route_affinity.clear(session["agent_id"], session["task_id"])
+            return result
+        if command == "screenshot":
+            return self._call_owner_chrome_secondary("screenshot", base)
+        host = urllib.parse.urlsplit(str(args.get("url") or resource["meta"].get("url") or "")).hostname or ""
+        self._permit(session, "owner_chrome_hidden_secondary", {"host": host}, action=f"owner_chrome_hidden.{command}")
+        if command == "evaluate":
+            self._permit(session, "browser_script", {"host": host}, action="owner_chrome_hidden.evaluate")
+        if command not in {"navigate", "observe", "read", "act", "evaluate"}:
+            raise HubError(
+                "OWNER_CHROME_HIDDEN_COMMAND_UNSUPPORTED",
+                command=command,
+                commands=["preflight", "status", "open", "list", "navigate", "observe", "read", "act", "evaluate", "screenshot", "close"],
+                execution_started=False,
+            )
+        payload = {**base, **{k: v for k, v in args.items() if k not in {"command", "tab_id", "target_id"}}}
+        result = self._call_owner_chrome_secondary(command, payload)
+        new_url = result.get("url_after") or result.get("url")
+        if isinstance(new_url, str) and new_url and new_url != resource["meta"].get("url"):
+            self.store.update_resource_meta(resource["resource_id"], {**resource["meta"], "url": new_url})
         return result
 
     # ---- GUI applications on a private desktop -------------------------------------------
@@ -910,8 +1043,48 @@ class Hub:
     # ---- cleanup of what a finished session owned ----------------------------------------
     def _cleanup(self, session: dict, held: list[dict]) -> dict:
         owner = self._owner(session)
-        report: dict[str, Any] = {"browser_tabs_closed": 0, "app_sessions_closed": 0, "locks_released": 0, "errors": []}
+        report: dict[str, Any] = {
+            "browser_tabs_closed": 0,
+            "owner_chrome_hidden_targets_closed": 0,
+            "app_sessions_closed": 0,
+            "locks_released": 0,
+            "errors": [],
+        }
         report["errors"].extend(self.io.cleanup(held))
+        held_secondary = [item for item in held if item["kind"] == "owner_chrome_hidden_target"]
+        if held_secondary or getattr(self.owner_chrome_secondary, "running", lambda: False)():
+            secondary_errors_before = len(report["errors"])
+            if getattr(self.owner_chrome_secondary, "running", lambda: False)():
+                try:
+                    known_sec = {tab["tab_id"] for tab in self._call_owner_chrome_secondary("list", {"owner": owner}).get("tabs", [])}
+                    missing_sec = [item["key"] for item in held_secondary if item["key"] not in known_sec]
+                    if missing_sec:
+                        report["errors"].append({
+                            "kind": "owner_chrome_hidden_target",
+                            "code": "TARGET_CLEANUP_UNCONFIRMED",
+                            "tab_ids": missing_sec,
+                        })
+                    closed_sec = self._call_owner_chrome_secondary("close_owner", {"owner": owner, "forget_unconfirmed": False})
+                    report["owner_chrome_hidden_targets_closed"] = int(closed_sec.get("closed") or 0)
+                    if closed_sec.get("unconfirmed"):
+                        report["errors"].append({
+                            "kind": "owner_chrome_hidden_target",
+                            "code": "TARGET_CLEANUP_UNCONFIRMED",
+                            "tab_ids": list(closed_sec["unconfirmed"]),
+                        })
+                    for err in closed_sec.get("errors") or []:
+                        entry = dict(err) if isinstance(err, dict) else {"code": str(err)}
+                        report["errors"].append({"kind": "owner_chrome_hidden_target", **entry})
+                except HubError as exc:
+                    report["errors"].append({"kind": "owner_chrome_hidden_target", "code": exc.code})
+            elif held_secondary:
+                report["errors"].append({
+                    "kind": "owner_chrome_hidden_target",
+                    "code": "OWNER_CHROME_HIDDEN_SECONDARY_NOT_RUNNING",
+                    "tab_ids": [item["key"] for item in held_secondary],
+                })
+            if held_secondary and len(report["errors"]) == secondary_errors_before:
+                self.route_affinity.clear(session["agent_id"], session["task_id"])
         if getattr(self.browser, "running", lambda: True)():
             try:
                 known = {tab["tab_id"] for tab in self.browser.call("tab_list", {"owner": owner})["tabs"]}
@@ -1041,7 +1214,7 @@ class Hub:
         retained_rows = self.store.resources(session_id=session["session_id"])
         retained_ids = {row["resource_id"] for row in retained_rows}
         report["locks_released"] = sum(
-            item["kind"] not in {"browser_tab", "app_session", "terminal"}
+            item["kind"] not in {"browser_tab", "owner_chrome_hidden_target", "app_session", "terminal"}
             and item["resource_id"] not in retained_ids
             for item in held
         )
@@ -1155,6 +1328,17 @@ class Hub:
                 browser_stop(close_tabs=should_close_tabs)
             except TypeError:
                 browser_stop()
+        secondary_shutdown = getattr(self.owner_chrome_secondary, "shutdown", None)
+        if secondary_shutdown:
+            try:
+                held_sec = self.store.resources(kind="owner_chrome_hidden_target")
+            except Exception:
+                held_sec = []
+            should_close_sec = (not bool(held_sec)) if close_tabs is None else bool(close_tabs)
+            try:
+                secondary_shutdown(close_targets=should_close_sec)
+            except TypeError:
+                secondary_shutdown()
 
     # ---- discovery -----------------------------------------------------------------------
     def capabilities(self) -> dict:
@@ -1168,18 +1352,24 @@ class Hub:
                 "maintain_interval_seconds": self._maintain_interval,
             },
             "browser_routes": {
-                "default": "isolated_hidden_browser",
-                "isolated_hidden_ops": ["managed_browser", "private_browser"],
-                "owner_chrome_explicit_op": "browser",
-                "owner_chrome_requires_explicit_selection": True,
+                "primary_owner_auth": OWNER_CHROME_HIDDEN_ROUTE,
+                "primary_owner_auth_op": "owner_chrome_hidden",
+                "primary_owner_auth_requires_cdp_and_default_context": True,
+                "optional_isolated_mode": "isolated_hidden_browser",
+                "optional_isolated_ops": ["managed_browser", "private_browser"],
+                "optional_isolated_satisfies_owner_auth": False,
+                "owner_chrome_visible_tab_op": "browser",
+                "owner_chrome_visible_tab_hidden_secondary_supported": False,
+                "isolated_substitution_forbidden": True,
                 "silent_playwright_fallback": False,
             },
-            "purpose": "shared infrastructure for every agent on this PC: sessions, ownership, isolated hidden browsers, "
-                       "explicit owner's Chrome, private desktops for GUI apps, permissions, brokered secrets, recovery",
+            "purpose": "shared infrastructure for every agent on this PC: sessions, ownership, owner Chrome Profile 1 hidden secondary targets, "
+                       "optional isolated hidden browsers, explicit visible-tab owner Chrome extension, private desktops for GUI apps, permissions, brokered secrets, recovery",
             "quickstart": [
                 "session_open {agent_id, task_id} -> keep session_id, session_secret, resume_token",
                 "send session_id and session_secret with every other call; any call is a heartbeat",
-                "route_plan {surface:'browser'} -> default isolated hidden browser (managed_browser / private_browser); browser (owner Chrome) is explicit only",
+                "route_plan {surface:'browser', capability:'owner_profile_hidden'} -> primary owner Chrome Profile 1 hidden secondary target (owner_chrome_hidden, fail-closed if CDP/Profile 1 default context unavailable; NEVER silently substitutes isolated profile)",
+                "optional isolated mode (no owner auth): managed_browser or private_browser; explicit visible-tab extension mode: browser",
                 "app_discover {app} -> routes; app_open {app} -> app_id; app_observe / app_act; app_close",
                 "give every mutating call a stable request_key; after a lost reply ask request_status, never repeat blindly",
                 "PERMISSION_REQUIRED means: tell the owner once; do not look for another way round",
@@ -1187,16 +1377,27 @@ class Hub:
             ],
             "operations": {
                 "capabilities": {"session": False}, "hub_status": {"session": False},
-                "route_plan": {"session": False, "args": {"surface": "browser|app", "capability": "dom|extension_bridge|download?", "prefer": "str?"}},
+                "route_plan": {"session": False, "args": {"surface": "browser|app", "capability": "owner_profile_hidden|dom|extension_bridge|download?", "prefer": "str?", "profile_dir_name": "str?"}},
                 "session_open": {"session": False, "args": {"agent_id": "str", "task_id": "str", "resume_token": "str?"}},
+                "owner_chrome_hidden": {
+                    "route": OWNER_CHROME_HIDDEN_ROUTE,
+                    "primary_owner_auth": True,
+                    "mutating": "open/navigate/act/evaluate/close",
+                    "request_key_required": True,
+                    "risk_class": "owner_chrome_hidden_secondary",
+                    "commands": ["preflight", "status", "open", "list", "navigate", "observe", "read", "act", "evaluate", "screenshot", "close"],
+                    "transport": "Chrome >=158 browser-level loopback CDP Target.createTarget({hidden:true}) inside already-running owner Chrome Profile 1; zero cookie copy; zero visible HWNDs/taskbar/tab-strip side effects; screenshot unsupported; fail-closed if CDP or Profile 1 defaultBrowserContextId unavailable",
+                },
                 "private_browser": {"mutating": "all except info/tabs/observe/read/screenshot/download_read", "request_key_required": True,
+                    "optional_isolated_mode": True, "satisfies_owner_profile_auth": False,
                     "commands": ["open", "close", "tabs", "tab_open", "tab_close", "navigate", "observe", "read", "act", "upload", "download_prepare", "download_read", "screenshot", "evaluate"],
                     "optional_open_args": list(PRIVATE_BROWSER_OPEN_ARGS),
-                    "transport": "owned Chrome on private Windows Desktop; CDP broker; Hub durable receipts"},
+                    "transport": "optional isolated owned Chrome on private Windows Desktop; CDP broker; Hub durable receipts"},
                 "managed_browser": {"mutating": "all except status/info/tabs/observe/snapshot/read/screenshot/download_read", "request_key_required": True,
+                    "optional_isolated_mode": True, "satisfies_owner_profile_auth": False,
                     "commands": ["status", "open", "close", "info", "tabs", "tab_open", "tab_close", "navigate", "observe", "snapshot", "read", "act", "upload", "download_prepare", "download_read", "screenshot", "evaluate"],
                     "optional_open_args": list(MANAGED_BROWSER_OPEN_ARGS),
-                    "transport": "isolated headless Playwright persistent context; optional named persistent profile; sticky task affinity; Hub durable receipts"},
+                    "transport": "optional isolated headless Playwright persistent context; named isolated profile; sticky task affinity; Hub durable receipts"},
                 "app_document": {"commands": ["read", "replace", "save"], "document": "exact path bound at app_open", "mutating": "replace/save"},
                 "session_heartbeat": {}, "session_status": {},
                 "session_close": {"mutating": True, "durable_receipt_after_close": True,
@@ -1268,6 +1469,8 @@ class Hub:
                 "sessions": self.store.sessions(), "private_desktops": len(self._hidden),
                 "browser_manager": {"running": getattr(self.browser, "running", lambda: None)(),
                                     "starts": getattr(self.browser, "starts", None)},
+                "owner_chrome_secondary": {"running": getattr(self.owner_chrome_secondary, "running", lambda: False)(),
+                                           "route": OWNER_CHROME_HIDDEN_ROUTE},
                 "managed_browser": {"running": getattr(self.managed_browser, "running", lambda: None)(),
                                     "starts": getattr(self.managed_browser, "starts", None)},
                 "pending_owner_requests": len(self.store.permission_requests()),
@@ -1379,6 +1582,7 @@ class Hub:
                 hub=self,
                 capability=str(args.get("capability") or "dom"),
                 prefer=args.get("prefer"),
+                profile_dir_name=str(args.get("profile_dir_name") or "Profile 1"),
             )
         if op == "hub_shutdown_idle":
             with self._hidden_lock:
@@ -1423,7 +1627,7 @@ class Hub:
             return journaled(lambda: self._close_session(session)) if request_key is not None else self._close_session(session)
         if op == "resource_claim":
             kind = args.get("kind")
-            if kind in {"browser_tab", "app_session", "terminal"}:
+            if kind in {"browser_tab", "owner_chrome_hidden_target", "app_session", "terminal"}:
                 raise HubError("RESOURCE_KIND_MANAGED", "tabs and app sessions are claimed by opening them")
             if kind in {"file", "directory"}:
                 raw_key = args.get("key")
@@ -1434,7 +1638,7 @@ class Hub:
                                                       meta=args.get("meta") if isinstance(args.get("meta"), dict) else None,
                                                       wait_seconds=args.get("wait_seconds", 0), check_access=check_access))
         if op == "resource_release":
-            managed = {"browser_tab", "app_session", "terminal"}
+            managed = {"browser_tab", "owner_chrome_hidden_target", "app_session", "terminal"}
             resource_id = args.get("resource_id")
             kind = args.get("kind")
             key = args.get("key")
@@ -1503,6 +1707,10 @@ class Hub:
             if args.get("command") in {"open", "navigate", "act", "evaluate", "restore", "close"}:
                 return journaled(lambda: self._browser(session, args))
             return self._browser(session, args)
+        if op == "owner_chrome_hidden":
+            if args.get("command") in {"open", "navigate", "act", "evaluate", "close"}:
+                return journaled(lambda: self._owner_chrome_hidden(session, args))
+            return self._owner_chrome_hidden(session, args)
         if op == "files":
             if args.get("command") == "write":
                 return journaled(lambda: self.io.files(session, args))

@@ -32,7 +32,7 @@ MCP_ADAPTER_VERSION = "1.1.0"
 PUBLIC = {"capabilities", "hub_status", "route_plan"}
 OPS = PUBLIC | {"session_open", "session_resume", "session_heartbeat", "session_status", "session_close", "task_cancel",
                 "resource_claim", "resource_release", "resource_list", "permission_check", "permission_describe",
-                "browser", "private_browser", "managed_browser", "app_discover", "app_open", "app_windows", "app_observe", "app_find",
+                "owner_chrome_hidden", "browser", "private_browser", "managed_browser", "app_discover", "app_open", "app_windows", "app_observe", "app_find",
                 "app_act", "app_capture", "app_document", "app_close", "files", "terminal", "request_status",
                 "audit_read"}
 _PRIVATE_RESULT_KEYS = frozenset({"session_secret", "resume_token", "_mcp_owner", "_mcp_pending"})
@@ -41,8 +41,9 @@ TOOL = {
     "name": "hub",
     "description": (
         "Shared FF Hub: call capabilities or route_plan first, then session_open with a unique task_id. "
-        "Default browser automation uses isolated hidden Chrome (managed_browser or private_browser); "
-        "owner-Chrome extension (browser) is explicit-only and never a silent fallback. "
+        "Primary owner-auth browser route is owner_chrome_hidden (owner_chrome_profile1_hidden_secondary: windowless hidden target inside already-running owner Chrome Profile 1 via loopback CDP; inherits auth with zero cookie copying and zero visible side effects; fail-closed if CDP or Profile 1 default context is unavailable — NEVER silently substitute an isolated profile). "
+        "Optional isolated mode (no owner auth): managed_browser or private_browser. "
+        "Explicit visible-tab extension mode: browser (adds tabs to owner Chrome tab strip; hidden secondary window unsupported). "
         "Use a stable request_key for mutations. After a lost reply call request_status with the same key; "
         "never replay unknown work. Credentials stay private in per-task checkpoints owned by the live MCP process; "
         "concurrent processes cannot hijack an active task_id. Close only your resources with session_close "
@@ -70,20 +71,26 @@ TOOL = {
             },
             "args": {
                 "type": "object",
-                "description": "Operation-specific arguments (command, url, browser_id, tab_id, profile_id, app, path, argv, etc.).",
+                "description": "Operation-specific arguments (command, url, tab_id, profile_dir_name, browser_id, profile_id, app, path, argv, etc.).",
                 "properties": {
-                    "command": {"type": "string", "description": "Sub-command for browser/managed_browser/private_browser/files/terminal/app_document."},
+                    "command": {"type": "string", "description": "Sub-command for owner_chrome_hidden/browser/managed_browser/private_browser/files/terminal/app_document."},
                     "surface": {"type": "string", "enum": ["browser", "app"], "description": "Target surface for route_plan."},
-                    "capability": {"type": "string", "description": "Requested capability for route_plan (dom, extension_bridge, download)."},
+                    "capability": {"type": "string", "description": "Requested capability for route_plan (owner_profile_hidden, dom, extension_bridge, download)."},
                     "prefer": {"type": "string", "description": "Optional preferred route name for route_plan."},
+                    "profile_dir_name": {"type": "string", "description": "Owner Chrome profile directory name (e.g. 'Profile 1') for owner_chrome_hidden/route_plan."},
+                    "viewport": {"type": "object", "properties": {"width": {"type": "integer"}, "height": {"type": "integer"}}, "description": "Emulated {width, height} viewport for owner_chrome_hidden open."},
                     "url": {"type": "string", "description": "Target http(s) URL for browser navigation/open."},
                     "browser_id": {"type": "string", "description": "Owned managed_browser or private_browser identifier."},
-                    "tab_id": {"type": "string", "description": "Owned browser tab identifier."},
+                    "tab_id": {"type": "string", "description": "Owned browser or owner_chrome_hidden target identifier."},
                     "sticky": {"type": "boolean", "description": "Reuse sticky task browser affinity on managed_browser open."},
-                    "profile_id": {"type": "string", "description": "Named isolated persistent profile ID under the Hub persistent-profiles root."},
-                    "profile_name": {"type": "string", "description": "Alias for profile_id on managed_browser/private_browser open."},
-                    "persistent_profile": {"type": "boolean", "description": "Persist isolated test/agent profile across browser restarts."},
+                    "profile_id": {"type": "string", "description": "Named isolated persistent profile ID (optional isolated mode only; never owner Chrome User Data)."},
+                    "profile_name": {"type": "string", "description": "Alias for profile_id on optional isolated managed_browser/private_browser open."},
+                    "persistent_profile": {"type": "boolean", "description": "Persist optional isolated profile across browser restarts."},
                     "action": {"type": "string", "description": "DOM action (click, fill, select, check, uncheck, press)."},
+                    "operation": {"type": "string", "description": "DOM operation alias (fill, click, select) for owner_chrome_hidden/private_browser act."},
+                    "selector": {"type": "string", "description": "CSS selector for owner_chrome_hidden read/act."},
+                    "ref": {"type": "string", "description": "Snapshot element ref for observe/act."},
+                    "snapshot": {"type": "string", "description": "Snapshot token from observe."},
                     "target": {"type": "object", "additionalProperties": True, "description": "Element locator or permission target object."},
                     "value": {"description": "Action value for fill/select."},
                     "postcondition": {"type": "object", "additionalProperties": True, "description": "Observable postcondition for browser/app act."},
@@ -354,15 +361,19 @@ class Adapter:
                         "task_id_location": "arguments.task_id",
                         "credentials": "managed privately; do not pass session credentials in arguments",
                         "checkpoint_ownership": "bound to live MCP process identity; concurrent processes fail closed",
-                        "default_browser_route": "isolated_hidden_browser",
+                        "primary_owner_auth_route": "owner_chrome_profile1_hidden_secondary",
+                        "optional_isolated_mode": "isolated_hidden_browser",
+                        "default_browser_route": "owner_chrome_profile1_hidden_secondary",
                         "owner_chrome_requires_explicit_selection": True,
+                        "isolated_substitution_forbidden": True,
                         "silent_playwright_fallback": False,
                         "disconnect": "sessions persist; explicit session_resume rotates credentials",
                         "cancellation": "accepted Hub work finishes in journal; reconcile request_status",
                         "legacy_unkeyed_operations": ["session_close", "resource_release"],
                     },
                     "quickstart": [
-                        "hub {op:'route_plan', args:{surface:'browser'}} -> isolated hidden browser by default; owner Chrome is explicit only",
+                        "hub {op:'route_plan', args:{surface:'browser', capability:'owner_profile_hidden'}} -> primary owner Chrome Profile 1 hidden secondary target (owner_chrome_hidden; fail-closed if CDP/Profile 1 unavailable; never silently substitutes isolated profile)",
+                        "optional isolated mode (no owner auth): managed_browser / private_browser; explicit visible-tab extension mode: browser",
                         "hub {op:'session_open', task_id:'unique-task', args:{}}",
                         "keep task_id on every task call; agent identity and credentials are fixed by this adapter",
                         "use request_key for mutations; request_status uses args.request_key after a lost reply",

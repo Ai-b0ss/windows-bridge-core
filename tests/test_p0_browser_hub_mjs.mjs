@@ -16,6 +16,7 @@ import {
   BrowserHub,
   HubError,
   backgroundCapability,
+  extensionConnector,
   loadPlaywright,
   resolvePlaywrightRoot,
   verifyPlaywrightCoreBundle,
@@ -647,5 +648,113 @@ test('REAL isolated headless Playwright 1.65.1 browser lifecycle with local 127.
     else process.env.FF_ISOLATED_BROWSER_PROFILE_ROOT = prevRoot;
     await new Promise(resolve => server.close(resolve));
     fs.rmSync(tmpProfileRoot, {recursive: true, force: true});
+  }
+});
+
+test('extension transport declares visible_tab_strip=true, hidden_secondary_window_supported=false and fails closed on strict hidden secondary requests', async () => {
+  // 1. backgroundCapability explicitly declares hidden_secondary_window_supported=false & visible_tab_strip=true
+  const capOk = await backgroundCapability(
+    async () => ({chrome_versions: ['158.0.8127.36'], extension_version: '0.5.0'}),
+    () => ({backgroundSupported: true, version: '1.65.1'}),
+  );
+  assert.equal(capOk.available, true);
+  assert.equal(capOk.hidden_secondary_window_supported, false);
+  assert.equal(capOk.visible_tab_strip, true);
+
+  const capBlocked = await backgroundCapability(
+    async () => { throw new HubError('CHROME_NOT_RUNNING'); },
+    () => ({backgroundSupported: true, version: '1.65.1'}),
+  );
+  assert.equal(capBlocked.available, false);
+  assert.equal(capBlocked.hidden_secondary_window_supported, false);
+  assert.equal(capBlocked.visible_tab_strip, true);
+
+  // 2. extensionConnector.describe() declares flags and constructor refuses strict hidden secondary flags
+  const fakeRuntimeLoader = () => ({
+    version: '1.65.1',
+    backgroundSupported: true,
+    tools: {createBrowserWithInfo: async () => { throw new Error('must not connect'); }},
+  });
+  const extConn = extensionConnector({runtimeLoader: fakeRuntimeLoader});
+  assert.equal(extConn.describe().hidden_secondary_window_supported, false);
+  assert.equal(extConn.describe().visible_tab_strip, true);
+  for (const flag of [{invisible_required: true}, {hidden_secondary: true}, {new_window_hidden: true}]) {
+    assert.throws(
+      () => extensionConnector({runtimeLoader: fakeRuntimeLoader, ...flag}),
+      error => error instanceof HubError &&
+        error.code === 'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT' &&
+        error.details.hidden_secondary_window_supported === false &&
+        error.details.visible_tab_strip === true &&
+        error.details.isolated_fallback === false &&
+        error.details.attempted === false,
+    );
+  }
+
+  // 3. BrowserHub.status() declares flags and tabOpen/connect fail closed BEFORE connecting (0 connect calls!)
+  let connectCalls = 0;
+  const hub = new BrowserHub({
+    describe: () => ({transport: 'playwright-extension', background: true, hidden_secondary_window_supported: false, visible_tab_strip: true}),
+    async connect() { connectCalls++; throw new Error('must not connect'); },
+  });
+  const st = hub.status();
+  assert.equal(st.hidden_secondary_window_supported, false);
+  assert.equal(st.visible_tab_strip, true);
+  for (const args of [
+    {owner: 'agent-1', invisible_required: true},
+    {owner: 'agent-1', hidden_secondary: true},
+    {owner: 'agent-1', new_window_hidden: true},
+    {owner: 'agent-1', window_mode: 'hidden_secondary'},
+    {owner: 'agent-1', route: 'owner_chrome_profile1_hidden_secondary'},
+  ]) {
+    await assert.rejects(
+      hub.tabOpen(args),
+      error => error instanceof HubError &&
+        error.code === 'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT' &&
+        error.details.isolated_fallback === false &&
+        error.details.attempted === false,
+    );
+    await assert.rejects(
+      hub.connect(args),
+      error => error instanceof HubError &&
+        error.code === 'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT',
+    );
+  }
+  assert.equal(connectCalls, 0, 'hub must fail closed BEFORE connecting or opening connect.html/about:blank');
+
+  // 4. PlaywrightEngine.attach() & _connectOwnerExtension() fail closed BEFORE factory() call (0 connect.html / 0 about:blank!)
+  let factoryCalls = 0;
+  const engine = new PlaywrightEngine({}, {
+    createBrowserWithInfo: async () => { factoryCalls++; throw new Error('must not invoke factory'); },
+  });
+  const prevToken = process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+  process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = 'synthetic-unit-test-token-do-not-use-in-prod-9999';
+  try {
+    for (const extra of [
+      {invisible_required: true},
+      {invisibleRequired: true},
+      {hidden_secondary: true},
+      {hiddenSecondary: true},
+      {new_window_hidden: true},
+      {newWindowHidden: true},
+      {window_mode: 'hidden_secondary'},
+      {route_mode: 'owner_chrome_profile1_hidden_secondary'},
+    ]) {
+      await assert.rejects(
+        engine.attach({ownerBrowser: true, ownerTransport: 'extension', ...extra}),
+        error => error instanceof BrowserSidecarError &&
+          error.code === 'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT' &&
+          error.details.hidden_secondary_window_supported === false &&
+          error.details.visible_tab_strip === true &&
+          error.details.isolated_fallback === false &&
+          error.details.attempted === false,
+      );
+    }
+    assert.equal(factoryCalls, 0, 'extension factory must never be called when hidden secondary is requested');
+    const caps = await engine.capabilities({ownerBrowser: true, ownerTransport: 'extension', background: true});
+    assert.equal(caps.hidden_secondary_window_supported, false);
+    assert.equal(caps.visible_tab_strip, true);
+  } finally {
+    if (prevToken === undefined) delete process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN;
+    else process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN = prevToken;
   }
 });

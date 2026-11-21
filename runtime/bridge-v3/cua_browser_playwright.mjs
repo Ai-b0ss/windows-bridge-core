@@ -136,7 +136,31 @@ export class PlaywrightEngine {
     try{return await this.pw.chromium.connect(endpoint,{timeout});}
     catch(error){throw new BrowserSidecarError('OWNER_BROWSER_APPROVED_TRANSPORT_LOST','approved Playwright transport is unavailable',{cause:error?.name??'Error',timeout_ms:timeout});}
   }
+  _wantsHiddenSecondary(options={}){
+    if(!options||typeof options!=='object')return false;
+    const mode=String(options.windowMode??options.window_mode??options.routeMode??options.route_mode??'').trim().toLowerCase();
+    return options.invisibleRequired===true||options.invisible_required===true||
+      options.hiddenSecondary===true||options.hidden_secondary===true||
+      options.newWindowHidden===true||options.new_window_hidden===true||
+      mode==='hidden_secondary'||mode==='owner_chrome_profile1_hidden_secondary';
+  }
+  _rejectExtensionHiddenSecondary(options={}){
+    if(!this._wantsHiddenSecondary(options))return;
+    throw new BrowserSidecarError(
+      'OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT',
+      'Playwright Extension relay drops newWindow/hidden and creates tabs inside the existing Chrome window; strict hidden secondary mode is unsupported on extension transport',
+      {
+        transport:'extension',
+        hidden_secondary_window_supported:false,
+        visible_tab_strip:true,
+        isolated_fallback:false,
+        attempted:false,
+        retry_safe:false,
+      },
+    );
+  }
   async _connectOwnerExtension(options={}){
+    this._rejectExtensionHiddenSecondary(options);
     const token=String(process.env.PLAYWRIGHT_MCP_EXTENSION_TOKEN??'');
     if(!token) throw new BrowserSidecarError('OWNER_BROWSER_EXTENSION_TOKEN_UNAVAILABLE','protected Playwright Extension token was not injected into this process');
     const factory=this.coreTools?.createBrowserWithInfo;
@@ -252,6 +276,7 @@ export class PlaywrightEngine {
     const ownerBrowser=options.ownerBrowser===true||options.ownerMode==='daily-driver';
     if(options.ownerTransport==='extension'){
       if(!ownerBrowser) throw new BrowserSidecarError('OWNER_BROWSER_EXTENSION_MODE_INVALID','extension transport requires ownerBrowser=true or ownerMode=daily-driver');
+      this._rejectExtensionHiddenSecondary(options);
       const extensionConnection=await this._connectOwnerExtension(options);
       const browser=extensionConnection.browser;
       let context=null;
@@ -388,7 +413,7 @@ export class PlaywrightEngine {
     }
     const handle={browser:context.browser?.()??null,context,page,ownedBrowser:true,headless:launchOptions.headless,managedTemporaryProfile:!options.userDataDir,managedProfile,connectionMode:'persistent',ownedPages:new WeakSet(),createdPages:new WeakSet(),crashedPages:new WeakSet(),disconnected:false,contextClosed:false}; this._wireLifecycle(handle); this._markOwned(handle,page,{created:true}); return handle;
   }
-  async capabilities(h){return {physical_input:false,semantic_dom:true,isolated_profile:!h?.ownerBrowser,cdp_attach:true,iframe_semantics:true,tab_ownership:true,external_browser_close_safe:!h?.ownedBrowser,owner_browser:Boolean(h?.ownerBrowser),owner_transport:h?.ownerTransport??null,owner_attach_approval_pending:false,background:Boolean(h?.background),headless:h?.headless===true,managed_temporary_profile:h?.managedTemporaryProfile===true};}
+  async capabilities(h){return {physical_input:false,semantic_dom:true,isolated_profile:!h?.ownerBrowser,cdp_attach:true,iframe_semantics:true,tab_ownership:true,external_browser_close_safe:!h?.ownedBrowser,owner_browser:Boolean(h?.ownerBrowser),owner_transport:h?.ownerTransport??null,owner_attach_approval_pending:false,background:Boolean(h?.background),hidden_secondary_window_supported:false,visible_tab_strip:h?.ownerTransport==='extension',headless:h?.headless===true,managed_temporary_profile:h?.managedTemporaryProfile===true};}
   async _mutationSignature(page){
     const signature=[];
     for(const frame of page.frames()){
