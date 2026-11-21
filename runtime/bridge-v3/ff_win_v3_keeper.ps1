@@ -1,7 +1,26 @@
-param([switch]$ProbeRelayCloud, [switch]$LoadFunctionsOnly)
+param(
+    [switch]$ProbeRelayCloud,
+    [switch]$LoadFunctionsOnly,
+    [string]$BridgeRoot = '',
+    [int]$Port = 0,
+    [int]$MaxLoops = 0,
+    [int]$PollIntervalSeconds = 5,
+    [string]$MutexName = ''
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'SilentlyContinue'
+
+$isCustomBridgeRoot = $false
+if ($BridgeRoot -and $BridgeRoot.Trim()) {
+    $bridgeBase = [IO.Path]::GetFullPath($BridgeRoot.Trim())
+    $isCustomBridgeRoot = $true
+} elseif ($env:FF_KEEPER_BRIDGE_ROOT -and $env:FF_KEEPER_BRIDGE_ROOT.Trim()) {
+    $bridgeBase = [IO.Path]::GetFullPath($env:FF_KEEPER_BRIDGE_ROOT.Trim())
+    $isCustomBridgeRoot = $true
+} else {
+    $bridgeBase = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge'
+}
 
 # ProbeRelayCloud is diagnostic-only and must not contend for keeper ownership
 # or publish keeper.pid. The long-lived mode below retains the named mutex as
@@ -10,10 +29,23 @@ $keeperMutex = $null
 $keeperMutexOwned = $false
 if (-not $ProbeRelayCloud -and -not $LoadFunctionsOnly) {
     try {
-        try {
-            $keeperMutex = [System.Threading.Mutex]::new($false, 'Global\FF-Windows-Bridge-V3-Keeper')
-        } catch {
-            $keeperMutex = [System.Threading.Mutex]::new($false, 'Local\FF-Windows-Bridge-V3-Keeper')
+        if ($MutexName -and $MutexName.Trim()) {
+            $keeperMutex = [System.Threading.Mutex]::new($false, $MutexName.Trim())
+        } elseif ($isCustomBridgeRoot) {
+            $shaAlg = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                $hashBytes = $shaAlg.ComputeHash([Text.Encoding]::UTF8.GetBytes($bridgeBase.ToLowerInvariant()))
+                $rootTag = ([BitConverter]::ToString($hashBytes).Replace('-', '').ToLowerInvariant()).Substring(0, 12)
+            } finally {
+                $shaAlg.Dispose()
+            }
+            $keeperMutex = [System.Threading.Mutex]::new($false, ('Local\FF-Windows-Bridge-V3-Keeper-' + $rootTag))
+        } else {
+            try {
+                $keeperMutex = [System.Threading.Mutex]::new($false, 'Global\FF-Windows-Bridge-V3-Keeper')
+            } catch {
+                $keeperMutex = [System.Threading.Mutex]::new($false, 'Local\FF-Windows-Bridge-V3-Keeper')
+            }
         }
         try {
             $keeperMutexOwned = $keeperMutex.WaitOne(0)
@@ -30,7 +62,14 @@ if (-not $ProbeRelayCloud -and -not $LoadFunctionsOnly) {
     }
 }
 
-$root = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\bridge-v3'
+$root = Join-Path $bridgeBase 'bridge-v3'
+$activeReleasePointerPath = Join-Path $bridgeBase 'state\active-release.json'
+$activeReleaseSchema = 'ff-bridge-active-release/v1'
+$knownStaleCommits = @(
+    'c034e527a77b737b266c3c7df8b8521032be6f8a',
+    'abd6666b1fc630e84debeef961d0b60da9d0e631',
+    '8f5104895aa51212e86bdd9cf2922197ef026210'
+)
 $agent = Join-Path $root 'ff_win_v3_main.py'
 $secretPath = Join-Path $root 'secret'
 $keeperPidPath = Join-Path $root 'keeper.pid'
@@ -38,18 +77,25 @@ $pythonPathFile = Join-Path $root 'python-path.txt'
 $relayEgressPath = Join-Path $root 'relay-egress.txt'
 $relayWatchdogLog = Join-Path $root 'relay-watchdog.log'
 $relayDeviceConfigPath = Join-Path $env:USERPROFILE '.desktop-commander-device\device.json'
-$relayPackageJsonPath = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\commander-runtime\node_modules\@wonderwhy-er\desktop-commander\package.json'
-$relayRuntimePath = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\commander-runtime\node_modules\@wonderwhy-er\desktop-commander\dist\index.js'
+$relayPackageJsonPath = Join-Path $bridgeBase 'commander-runtime\node_modules\@wonderwhy-er\desktop-commander\package.json'
+$relayRuntimePath = Join-Path $bridgeBase 'commander-runtime\node_modules\@wonderwhy-er\desktop-commander\dist\index.js'
 $relayStdoutPath = Join-Path $root 'commander-remote.out.log'
 $relayStderrPath = Join-Path $root 'commander-remote.err.log'
-$continuationsRoot = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\continuations'
+$continuationsRoot = Join-Path $bridgeBase 'continuations'
 $continuationDaemonPidPath = Join-Path $continuationsRoot 'continuation_daemon.pid'
 $continuationDaemon = Join-Path $root 'cua_session_continuation.py'
 $ownerChromeBootstrap = Join-Path $root 'cua_owner_chrome_logon.ps1'
 $runtimeDeployLock = Join-Path $root '.cua-runtime-deploy-lock.json'
 $coldMaintenanceLock = Join-Path $root '.cua-cold-maintenance.lock'
 $coldMaintenanceMaxTtlSeconds = 300
-$port = 39073
+if ($Port -gt 0) {
+    $port = $Port
+} elseif ($env:FF_KEEPER_PORT -and ($env:FF_KEEPER_PORT -match '^\d+$') -and ([int]$env:FF_KEEPER_PORT -gt 0)) {
+    $port = [int]$env:FF_KEEPER_PORT
+} else {
+    $port = 39073
+}
+if ($PollIntervalSeconds -lt 1) { $PollIntervalSeconds = 1 }
 
 if (-not $ProbeRelayCloud -and -not $LoadFunctionsOnly) {
     New-Item -ItemType Directory -Path $root -Force | Out-Null
@@ -65,12 +111,204 @@ function Write-FF3RelayWatchdogLog([string]$Message) {
     } catch {}
 }
 
+function Get-FF3FileSha256([string]$FilePath) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $stream = [IO.File]::OpenRead($FilePath)
+        try {
+            $hash = $sha.ComputeHash($stream)
+            return ([BitConverter]::ToString($hash).Replace('-', '').ToLowerInvariant())
+        } finally {
+            $stream.Dispose()
+        }
+    } finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-FF3BridgePhysicalBase {
+    $full = [IO.Path]::GetFullPath($bridgeBase).TrimEnd('\')
+    try {
+        $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
+        if ($null -ne $item -and $item.PSObject.Properties['Target'] -and $item.Target) {
+            $target = @($item.Target)[0]
+            if ($target) { return [IO.Path]::GetFullPath([string]$target).TrimEnd('\') }
+        }
+    } catch {}
+    return $full
+}
+
+function Test-FF3IsReparsePoint([string]$Path) {
+    try {
+        $attrs = [IO.File]::GetAttributes($Path)
+        return (($attrs -band [IO.FileAttributes]::ReparsePoint) -ne 0)
+    } catch {
+        return $false
+    }
+}
+
+function Test-FF3SafePathWithinBase([string]$BasePhys, [string]$CandidatePath) {
+    try {
+        $baseNorm = [IO.Path]::GetFullPath($BasePhys).TrimEnd('\')
+        $candNorm = [IO.Path]::GetFullPath($CandidatePath).TrimEnd('\')
+        if (-not $candNorm.StartsWith($baseNorm + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            return $false
+        }
+        $rel = $candNorm.Substring($baseNorm.Length + 1)
+        $cursor = $baseNorm
+        foreach ($part in ($rel -split '\\')) {
+            if (-not $part -or $part -eq '.' -or $part -eq '..') { return $false }
+            $cursor = Join-Path $cursor $part
+            if ((Test-Path -LiteralPath $cursor) -and (Test-FF3IsReparsePoint $cursor)) {
+                return $false
+            }
+        }
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+function Test-FF3ActiveReleasePointerPresent {
+    $physBase = Get-FF3BridgePhysicalBase
+    $ptr = Join-Path $physBase 'state\active-release.json'
+    return ((Test-Path -LiteralPath $ptr) -or (Test-FF3IsReparsePoint $ptr))
+}
+
+function Resolve-FF3ActiveRelease {
+    $physBase = Get-FF3BridgePhysicalBase
+    $ptr = Join-Path $physBase 'state\active-release.json'
+    if (-not (Test-Path -LiteralPath $ptr) -and -not (Test-FF3IsReparsePoint $ptr)) {
+        $legacyAgent = Join-Path $root 'ff_win_v3_main.py'
+        return [pscustomobject]@{
+            ok = [bool](Test-Path -LiteralPath $legacyAgent -PathType Leaf)
+            present = $false
+            mode = 'legacy_bridge_v3'
+            error = $null
+            release_dir = $root
+            release_name = 'bridge-v3'
+            source_head = $null
+            release_id = $null
+            agent_path = $legacyAgent
+            hub_path = (Join-Path $root 'ff_hub.py')
+            browser_hub_path = (Join-Path $root 'ff_browser_hub.mjs')
+            continuation_daemon = $continuationDaemon
+            owner_chrome_bootstrap = $ownerChromeBootstrap
+            playwright_root = $null
+        }
+    }
+
+    if (-not (Test-FF3SafePathWithinBase $physBase $ptr) -or -not (Test-Path -LiteralPath $ptr -PathType Leaf)) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_POINTER_UNSAFE' }
+    }
+    try {
+        $pointer = Get-Content -LiteralPath $ptr -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_POINTER_INVALID_JSON' }
+    }
+    if ($null -eq $pointer -or [string]$pointer.schema -cne $activeReleaseSchema) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_SCHEMA_INVALID' }
+    }
+    $sourceHead = [string]$pointer.source_head
+    if ($sourceHead -cnotmatch '^[0-9a-f]{40}$' -or ($knownStaleCommits -contains $sourceHead.ToLowerInvariant())) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_SOURCE_HEAD_INVALID' }
+    }
+    $releaseId = [string]$pointer.release_id
+    $expectedManifestSha = [string]$pointer.manifest_sha256
+    $expectedAgentSha = [string]$pointer.agent_entrypoint_sha256
+    if ($releaseId -cnotmatch '^[0-9a-f]{64}$' -or $expectedManifestSha -cnotmatch '^[0-9a-f]{64}$' -or $expectedAgentSha -cnotmatch '^[0-9a-f]{64}$') {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_HASH_FIELDS_INVALID' }
+    }
+    $relDirRaw = [string]$pointer.release_dir
+    if (-not $relDirRaw -or -not (Test-FF3SafePathWithinBase $physBase $relDirRaw)) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_DIR_UNSAFE' }
+    }
+    $relDir = [IO.Path]::GetFullPath($relDirRaw).TrimEnd('\')
+    if (-not (Test-Path -LiteralPath $relDir -PathType Container)) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_DIR_MISSING' }
+    }
+    $manifestPath = Join-Path $relDir 'installed-runtime-manifest.json'
+    if (-not (Test-FF3SafePathWithinBase $physBase $manifestPath) -or -not (Test-Path -LiteralPath $manifestPath -PathType Leaf)) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_MANIFEST_MISSING' }
+    }
+    $actualManifestSha = Get-FF3FileSha256 $manifestPath
+    if ($actualManifestSha -cne $expectedManifestSha) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_MANIFEST_SHA_MISMATCH' }
+    }
+    try {
+        $manifest = Get-Content -LiteralPath $manifestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_MANIFEST_INVALID_JSON' }
+    }
+    if ([string]$manifest.schema -cne 'cua-runtime-install/v1' -or [string]$manifest.source_head -cne $sourceHead -or [string]$manifest.release_id -cne $releaseId) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_MANIFEST_IDENTITY_MISMATCH' }
+    }
+    $files = @($manifest.files)
+    if ($files.Count -eq 0) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_MANIFEST_FILES_EMPTY' }
+    }
+    $entryName = if ($pointer.PSObject.Properties['agent_entrypoint'] -and $pointer.agent_entrypoint) { [string]$pointer.agent_entrypoint } else { 'ff_win_v3_main.py' }
+    if ($entryName -match '[\\:]' -or $entryName.StartsWith('/') -or ($entryName -split '/' | Where-Object { $_ -in @('', '.', '..') })) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_ENTRYPOINT_UNSAFE' }
+    }
+    $entryTrackedSha = $null
+    foreach ($item in $files) {
+        $targetRel = [string]$item.target
+        $targetSha = [string]$item.sha256
+        if (-not $targetRel -or $targetRel -match '[\\:]' -or $targetRel.StartsWith('/') -or $targetSha -cnotmatch '^[0-9a-f]{64}$') {
+            return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_MANIFEST_ENTRY_INVALID' }
+        }
+        $targetWin = $targetRel -replace '/', '\'
+        $targetFull = Join-Path $relDir $targetWin
+        if (-not (Test-FF3SafePathWithinBase $relDir $targetFull) -or -not (Test-Path -LiteralPath $targetFull -PathType Leaf)) {
+            return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = ('ACTIVE_RELEASE_FILE_MISSING:' + $targetRel) }
+        }
+        if ((Get-FF3FileSha256 $targetFull) -cne $targetSha) {
+            return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = ('ACTIVE_RELEASE_FILE_HASH_MISMATCH:' + $targetRel) }
+        }
+        if ($targetRel -ceq $entryName) {
+            $entryTrackedSha = $targetSha
+        }
+    }
+    if (-not $entryTrackedSha -or $entryTrackedSha -cne $expectedAgentSha) {
+        return [pscustomobject]@{ ok = $false; present = $true; mode = 'active_release_pointer'; error = 'ACTIVE_RELEASE_ENTRYPOINT_HASH_MISMATCH' }
+    }
+
+    $resolvedAgent = Join-Path $relDir ($entryName -replace '/', '\')
+    $resolvedCont = Join-Path $relDir 'cua_session_continuation.py'
+    if (-not (Test-Path -LiteralPath $resolvedCont -PathType Leaf)) { $resolvedCont = $continuationDaemon }
+    $resolvedChrome = Join-Path $relDir 'cua_owner_chrome_logon.ps1'
+    if (-not (Test-Path -LiteralPath $resolvedChrome -PathType Leaf)) { $resolvedChrome = $ownerChromeBootstrap }
+    $pwRoot = $null
+    if ($pointer.PSObject.Properties['playwright_root'] -and $pointer.playwright_root) {
+        $pwRoot = [string]$pointer.playwright_root
+    } elseif (Test-Path -LiteralPath (Join-Path $relDir 'node_modules\playwright-core') -PathType Container) {
+        $pwRoot = $relDir
+    }
+    return [pscustomobject]@{
+        ok = $true
+        present = $true
+        mode = 'active_release_pointer'
+        error = $null
+        release_dir = $relDir
+        release_name = [string]$pointer.release_name
+        source_head = $sourceHead
+        release_id = $releaseId
+        agent_path = $resolvedAgent
+        hub_path = (Join-Path $relDir 'ff_hub.py')
+        browser_hub_path = (Join-Path $relDir 'ff_browser_hub.mjs')
+        continuation_daemon = $resolvedCont
+        owner_chrome_bootstrap = $resolvedChrome
+        playwright_root = $pwRoot
+    }
+}
+
 function Get-FF3Python {
     if (Test-Path -LiteralPath $pythonPathFile -PathType Leaf) {
         $candidate = (Get-Content -LiteralPath $pythonPathFile -Raw).Trim()
         if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) { return $candidate }
     }
-    $portable = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\tools\python-3.13.9-embed\python.exe'
+    $portable = Join-Path $bridgeBase 'tools\python-3.13.9-embed\python.exe'
     if (Test-Path -LiteralPath $portable -PathType Leaf) { return $portable }
     $cmd = Get-Command python.exe -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($cmd) { return $cmd.Source }
@@ -147,14 +385,17 @@ function Test-FF3ContinuationDaemon {
 
 function Start-FF3ContinuationDaemon {
     $python = Get-FF3Python
-    if (-not $python -or -not (Test-Path -LiteralPath $continuationDaemon -PathType Leaf)) { return $false }
+    $resolved = Resolve-FF3ActiveRelease
+    $daemonScript = if ($resolved.ok -and $resolved.continuation_daemon) { $resolved.continuation_daemon } else { $continuationDaemon }
+    if (-not $python -or -not (Test-Path -LiteralPath $daemonScript -PathType Leaf)) { return $false }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $python
-    $psi.Arguments = '"' + $continuationDaemon + '" daemon --interval 2'
+    $psi.Arguments = '"' + $daemonScript + '" daemon --interval 2'
     $psi.WorkingDirectory = $root
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.EnvironmentVariables['FF_BRIDGE_ROOT'] = $bridgeBase
     try { [System.Diagnostics.Process]::Start($psi) | Out-Null; return $true } catch { return $false }
 }
 
@@ -338,15 +579,18 @@ function Test-FF3OwnerChromeSupervisor {
 }
 
 function Invoke-FF3OwnerChromeBootstrap {
-    if (-not (Test-Path -LiteralPath $ownerChromeBootstrap -PathType Leaf)) { return $false }
+    $resolved = Resolve-FF3ActiveRelease
+    $bootstrapScript = if ($resolved.ok -and $resolved.owner_chrome_bootstrap) { $resolved.owner_chrome_bootstrap } else { $ownerChromeBootstrap }
+    if (-not (Test-Path -LiteralPath $bootstrapScript -PathType Leaf)) { return $false }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = 'powershell.exe'
-    $psi.Arguments = '-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $ownerChromeBootstrap + '"'
+    $psi.Arguments = '-NoLogo -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "' + $bootstrapScript + '"'
     $psi.WorkingDirectory = $root
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
+    $psi.EnvironmentVariables['FF_BRIDGE_ROOT'] = $bridgeBase
     try {
         $process = [System.Diagnostics.Process]::Start($psi)
         if (-not $process.WaitForExit(45000)) {
@@ -365,14 +609,24 @@ function Invoke-FF3OwnerChromeBootstrap {
 
 function Get-FF3AgentProcesses {
     try {
-        $escaped = [regex]::Escape($agent)
-        $invocation = '(?i)^\s*(?:"[^"]+"|[^\s"]+)\s+(?:-B\s+)?(?:"' + $escaped + '"|' + $escaped + ')\s+serve(?:\s|$)'
+        $physBase = Get-FF3BridgePhysicalBase
+        $baseCandidates = @(([IO.Path]::GetFullPath($bridgeBase).TrimEnd('\')), $physBase) | Sort-Object -Unique
         $portArgument = '(?i)(?:^|\s)--port\s+' + [regex]::Escape([string]$port) + '(?:\s|$)'
         return @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-            $_.Name -ieq 'python.exe' -and
-            $_.CommandLine -and
-            ($_.CommandLine -match $invocation) -and
-            ($_.CommandLine -match $portArgument)
+            if ($_.Name -ine 'python.exe' -and $_.Name -ine 'pythonw.exe') { return $false }
+            if (-not $_.CommandLine) { return $false }
+            if ($_.CommandLine -notmatch $portArgument) { return $false }
+            $cmdNorm = $_.CommandLine.Replace('/', '\')
+            $matchedBase = $false
+            foreach ($baseDir in $baseCandidates) {
+                $escBase = [regex]::Escape($baseDir)
+                $pattern = '(?i)^\s*(?:"[^"]+"|[^\s"]+)\s+(?:-B\s+)?(?:"' + $escBase + '\\[^"]*ff_win_v3_main\.py"|' + $escBase + '\\[^\s"]*ff_win_v3_main\.py)\s+serve(?:\s|$)'
+                if ($cmdNorm -match $pattern) {
+                    $matchedBase = $true
+                    break
+                }
+            }
+            return $matchedBase
         })
     } catch { throw }
 }
@@ -427,6 +681,13 @@ function Test-FF3AgentStartAllowed {
         Write-FF3RelayWatchdogLog 'agent_restart_suppressed:cold_maintenance_lock'
         return $false
     }
+    if (Test-FF3ActiveReleasePointerPresent) {
+        $resolved = Resolve-FF3ActiveRelease
+        if (-not $resolved.ok) {
+            Write-FF3RelayWatchdogLog ('agent_restart_suppressed:active_release_invalid:' + [string]$resolved.error)
+            return $false
+        }
+    }
     try {
         $existing = @(Get-FF3AgentProcesses)
         if ($existing.Count -gt 0) {
@@ -444,19 +705,41 @@ function Start-FF3Agent {
     if (-not (Test-FF3AgentStartAllowed)) { return $false }
     $python = Get-FF3Python
     if (-not $python) { return $false }
-    if (-not (Test-Path -LiteralPath $agent -PathType Leaf)) { return $false }
+    $resolved = Resolve-FF3ActiveRelease
+    if (-not $resolved.ok) {
+        Write-FF3RelayWatchdogLog ('agent_start_blocked:active_release_invalid:' + [string]$resolved.error)
+        return $false
+    }
+    $targetAgent = [string]$resolved.agent_path
+    $script:agent = $targetAgent
+    if (-not $targetAgent -or -not (Test-Path -LiteralPath $targetAgent -PathType Leaf)) { return $false }
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $python
-    $psi.Arguments = '"' + $agent + '" serve --host 127.0.0.1 --port ' + $port
+    $psi.Arguments = '"' + $targetAgent + '" serve --host 127.0.0.1 --port ' + $port
     $psi.WorkingDirectory = $root
     $psi.UseShellExecute = $false
     $psi.CreateNoWindow = $true
     $psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+    $psi.EnvironmentVariables['FF_BRIDGE_ROOT'] = $bridgeBase
+    $psi.EnvironmentVariables['FF_ACTIVE_RELEASE_DIR'] = [string]$resolved.release_dir
+    if ($resolved.source_head) {
+        $psi.EnvironmentVariables['FF_ACTIVE_RELEASE_HEAD'] = [string]$resolved.source_head
+    }
+    if ($resolved.playwright_root) {
+        $psi.EnvironmentVariables['FF_PLAYWRIGHT_ROOT'] = [string]$resolved.playwright_root
+    }
     @($psi.EnvironmentVariables.Keys) | ForEach-Object {
         $key = [string]$_
         if ($key -eq 'RUNNER_TRACKING_ID' -or $key -like 'GITHUB_*' -or $key -like 'ACTIONS_*') { $psi.EnvironmentVariables.Remove($key) }
     }
-    try { [System.Diagnostics.Process]::Start($psi) | Out-Null; return $true } catch { return $false }
+    try {
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        Write-FF3RelayWatchdogLog ('agent_started:mode=' + [string]$resolved.mode + ':release=' + [string]$resolved.release_name + ':head=' + [string]$resolved.source_head)
+        return $true
+    } catch {
+        Write-FF3RelayWatchdogLog ('agent_start_failed:' + [string]$_.Exception.Message)
+        return $false
+    }
 }
 
 if ($ProbeRelayCloud) {
@@ -496,7 +779,9 @@ try {
 } catch { $lastEgress = $null }
 
 try {
+    $loopIteration = 0
     while ($true) {
+        $loopIteration++
         if ((-not (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf)) -and (-not (Test-FF3ColdMaintenanceLockActive -LockPath $coldMaintenanceLock))) {
             $agentHealthy = Test-FF3Agent
             if ($agentHealthy) {
@@ -573,7 +858,8 @@ try {
                 try { Set-Content -LiteralPath $relayEgressPath -Value $egress -Encoding ASCII } catch {}
             }
         }
-        Start-Sleep -Seconds 5
+        if ($MaxLoops -gt 0 -and $loopIteration -ge $MaxLoops) { break }
+        Start-Sleep -Seconds $PollIntervalSeconds
     }
 } finally {
     try {
