@@ -87,9 +87,11 @@ class HubGateway:
         try:
             # Only this trusted local gateway can add the principal proof.
             # Client-requested proof fields are rejected by request_fields.
-            signed_request = sign_gateway_request(request, self.state_dir)
             (self._starter or ensure_running)(self.state_dir)
             client = (self._client_factory or HubClient)(self.state_dir)
+            # Sign immediately before I/O. A cold-start Hub may take longer
+            # than the attestation TTL to start.
+            signed_request = sign_gateway_request(request, self.state_dir)
             reply = client.raw(signed_request)
         except HubError as exc:
             raise HubGatewayError(exc.code, **exc.details) from None

@@ -94,6 +94,18 @@ class StableClientHubTests(unittest.TestCase):
             "session_id": session["session_id"], "session_secret": session["session_secret"],
         }, signed)
 
+    def test_gateway_signature_is_verified_once_before_owner_lock(self):
+        from unittest.mock import patch
+        from ff_hub_client_identity import verify_gateway_request
+        request = sign_gateway_request({
+            "op": "session_open",
+            "args": {"agent_id": "queue-safe-chat", "task_id": "queue-test"},
+        }, self.path)
+        with patch("ff_hub.verify_gateway_request", wraps=verify_gateway_request) as verify:
+            session = self.hub.dispatch(request)
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(session.get("verified_client_principal"), PRINCIPAL)
+
     def test_two_chat_ids_share_grant_only_with_verified_gateway(self):
         first = self.session("chatgpt-gpt6-owner-browser")
         second = self.session("chatgpt-hidden-browser-verification")

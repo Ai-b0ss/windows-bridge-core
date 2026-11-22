@@ -2348,6 +2348,12 @@ class Hub:
     def dispatch(self, request: dict, *, check_access: Callable | None = None) -> dict:
         if not isinstance(request, dict):
             raise HubError("REQUEST_INVALID")
+        # Verify before waiting on the owner gate: a legitimate request may be
+        # queued behind a long browser action longer than the short proof TTL.
+        try:
+            verified_gateway_principal = verify_gateway_request(request, self.state_dir)
+        except ValueError:
+            raise HubError("GATEWAY_ATTESTATION_INVALID", execution_started=False) from None
         op = request.get("op")
         raw_args = request.get("args")
         args = {} if raw_args is None else raw_args
@@ -2360,7 +2366,7 @@ class Hub:
                   "resource_list", "permission_check", "permission_describe", "secret_list", "audit_read", "app_discover"}:
             if check_access:
                 check_access()
-            return self._dispatch(request)
+            return self._dispatch(request, verified_gateway_principal=verified_gateway_principal)
         if op == "session_open":
             if not isinstance(args.get("agent_id"), str) or not isinstance(args.get("task_id"), str):
                 raise HubError("IDENTITY_INVALID")
@@ -2382,15 +2388,20 @@ class Hub:
         with self._owner_gate(owner):
             if check_access:
                 check_access()
-            return self._dispatch(request, check_access=check_access)
+            return self._dispatch(request, check_access=check_access,
+                                  verified_gateway_principal=verified_gateway_principal)
 
-    def _dispatch(self, request: dict, *, check_access: Callable | None = None) -> dict:
+    def _dispatch(self, request: dict, *, check_access: Callable | None = None,
+                  verified_gateway_principal: str | None = None) -> dict:
         if not isinstance(request, dict):
             raise HubError("REQUEST_INVALID")
-        try:
-            gateway_principal = verify_gateway_request(request, self.state_dir)
-        except ValueError:
-            raise HubError("GATEWAY_ATTESTATION_INVALID", execution_started=False) from None
+        if verified_gateway_principal is not None:
+            gateway_principal = verified_gateway_principal
+        else:
+            try:
+                gateway_principal = verify_gateway_request(request, self.state_dir)
+            except ValueError:
+                raise HubError("GATEWAY_ATTESTATION_INVALID", execution_started=False) from None
         op = request.get("op")
         raw_args = request.get("args")
         args = {} if raw_args is None else raw_args
