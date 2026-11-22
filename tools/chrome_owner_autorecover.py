@@ -66,7 +66,12 @@ def windows_for_owner(pid: int) -> set[int]:
                 result.add(int(hwnd))
         return True
     USER32.EnumWindows(callback,None)
-    return result
+    # A normal browser window has no GW_OWNER. Chrome consent dialogs,
+    # "Restore pages" prompts, and other transient popups are owned by
+    # that browser window and must not be counted as separate helpers.
+    USER32.GetWindow.argtypes=[ctypes.c_void_p,ctypes.c_uint]
+    USER32.GetWindow.restype=ctypes.c_void_p
+    return {hwnd for hwnd in result if not USER32.GetWindow(hwnd,4)}
 
 
 def listener_pid(port:int) -> int|None:
@@ -178,10 +183,20 @@ class Recovery:
             return self.report("OWNER_CHROME_REMOTE_DEBUG_DISABLED")
         status=hub_status(self.hub_state)
         if status is None:return self.report("HUB_UNAVAILABLE")
-        if status.get("owner_chrome_secondary",{}).get("connected"):
-            return self.report("CDP_CONNECTED",hub_pid=status["pid"])
         owners=owner_processes(self.chrome,self.user_data)
         if len(owners)>1:return self.report("MULTIPLE_OWNER_CHROME_PROCESSES")
+        remote=status.get("owner_chrome_secondary",{})
+        if remote.get("connected") and len(owners)==1:
+            current=owners[0]
+            if listener_pid(configured_port(self.user_data))==current.pid:
+                connected_at=remote.get("connected_at")
+                try:
+                    if connected_at is not None and float(connected_at)>=current.create_time()-1:
+                        return self.report("CDP_CONNECTED",hub_pid=status["pid"],chrome_pid=current.pid)
+                except (ValueError,TypeError,psutil.Error):pass
+                return self.report("STALE_CDP_WAIT_FOR_HUB_KEEPALIVE",chrome_pid=current.pid)
+        elif remote.get("connected") and not owners:
+            self.report("CHROME_MISSING_DESPITE_STALE_HUB_STATUS")
         if not owners:
             # User has already enabled Chrome's remote debug toggle. No extra
             # command-line CDP port is needed for the *actual* Default profile.
@@ -198,6 +213,8 @@ class Recovery:
         port=configured_port(self.user_data)
         if listener_pid(port)!=pid:
             return self.report("CDP_PORT_NOT_OWNED_BY_CHROME",chrome_pid=pid,port=port)
+        if remote.get("connected"):
+            return self.report("STALE_CDP_WAIT_FOR_HUB_KEEPALIVE",chrome_pid=pid)
         if windows_for_owner(pid):
             return self.report("CHROME_ALREADY_HAS_WINDOW_WAIT_FOR_WATCHER",pid=pid,port=port)
         if not allow_support:return self.report("CDP_AVAILABLE_AWAITING_NATIVE_CONSENT",pid=pid,port=port)

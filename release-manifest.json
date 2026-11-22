@@ -555,7 +555,7 @@
     "tests/test_chat_consent.py": "3fdb51e2f76660f0606fb40c732ed7e40681095952e12369ad8c5ffd3dc47b21",
     "tests/test_chat_effect_permission.py": "5803d1b23c35b81a3cd8490318fdfaf2dc950fb4ff078c0e950234e14cc83646",
     "tests/test_chat_permission.py": "b93c71e6e563f63fb688816811d08843dbd907defeff9b51fea0596795cf8dff",
-    "tests/test_chrome_owner_autorecover.py": "20bdafd7890c7c36c6be67623ac787ba3454f81e9b948d1d94e2aa6c5a489a6f",
+    "tests/test_chrome_owner_autorecover.py": "7d481b047237859ce3dd868bd5f2c77e83cbc5afdf6ce10d6a910338355d66fa",
     "tests/test_claude_desktop_hidden_route.py": "b1cbf5b0453d1d02a2c1f5c4c90fab6dca95634b124b39a85dd83b5c74ef9bac",
     "tests/test_cli_contracts.py": "85554963e143767cef701deb30369958e906d57a2501c3fa1fa9ad9a1fdc011c",
     "tests/test_cli_discovery_safe_probe.py": "06d7cd0e8e42e859eb4cfb121d7a368fdbf4595001f4f3c2f607131c4d13a32a",

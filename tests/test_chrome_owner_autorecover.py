@@ -38,11 +38,25 @@ class Tests(unittest.TestCase):
         ]
 
     def test_when_connected_never_launch_chrome_or_window(self):
-        with patch.object(mod,"hub_status",return_value={"pid":1234,"owner_chrome_secondary":{"connected":True}}),\
-             patch.object(mod,"owner_processes") as owners,patch.object(mod,"native_support_window") as helper:
+        with patch.object(mod,"hub_status",return_value={"pid":1234,"owner_chrome_secondary":{"connected":True,"connected_at":1001}}),\
+             patch.object(mod,"owner_processes",return_value=[self.owner]),\
+             patch.object(mod,"listener_pid",return_value=self.owner.pid),\
+             patch.object(self.owner,"create_time",return_value=1000,create=True),\
+             patch.object(mod,"native_support_window") as helper:
             result=self.rec.step()
         self.assertEqual(result["code"],"CDP_CONNECTED")
-        owners.assert_not_called()
+        helper.assert_not_called()
+
+    def test_stale_hub_connection_after_chrome_crash_waits_for_keepalive(self):
+        # A Hub can report connected=true for up to one heartbeat interval
+        # after its old Chrome PID has died and a fresh Chrome has appeared.
+        with patch.object(mod,"hub_status",return_value={"pid":1234,"owner_chrome_secondary":{"connected":True,"connected_at":10}}),\
+             patch.object(mod,"owner_processes",return_value=[self.owner]),\
+             patch.object(mod,"listener_pid",return_value=self.owner.pid),\
+             patch.object(self.owner,"create_time",return_value=1000,create=True),\
+             patch.object(mod,"native_support_window") as helper:
+            result=self.rec.step()
+        self.assertEqual(result["code"],"STALE_CDP_WAIT_FOR_HUB_KEEPALIVE")
         helper.assert_not_called()
 
     def test_disabled_remote_debug_fails_closed(self):
