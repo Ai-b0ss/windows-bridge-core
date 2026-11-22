@@ -38,6 +38,96 @@ def _key(state_dir: str | Path) -> bytes | None:
 
 
 
+
+def _write_private_windows_key(path: Path, raw_key: bytes) -> None:
+    """Create a Windows key with a protected DACL before any bytes are written.
+
+    Explicit full access: current Windows user, SYSTEM and Administrators.
+    Other inherited ACEs, including Users and Authenticated Users, are absent.
+    """
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    advapi.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi.OpenProcessToken.restype = wintypes.BOOL
+    advapi.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    advapi.GetTokenInformation.restype = wintypes.BOOL
+    advapi.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD)]
+    advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel.LocalFree.restype = ctypes.c_void_p
+
+    def check(ok: object, action: str) -> None:
+        if not ok:
+            raise OSError(ctypes.get_last_error(), action)
+
+    token = wintypes.HANDLE()
+    check(advapi.OpenProcessToken(kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)), "OpenProcessToken")
+    try:
+        size = wintypes.DWORD()
+        advapi.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        check(size.value > 0, "GetTokenInformation(size)")
+        user_info = ctypes.create_string_buffer(size.value)
+        check(advapi.GetTokenInformation(token, 1, user_info, size, ctypes.byref(size)), "GetTokenInformation(user)")
+        sid = ctypes.c_void_p.from_buffer(user_info).value
+        sid_text = wintypes.LPWSTR()
+        check(advapi.ConvertSidToStringSidW(ctypes.c_void_p(sid), ctypes.byref(sid_text)), "ConvertSidToStringSid")
+        try:
+            sid_string = sid_text.value
+        finally:
+            kernel.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+    finally:
+        kernel.CloseHandle(token)
+
+    # D:P prohibits inherited ACEs from the broad Hub state directory.
+    sddl = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;" + sid_string + ")"
+    security_descriptor = ctypes.c_void_p()
+    check(advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
+        sddl, 1, ctypes.byref(security_descriptor), None
+    ), "ConvertStringSecurityDescriptorToSecurityDescriptorW")
+    class SecurityAttributes(ctypes.Structure):
+        _fields_ = [("nLength", wintypes.DWORD),
+                    ("lpSecurityDescriptor", ctypes.c_void_p),
+                    ("bInheritHandle", wintypes.BOOL)]
+
+    kernel.CreateFileW.argtypes = [
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+        ctypes.POINTER(SecurityAttributes), wintypes.DWORD,
+        wintypes.DWORD, wintypes.HANDLE
+    ]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    attrs = SecurityAttributes(ctypes.sizeof(SecurityAttributes), security_descriptor, False)
+    handle = None
+    try:
+        handle = kernel.CreateFileW(
+            str(path), 0x40000000, 0, ctypes.byref(attrs),
+            1, 0x80, None
+        )
+        invalid = ctypes.c_void_p(-1).value
+        if handle == invalid:
+            error_code = ctypes.get_last_error()
+            if error_code in (80, 183):
+                raise FileExistsError(str(path))
+            raise OSError(error_code, "CreateFileW(private key)")
+        with os.fdopen(msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_BINARY), "w", encoding="ascii") as stream:
+            handle = None  # CRT stream now owns the Windows handle.
+            stream.write(raw_key.hex() + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if handle is not None and handle != ctypes.c_void_p(-1).value:
+            kernel.CloseHandle(handle)
+        kernel.LocalFree(security_descriptor)
+
 def ensure_gateway_key(state_dir: str | Path) -> bool:
     """One-time local Bridge gateway initialization; no request-supplied grants.
 
@@ -53,29 +143,29 @@ def ensure_gateway_key(state_dir: str | Path) -> bool:
         raise ValueError("GATEWAY_KEY_INVALID")
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        key = secrets.token_bytes(32)
+        if os.name == "nt":
+            _write_private_windows_key(path, key)
+        else:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="ascii") as stream:
+                stream.write(key.hex() + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.chmod(path, 0o600)
     except FileExistsError:
         if _key(state_dir) is not None:
             return False
         raise ValueError("GATEWAY_KEY_INVALID") from None
-    try:
-        key = secrets.token_bytes(32)
-        with os.fdopen(fd, "w", encoding="ascii") as stream:
-            stream.write(key.hex() + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
-        if _key(state_dir) is None:
-            raise ValueError("GATEWAY_KEY_NOT_VERIFIED")
     except BaseException:
-        try:
-            path.unlink()
-        except OSError:
-            pass
+        if _key(state_dir) is None and path.exists():
+            try:
+                path.unlink()
+            except OSError:
+                pass
         raise
+    if _key(state_dir) is None:
+        raise ValueError("GATEWAY_KEY_NOT_VERIFIED")
     return True
 
 def _payload(request: dict[str, Any], *, issued_at: int, nonce: str) -> bytes:

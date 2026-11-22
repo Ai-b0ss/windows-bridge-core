@@ -4,6 +4,7 @@ No running Windows, Chrome or installed key is touched.
 """
 from __future__ import annotations
 import json
+import os
 import pathlib
 import sys
 import tempfile
@@ -37,6 +38,32 @@ class KeyBootstrap(unittest.TestCase):
         signed=sign_gateway_request(req,self.root)
         self.assertEqual(verify_gateway_request(signed,self.root),PRINCIPAL)
         self.assertNotIn(PROOF_FIELD,req)
+
+    @unittest.skipUnless(os.name == "nt", "Windows DACL")
+    def test_created_key_has_protected_windows_acl(self):
+        import os
+        import subprocess
+        ensure_gateway_key(self.root)
+        path = str(self.root / KEY_FILENAME).replace("'", "''")
+        ps = (
+            "$a=Get-Acl -LiteralPath '" + path + "';"
+            "$d=@{Protected=$a.AreAccessRulesProtected;"
+            "Entries=@($a.Access|ForEach-Object {"
+            "@{Name=$_.IdentityReference.Value;Inherited=$_.IsInherited;"
+            "Rights=$_.FileSystemRights.ToString()}})};"
+            "$d|ConvertTo-Json -Compress -Depth 5"
+        )
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        acl = json.loads(result.stdout)
+        self.assertTrue(acl["Protected"])
+        entries = acl["Entries"]
+        self.assertEqual(len(entries), 3, entries)
+        self.assertTrue(all(not entry["Inherited"] for entry in entries))
+        self.assertTrue(all(entry["Rights"] == "FullControl" for entry in entries))
 
     def test_invalid_file_is_never_overwritten(self):
         key=self.root/KEY_FILENAME
