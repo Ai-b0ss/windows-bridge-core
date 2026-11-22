@@ -442,7 +442,7 @@
     "runtime/bridge-v3/ff_app_catalog.py": "9767ac29e7fe7e966ee8570b678709c0bcc8674bfc264c7c06097a9d02e12d21",
     "runtime/bridge-v3/ff_browser_hub.mjs": "32b04321f24ddc73f49ef4227ae1db948ef56965db17a782cd754cd1f6d489f1",
     "runtime/bridge-v3/ff_browser_hub.ps1": "66016761b517ccc43a3727fc902620b039e6c7248b37a58e6ed21c80b4149e23",
-    "runtime/bridge-v3/ff_browser_routes.py": "4cd5cccfb46df1414f2b367608f0601194590403e5c7ca1b2493425917465b41",
+    "runtime/bridge-v3/ff_browser_routes.py": "dca0b47fb7ac6a73df3a5f6543cf93d0e6d44481be70258e31106b521dabcd57",
     "runtime/bridge-v3/ff_hub.py": "b81e2a3a11c5af88702d8b041c9d9852847769aa5918f80f189924b3e3a7838f",
     "runtime/bridge-v3/ff_hub_apps.py": "2cbcd3501e14a6c3dc03c4efbcee9699c7f1f72019ef6f44cc5b9ee7e0b81eae",
     "runtime/bridge-v3/ff_hub_client_identity.py": "f1f72e5e4bbf896d8d0736567974b13cabf1f6275f18a7ad0389abdbb5d34434",

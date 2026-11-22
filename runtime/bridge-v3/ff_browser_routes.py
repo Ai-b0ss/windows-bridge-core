@@ -555,13 +555,16 @@ def evaluate_no_interruption_site_read(
     policy = getattr(hub, "policy", None) if hub is not None else None
 
     def _policy_decide(risk_class: str, target: dict[str, Any]) -> dict[str, Any]:
-        if not agent_id:
+        # A verified Bridge gateway can plan before opening an agent session.
+        # A user-supplied agent_id alone never stands in for attestation.
+        policy_subject = scope.get("policy_subject")
+        if not agent_id and not policy_subject:
             return {"decision": "needs_owner", "risk_class": risk_class, "reason": "AGENT_IDENTITY_REQUIRED", "grant_id": None}
         if policy is None or not hasattr(policy, "decide"):
             return {"decision": "needs_owner", "risk_class": risk_class, "reason": "HUB_POLICY_UNAVAILABLE", "grant_id": None}
-        # A Bridge-attested connector principal may share browser grants across
-        # chats while each agent's session, resources, and task IDs remain isolated.
-        policy_subject = scope.get("policy_subject") if risk_class == "owner_chrome_hidden_secondary" else None
+        decide = getattr(hub, "_policy_decide", None)
+        if callable(decide):
+            return dict(decide(policy_subject or agent_id, risk_class, target))
         return dict(policy.decide(policy_subject or agent_id, risk_class, target))
 
     # --- Candidate 1: owner_chrome_profile1_hidden_secondary (strictly invisible windowless CDP) ---
