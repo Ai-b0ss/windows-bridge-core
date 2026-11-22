@@ -47,6 +47,7 @@ from cua_owner_chrome_secondary import (
     valid_url as valid_owner_chrome_url,
 )
 from ff_agent_entry import ENTRY_PATH, SCHEMA as ENTRY_SCHEMA, EntryArtifacts, EntryAuthority, entry_call
+from ff_hub_client_identity import PRINCIPAL as BRIDGE_PRINCIPAL, verify_gateway_request
 from ff_browser_routes import (
     BACKGROUND_TAB_FORM_CAPABILITIES,
     BACKGROUND_TAB_READ_CAPABILITIES,
@@ -596,9 +597,23 @@ class Hub:
         return getattr(self.owner_chrome_secondary, "profile_dir_name", None) or "Profile 1"
 
     # ---- permissions ---------------------------------------------------------------------
+    @staticmethod
+    def _policy_subject(session: dict, risk_class: str) -> str:
+        """A verified gateway principal applies only to explicitly scoped browser grants."""
+        if risk_class in {"owner_chrome_hidden_secondary", "browser_script"}:
+            if session.get("_verified_gateway_principal") == BRIDGE_PRINCIPAL:
+                return BRIDGE_PRINCIPAL
+            # The reserved principal cannot be claimed by choosing its string
+            # as an unauthenticated user-controlled agent_id.
+            return "" if session["agent_id"] == BRIDGE_PRINCIPAL else session["agent_id"]
+        return session["agent_id"]
+
     def _permit(self, session: dict, risk_class: str, target: dict | None = None, *, action: str = "") -> dict:
         target_payload = target or {}
-        decision = self.policy.decide(session["agent_id"], risk_class, target_payload)
+        # Session ownership stays isolated per agent_id/task_id; only browser
+        # permissions can use the authenticated Bridge client principal.
+        subject = self._policy_subject(session, risk_class)
+        decision = self.policy.decide(subject, risk_class, target_payload)
         self.store.audit("permission", agent_id=session["agent_id"], task_id=session["task_id"],
                          session_id=session["session_id"], risk_class=risk_class, action=action,
                          target=target_payload, decision=decision["decision"], reason=decision["reason"],
@@ -922,7 +937,12 @@ class Hub:
 
     # ---- user-facing no-interruption read-only site workflow ------------------------------
     def _scope_for_session(self, session: dict) -> dict[str, Any]:
-        scope: dict[str, Any] = {"agent_id": session["agent_id"], "task_id": session["task_id"]}
+        scope: dict[str, Any] = {
+            "agent_id": "" if session["agent_id"] == BRIDGE_PRINCIPAL else session["agent_id"],
+            "task_id": session["task_id"],
+        }
+        if session.get("_verified_gateway_principal"):
+            scope["policy_subject"] = self._policy_subject(session, "owner_chrome_hidden_secondary")
         grant_id = self.store.entry_grant_id(session["session_id"])
         if grant_id:
             row = self.entry_authority._row(grant_id)
@@ -1112,7 +1132,7 @@ class Hub:
                     )
                     opened_url = str(tab.get("url") or validated_url)
                     opened_host = _extract_url_host(opened_url)
-                    if opened_host and opened_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, opened_host):
+                    if opened_host and opened_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, opened_host):
                         redirect_blocked_host = opened_host
                     else:
                         if read_mode in {"observe", "snapshot"}:
@@ -1124,7 +1144,7 @@ class Hub:
                             content = self._call_owner_chrome_secondary("read", read_args)
                         final_url = str(content.get("url") or opened_url)
                         final_host = _extract_url_host(final_url)
-                        if final_host and final_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, final_host):
+                        if final_host and final_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, final_host):
                             redirect_blocked_host = final_host
                             content = None
                 finally:
@@ -1283,7 +1303,7 @@ class Hub:
                     )
                     opened_url = str(tab.get("url") or validated_url)
                     opened_host = _extract_url_host(opened_url)
-                    if opened_host and opened_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, opened_host):
+                    if opened_host and opened_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, opened_host):
                         redirect_blocked_host = opened_host
                     else:
                         if read_mode in {"snapshot", "observe"}:
@@ -1295,7 +1315,7 @@ class Hub:
                             content = self.browser.call("read", read_args)
                         final_url = str(content.get("url") or opened_url)
                         final_host = _extract_url_host(final_url)
-                        if final_host and final_host != host and not self._host_allowed_for_provider(session["agent_id"], provider, final_host):
+                        if final_host and final_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, final_host):
                             redirect_blocked_host = final_host
                             content = None
                 finally:
@@ -2052,6 +2072,18 @@ class Hub:
             "schema": "ff-agent-hub-capabilities-v1", "hub_version": HUB_VERSION, "pid": os.getpid(),
             "agent_entry": {"schema": ENTRY_SCHEMA, "http_path": ENTRY_PATH, "bind": "loopback",
                             "auth": "locally-issued task-scoped bearer", "mcp_transport": "stdio"},
+            "bridge_client_identity": {
+                "supported": True,
+                "principal": BRIDGE_PRINCIPAL,
+                "proof": "short_lived_local_hmac_bound_to_request",
+                "trusted_gateway_only": True,
+                "principal_separate_from_agent_task": True,
+                "browser_scopes_only": ["owner_chrome_hidden_secondary", "browser_script"],
+                "per_chat_agent_id_still_required": True,
+                "owner_local_provisioning_required": True,
+                "remote_grant_issuance": False,
+                "same_user_windows_is_not_security_isolation": True,
+            },
             "session_timeouts": {
                 "session_ttl_seconds": self.store.session_ttl,
                 "orphan_ttl_seconds": self.store.orphan_ttl,
@@ -2332,6 +2364,8 @@ class Hub:
         if op == "session_open":
             if not isinstance(args.get("agent_id"), str) or not isinstance(args.get("task_id"), str):
                 raise HubError("IDENTITY_INVALID")
+            if args["agent_id"] == BRIDGE_PRINCIPAL:
+                raise HubError("IDENTITY_RESERVED", execution_started=False)
             owner = self._owner(args)
         else:
             allow_closed = op in {"task_cancel", "request_status"} or (
@@ -2353,6 +2387,10 @@ class Hub:
     def _dispatch(self, request: dict, *, check_access: Callable | None = None) -> dict:
         if not isinstance(request, dict):
             raise HubError("REQUEST_INVALID")
+        try:
+            gateway_principal = verify_gateway_request(request, self.state_dir)
+        except ValueError:
+            raise HubError("GATEWAY_ATTESTATION_INVALID", execution_started=False) from None
         op = request.get("op")
         raw_args = request.get("args")
         args = {} if raw_args is None else raw_args
@@ -2365,9 +2403,15 @@ class Hub:
         if op == "hub_status":
             return self.status()
         if op == "route_plan":
-            scope = {"agent_id": args.get("agent_id"), "task_id": args.get("task_id")}
+            supplied_agent = args.get("agent_id")
+            scope = {"agent_id": "" if supplied_agent == BRIDGE_PRINCIPAL else supplied_agent,
+                     "task_id": args.get("task_id")}
+            if gateway_principal:
+                scope["policy_subject"] = gateway_principal
             if request.get("session_id") and request.get("session_secret"):
                 sess = self.store.authenticate(request.get("session_id"), request.get("session_secret"))
+                if gateway_principal:
+                    sess["_verified_gateway_principal"] = gateway_principal
                 scope = self._scope_for_session(sess)
             default_profile = self.configured_owner_chrome_profile()
             cap = str(args.get("capability") or "dom")
@@ -2446,8 +2490,11 @@ class Hub:
             with self._hidden_lock:
                 if self._stopping:
                     raise HubError("HUB_STOPPING", execution_started=False)
-                return self.store.open_session(args.get("agent_id"), args.get("task_id"),
-                                               resume_token=args.get("resume_token"), note=args.get("note"))
+                reply = self.store.open_session(args.get("agent_id"), args.get("task_id"),
+                                                resume_token=args.get("resume_token"), note=args.get("note"))
+                if gateway_principal:
+                    reply["verified_client_principal"] = gateway_principal
+                return reply
         request_key = request.get("request_key")
         allow_closed = op in {"task_cancel", "request_status"} or (
             op == "session_close" and request_key is not None
@@ -2458,6 +2505,8 @@ class Hub:
             allow_closed=allow_closed,
             touch=op not in {"task_cancel", "session_close"},
         )
+        if gateway_principal:
+            session["_verified_gateway_principal"] = gateway_principal
 
         def journaled(run: Callable[[], dict]) -> dict:
             return self.store.journal_execute(session, request_key, op, args, run)
@@ -2519,8 +2568,12 @@ class Hub:
                 return self.entry_artifacts.call(session["session_id"], args)
             return journaled(artifact) if args.get("command") == "put" else artifact()
         if op == "permission_check":
-            return self.policy.decide(session["agent_id"], str(args.get("risk_class") or ""),
-                                      args.get("target") if isinstance(args.get("target"), dict) else None)
+            risk_class = str(args.get("risk_class") or "")
+            result = self.policy.decide(self._policy_subject(session, risk_class), risk_class,
+                                        args.get("target") if isinstance(args.get("target"), dict) else None)
+            if gateway_principal and risk_class in {"owner_chrome_hidden_secondary", "browser_script"}:
+                result["verified_client_principal"] = gateway_principal
+            return result
         if op == "permission_describe":
             return self.policy.describe()
         if op == "secret_list":

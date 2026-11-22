@@ -27,6 +27,12 @@ def agent_workflows() -> dict:
             "session_bootstrap": {"op": "session_open", "args": {"agent_id": "<stable-agent-id>", "task_id": "<stable-task-id>"}},
             "session_required_for_work": True,
             "session_secret_must_remain_private": True,
+            "stable_client_identity": (
+                "When local Bridge client-principal proof is owner-provisioned, every authorized ChatGPT chat "
+                "may choose a distinct agent_id/task_id yet use the same owner-granted connector principal "
+                "for owner_chrome_hidden_secondary and browser_script. A chat-supplied agent_id alone is NOT "
+                "proof of connector identity. Never invent a principal or issue your own owner grant."
+            ),
             "profile_selection_rule": (
                 "The route ID owner_chrome_profile1_hidden_secondary is a legacy name, NOT a Chrome profile directory. "
                 "Use live Hub route_plan.profile_dir_name and select the already-running owner Chrome profile. "

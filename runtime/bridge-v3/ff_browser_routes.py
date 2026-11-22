@@ -559,7 +559,10 @@ def evaluate_no_interruption_site_read(
             return {"decision": "needs_owner", "risk_class": risk_class, "reason": "AGENT_IDENTITY_REQUIRED", "grant_id": None}
         if policy is None or not hasattr(policy, "decide"):
             return {"decision": "needs_owner", "risk_class": risk_class, "reason": "HUB_POLICY_UNAVAILABLE", "grant_id": None}
-        return dict(policy.decide(agent_id, risk_class, target))
+        # A Bridge-attested connector principal may share browser grants across
+        # chats while each agent's session, resources, and task IDs remain isolated.
+        policy_subject = scope.get("policy_subject") if risk_class == "owner_chrome_hidden_secondary" else None
+        return dict(policy.decide(policy_subject or agent_id, risk_class, target))
 
     # --- Candidate 1: owner_chrome_profile1_hidden_secondary (strictly invisible windowless CDP) ---
     mgr = (getattr(hub, "owner_chrome_hidden", None) or getattr(hub, "owner_chrome_secondary", None)) if hub is not None else None

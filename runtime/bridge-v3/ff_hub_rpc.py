@@ -63,6 +63,9 @@ class HubGateway:
             "cleanup_receipt_fields": ["closed", "cleanup_verified", "resources_retained"],
             "automatic_mutation_replay": False, "foreground_input_available": False,
             "agent_identity": "client labels within trusted same-user transport, not an OS security boundary",
+            "stable_client_principal": "bridge-chatgpt-connector",
+            "client_identity_proof": "local_gateway_hmac_opt_in; absent without owner-provisioned key",
+            "agent_id_is_not_policy_principal": True,
             "live_browser_or_gui_verified": False,
         }
 
@@ -80,10 +83,14 @@ class HubGateway:
         # the Hub RPC API. Arbitrary endpoints, state roots and keys cannot be
         # selected by the caller of this gateway.
         from ff_hub import HubClient, HubError, ensure_running
+        from ff_hub_client_identity import sign_gateway_request
         try:
+            # Only this trusted local gateway can add the principal proof.
+            # Client-requested proof fields are rejected by request_fields.
+            signed_request = sign_gateway_request(request, self.state_dir)
             (self._starter or ensure_running)(self.state_dir)
             client = (self._client_factory or HubClient)(self.state_dir)
-            reply = client.raw(dict(request))
+            reply = client.raw(signed_request)
         except HubError as exc:
             raise HubGatewayError(exc.code, **exc.details) from None
         except (OSError, ValueError, TypeError):
