@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -11,8 +12,8 @@ using System.Web.Script.Serialization;
 internal static class Program {
     const string PipeName = "ff_browser_companion_v1";
     const string ExpectedOrigin = "chrome-extension://mmhkecdcdceeibbhalmfhjleeebgdbhk/";
-    static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
     static readonly AutoResetEvent ResponseReady = new AutoResetEvent(false);
+    static readonly ManualResetEvent ChromeDone = new ManualResetEvent(false);
     static readonly object StateLock = new object();
     static readonly object OutputLock = new object();
     static Stream ChromeInput;
@@ -21,13 +22,26 @@ internal static class Program {
     static string PendingResponse;
     static volatile bool ChromeClosed;
 
-    static string SecretPath() {
+    static string CanonicalRoot() {
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        return Path.Combine(local, "FF-Windows-Bridge", "bridge-v3", "secret");
+        return Path.Combine(local, "FF-Windows-Bridge", "bridge-v3");
     }
 
-    static string ReadSecret() {
-        var path = SecretPath();
+    static string NormalizeRoot(string root) {
+        return Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar).ToLowerInvariant();
+    }
+
+    static string PipeForRoot(string root) {
+        var normalized = NormalizeRoot(root);
+        if (normalized == NormalizeRoot(CanonicalRoot())) return PipeName;
+        using (var sha = SHA256.Create()) {
+            var hash = sha.ComputeHash(Encoding.Unicode.GetBytes(normalized));
+            return PipeName + "_" + BitConverter.ToString(hash, 0, 16).Replace("-", "").ToLowerInvariant();
+        }
+    }
+
+    static string ReadSecret(string root) {
+        var path = Path.Combine(root, "secret");
         if (!File.Exists(path)) throw new InvalidOperationException("BRIDGE_SECRET_MISSING");
         var value = File.ReadAllText(path, Encoding.ASCII).Trim();
         if (value.Length < 16) throw new InvalidOperationException("BRIDGE_SECRET_INVALID");
@@ -67,7 +81,7 @@ internal static class Program {
     }
 
     static Dictionary<string, object> ParseObject(string json) {
-        var value = Json.DeserializeObject(json) as Dictionary<string, object>;
+        var value = new JavaScriptSerializer().DeserializeObject(json) as Dictionary<string, object>;
         if (value == null) throw new InvalidDataException("JSON_OBJECT_REQUIRED");
         return value;
     }
@@ -92,21 +106,22 @@ internal static class Program {
             }
         } catch {}
         ChromeClosed = true;
+        ChromeDone.Set();
         ResponseReady.Set();
     }
 
-    static NamedPipeServerStream CreatePipe() {
+    static NamedPipeServerStream CreatePipe(string pipeName) {
         var security = new PipeSecurity();
         var sid = WindowsIdentity.GetCurrent().User;
         security.SetOwner(sid);
         security.AddAccessRule(new PipeAccessRule(sid, PipeAccessRights.FullControl, AccessControlType.Allow));
         return new NamedPipeServerStream(
-            PipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
-            PipeOptions.None, 8192, 8192, security);
+            pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+            PipeOptions.Asynchronous, 8192, 8192, security);
     }
 
     static string Error(string code) {
-        return Json.Serialize(new Dictionary<string, object> {
+        return new JavaScriptSerializer().Serialize(new Dictionary<string, object> {
             {"ok", false}, {"error_code", code}, {"message", code}
         });
     }
@@ -138,10 +153,12 @@ internal static class Program {
         request["type"] = "command";
         var requestId = Convert.ToString(idValue);
         lock (StateLock) {
+            if (ChromeClosed) return Error("IPC_EXTENSION_DISCONNECTED");
+            ResponseReady.Reset();
             PendingId = requestId;
             PendingResponse = null;
         }
-        try { WriteNativeMessage(Json.Serialize(request)); }
+        try { WriteNativeMessage(new JavaScriptSerializer().Serialize(request)); }
         catch { lock (StateLock) { PendingId = null; } return Error("IPC_EXTENSION_WRITE_FAILED"); }
         if (!ResponseReady.WaitOne(35000)) {
             lock (StateLock) { PendingId = null; PendingResponse = null; }
@@ -156,14 +173,57 @@ internal static class Program {
         return Error(ChromeClosed ? "IPC_EXTENSION_DISCONNECTED" : "IPC_EXTENSION_NO_RESPONSE");
     }
 
-    static void ServePipe(string secret) {
-        while (!ChromeClosed) {
-            using (var pipe = CreatePipe()) {
-                pipe.WaitForConnection();
-                using (var reader = new StreamReader(pipe, new UTF8Encoding(false), false, 8192, true))
-                using (var writer = new StreamWriter(pipe, new UTF8Encoding(false), 8192, true) { AutoFlush = true }) {
-                    var line = reader.ReadLine();
-                    if (line != null) writer.WriteLine(HandlePipeRequest(line, secret));
+    static int Await(IAsyncResult operation, int timeoutMillis) {
+        return WaitHandle.WaitAny(new[] { operation.AsyncWaitHandle, ChromeDone }, timeoutMillis);
+    }
+
+    static string ReadPipeLine(NamedPipeServerStream pipe) {
+        var timer = System.Diagnostics.Stopwatch.StartNew();
+        var buffer = new byte[4096];
+        using (var body = new MemoryStream()) {
+            while (body.Length < 1024 * 1024) {
+                var pending = pipe.BeginRead(buffer, 0, buffer.Length, null, null);
+                if (Await(pending, Math.Max(0, 5000 - (int)timer.ElapsedMilliseconds)) != 0) return null;
+                var count = pipe.EndRead(pending);
+                if (count == 0) return null;
+                var newline = Array.IndexOf(buffer, (byte)'\n', 0, count);
+                body.Write(buffer, 0, newline < 0 ? count : newline);
+                if (newline >= 0) return Encoding.UTF8.GetString(body.ToArray()).TrimEnd('\r');
+            }
+        }
+        return null;
+    }
+
+    static void ServePipe(string secret, string pipeName) {
+        NamedPipeServerStream listener;
+        try { listener = CreatePipe(pipeName); }
+        catch (IOException) {
+            WriteNativeMessage("{\"type\":\"host_error\",\"error_code\":\"HOST_PIPE_BUSY\"}");
+            throw;
+        }
+        using (var pipe = listener) {
+            WriteNativeMessage("{\"type\":\"host_ready\",\"protocol_version\":1}");
+            while (!ChromeClosed) {
+                var waiting = pipe.BeginWaitForConnection(null, null);
+                if (Await(waiting, Timeout.Infinite) != 0) return;
+                pipe.EndWaitForConnection(waiting);
+                try {
+                    var line = ReadPipeLine(pipe);
+                    if (line != null) {
+                        var bytes = Encoding.UTF8.GetBytes(HandlePipeRequest(line, secret) + "\n");
+                        var writing = pipe.BeginWrite(bytes, 0, bytes.Length, null, null);
+                        if (Await(writing, 5000) == 0) {
+                            pipe.EndWrite(writing);
+                            // DisconnectNamedPipe discards unread bytes. The one-request client closes
+                            // after reading its frame, so keep this instance alive until EOF or timeout.
+                            var receipt = pipe.BeginRead(new byte[1], 0, 1, null, null);
+                            if (Await(receipt, 5000) == 0) pipe.EndRead(receipt);
+                        }
+                    }
+                } catch (IOException) {
+                    // A disconnected IPC caller does not require closing Chrome's native port.
+                } finally {
+                    if (pipe.IsConnected) pipe.Disconnect();
                 }
             }
         }
@@ -171,15 +231,24 @@ internal static class Program {
 
     public static int Main(string[] args) {
         try {
-            if (args.Length < 1 || !String.Equals(args[0], ExpectedOrigin, StringComparison.Ordinal)) return 3;
-            var secret = ReadSecret();
+            if (args.Length < 1 || !String.Equals(args[0], ExpectedOrigin, StringComparison.Ordinal)) {
+                Console.Error.WriteLine("FF_COMPANION_HOST_ORIGIN_INVALID");
+                return 3;
+            }
+            var root = AppDomain.CurrentDomain.BaseDirectory;
+            var secret = ReadSecret(root);
             ChromeInput = Console.OpenStandardInput();
             ChromeOutput = Console.OpenStandardOutput();
             var reader = new Thread(ReaderLoop) { IsBackground = true, Name = "ff-companion-native-reader" };
             reader.Start();
-            ServePipe(secret);
+            ServePipe(secret, PipeForRoot(root));
             return 0;
+        } catch (InvalidOperationException error) {
+            var code = error.Message;
+            Console.Error.WriteLine(code == "BRIDGE_SECRET_MISSING" || code == "BRIDGE_SECRET_INVALID" ? code : "FF_COMPANION_HOST_FAILED");
+            return 2;
         } catch {
+            Console.Error.WriteLine("FF_COMPANION_HOST_FAILED");
             return 2;
         }
     }

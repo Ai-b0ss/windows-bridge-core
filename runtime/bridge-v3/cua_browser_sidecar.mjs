@@ -22,9 +22,18 @@ export class BrowserSidecar {
 
   async attach(options = {}) {
     const handle = await this.engine.attach(options);
+    let capabilities;
+    try {
+      capabilities = await this.engine.capabilities(handle);
+    } catch (error) {
+      if (typeof this.engine.close === 'function') {
+        await this.engine.close(handle).catch(() => {});
+      }
+      throw error;
+    }
     const surfaceId = id('surface');
     this.surfaces.set(surfaceId, {handle, generation: 0, snapshot: null, attachOptions: {...options}});
-    return {surface_id: surfaceId, route: this.route, capabilities: await this.engine.capabilities(handle)};
+    return {surface_id: surfaceId, route: this.route, capabilities};
   }
 
   _surface(surfaceId) {
@@ -309,8 +318,29 @@ export class BrowserSidecar {
     const surface = this._surface(surfaceId);
     try {
       await this.engine.close(surface.handle);
-    } catch {}
+    } catch (error) {
+      const stillLive = !surface.handle?.disconnected &&
+        surface.handle?.browser?.isConnected?.() !== false &&
+        error?.details?.detached !== true &&
+        error?.details?.protocol_connection_closed !== true;
+      if (stillLive) {
+        throw new BrowserSidecarError(
+          'SURFACE_RECOVER_CLOSE_FAILED',
+          'failed to close previous live browser surface before recovery',
+          {surface_id: surfaceId, cause: error?.code || String(error?.message || error)},
+        );
+      }
+    }
     const handle = await this.engine.attach({...surface.attachOptions});
+    let capabilities;
+    try {
+      capabilities = await this.engine.capabilities(handle);
+    } catch (error) {
+      if (typeof this.engine.close === 'function') {
+        await this.engine.close(handle).catch(() => {});
+      }
+      throw error;
+    }
     surface.handle = handle;
     surface.snapshot = null;
     surface.generation++;
@@ -319,14 +349,25 @@ export class BrowserSidecar {
       route: this.route,
       recovered: true,
       generation: surface.generation,
-      capabilities: await this.engine.capabilities(handle),
+      capabilities,
     };
   }
 
   async close(surfaceId) {
     const surface = this._surface(surfaceId);
-    const cleanup = await this.engine.close(surface.handle);
-    this.surfaces.delete(surfaceId);
-    return {ok: true, cleanup: cleanup ?? null};
+    try {
+      const cleanup = await this.engine.close(surface.handle);
+      this.surfaces.delete(surfaceId);
+      return {ok: true, cleanup: cleanup ?? null};
+    } catch (error) {
+      const detachedOrDead = error?.details?.detached === true ||
+        error?.details?.protocol_connection_closed === true ||
+        surface.handle?.disconnected === true ||
+        surface.handle?.browser?.isConnected?.() === false;
+      if (detachedOrDead) {
+        this.surfaces.delete(surfaceId);
+      }
+      throw error;
+    }
   }
 }

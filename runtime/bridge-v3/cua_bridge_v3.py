@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import hashlib
 import threading
 import os
@@ -8,6 +9,7 @@ import re
 import sys
 import time
 import uuid
+import weakref
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -46,6 +48,33 @@ _VISION_COMMANDS = frozenset({
     "capture", "vision_capture", "vision_detect", "vision_ocr", "vision_observe",
     "vision_ground", "vision_find", "vision_resolve", "vision_validate",
 })
+
+DEFAULT_BROWSER_SURFACE_IDLE_TTL_S = 600.0
+MIN_BROWSER_SURFACE_IDLE_TTL_S = 0.05
+MAX_BROWSER_SURFACE_IDLE_TTL_S = 3600.0
+_BROWSER_APP_NAMES = frozenset({
+    "chrome", "google chrome", "chrome.exe", "chromium", "edge",
+    "microsoft edge", "msedge", "msedge.exe", "browser", "web",
+})
+_HIDDEN_OR_HUB_ROUTE_MODES = frozenset({"hub", "hidden", "isolated", "shared_hub"})
+
+
+def _normalize_scope_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _clamp_idle_ttl(value: Any, default: float = DEFAULT_BROWSER_SURFACE_IDLE_TTL_S) -> float:
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CuaBridgeError("BROWSER_IDLE_TTL_INVALID")
+    ttl = float(value)
+    if ttl != ttl or ttl <= 0:
+        raise CuaBridgeError("BROWSER_IDLE_TTL_INVALID")
+    return min(max(ttl, MIN_BROWSER_SURFACE_IDLE_TTL_S), MAX_BROWSER_SURFACE_IDLE_TTL_S)
 
 
 class CuaBridgeError(RuntimeError):
@@ -313,8 +342,12 @@ class CuaBridgeControlPlane:
         app_api_registry_factory: Callable[[Any], Any] | None = None,
         experience_store_factory: Callable[[Path], Any] | None = None,
         state_dir: str | Path | None = None,
+        browser_idle_ttl_s: float = DEFAULT_BROWSER_SURFACE_IDLE_TTL_S,
+        require_explicit_owner_chrome: bool = False,
     ):
         self.root = Path(package_root).resolve()
+        self._browser_idle_ttl_s = _clamp_idle_ttl(browser_idle_ttl_s)
+        self._require_explicit_owner_chrome = bool(require_explicit_owner_chrome)
         # Route preferences are mutable runtime state, never package source bytes.
         # Respect the caller's isolated state root; otherwise use this Bridge's
         # FF_BRIDGE_ROOT (not the shared Python source/package directory).
@@ -346,6 +379,22 @@ class CuaBridgeControlPlane:
         self._surfaces: dict[str, dict[str, Any]] = {}
         self._global_resources = GlobalResourceCoordinator(state_dir, timeout=5.0)
         self._resources = CoordinatedResources(SemanticResourceCoordinator(), self._global_resources)
+        self._register_shutdown_cleanup()
+
+    def _register_shutdown_cleanup(self) -> None:
+        self_ref = weakref.ref(self)
+
+        def _cleanup_ref() -> None:
+            inst = self_ref()
+            if inst is not None:
+                inst.close()
+
+        _cleanup_ref._plane_id = id(self)  # type: ignore[attr-defined]
+        atexit.register(_cleanup_ref)
+        agent_mod = sys.modules.get("ff_win_v3_agent")
+        register_hook = getattr(agent_mod, "register_shutdown_hook", None) if agent_mod is not None else None
+        if callable(register_hook):
+            register_hook(_cleanup_ref)
 
     def _browser_supervisor(self, transport: str) -> JsonLineSidecarSupervisor:
         with self._browser_supervisor_lock:
@@ -513,12 +562,17 @@ class CuaBridgeControlPlane:
         return self._app_resolver
 
     def _companion_health(self) -> dict[str, Any]:
+        scope = {
+            "supported_capabilities": ["downloads", "nativeMessaging"],
+            "browser_page_reader": False,
+            "page_read_supported": False,
+        }
         try:
             capabilities = self._browser_companion().capabilities()
             compatible = capabilities.get("protocol_version") == 1 and capabilities.get("downloads") is True
-            return {"running": True, "compatible": bool(compatible), "capabilities": capabilities}
+            return {"running": True, "compatible": bool(compatible), "capabilities": capabilities, **scope}
         except CompanionError as exc:
-            return {"running": False, "compatible": False, "error_code": exc.code}
+            return {"running": False, "compatible": False, "error_code": exc.code, **scope}
 
     def dispatch(self, args: Mapping[str, Any]) -> dict[str, Any]:
         command = str(args.get("command") or "")
@@ -603,7 +657,11 @@ class CuaBridgeControlPlane:
                     "preferred_cli": ranked[0] if ranked else None,
                     "task_compatibility": "unknown", "gui_first": False,
                     "diagnostic_receipt": issue_gui_fallback_receipt(candidates, app=app) if args.get("probe_versions") is True else None}
+        if command == "reap_idle_surfaces":
+            reaped = self.reap_idle_browser_surfaces()
+            return {"ok": True, "reaped_surface_ids": reaped, "reaped_count": len(reaped)}
         if command == "health":
+            reaped_idle = self.reap_idle_browser_surfaces()
             try:
                 global_health = {"available": True, **self._global_resources.snapshot()}
             except (GlobalResourceError, OSError) as exc:
@@ -614,6 +672,8 @@ class CuaBridgeControlPlane:
                 "semantic_default": True,
                 "legacy_physical_requires_explicit_opt_in": True,
                 "browser": {key: value.health() for key, value in self._browser.items()},
+                "active_browser_surfaces": sum(1 for item in self._surfaces.values() if item.get("kind") == "browser"),
+                "reaped_idle_browser_surfaces": len(reaped_idle),
                 "browser_companion": self._companion_health(),
                 "native": {key: value.health() for key, value in self._native.items()},
                 "physical": self._physical.health() if self._physical is not None else {"initialized": False},
@@ -1237,11 +1297,89 @@ class CuaBridgeControlPlane:
             "app_api": handle.public(),
         }
 
+    def reap_idle_browser_surfaces(self, *, now_monotonic: float | None = None) -> list[str]:
+        """Close and evict browser surfaces whose idle TTL has expired."""
+        now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+        reaped: list[str] = []
+        for surface_id, surface in list(self._surfaces.items()):
+            if surface.get("kind") != "browser":
+                continue
+            ttl = surface.get("idle_ttl_s")
+            last_used = surface.get("last_used_at")
+            if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
+                continue
+            if not isinstance(last_used, (int, float)) or isinstance(last_used, bool):
+                continue
+            if (now - float(last_used)) <= float(ttl):
+                continue
+            try:
+                supervisor = self._browser_supervisor(surface["transport"])
+                resources = getattr(self, "_resources", None)
+                if resources is not None and hasattr(resources, "write_many"):
+                    with resources.write_many(self._surface_resource_keys(surface_id, surface)):
+                        _unwrap(supervisor.request("close", {"surface_id": surface_id}), browser=True)
+                else:
+                    _unwrap(supervisor.request("close", {"surface_id": surface_id}), browser=True)
+            except Exception:
+                pass
+            vision = getattr(self, "_vision", None)
+            if vision is not None:
+                try:
+                    vision.clear_surface(surface_id)
+                except Exception:
+                    pass
+            self._surfaces.pop(surface_id, None)
+            reaped.append(surface_id)
+        return reaped
+
     def _attach(self, args: Mapping[str, Any]) -> dict[str, Any]:
         kind = str(args.get("surface_kind") or "")
         if kind == "browser":
-            transport = str(args.get("transport") or "extension")
+            self.reap_idle_browser_surfaces()
+            raw_transport = args.get("transport")
             raw_options = args.get("options", {})
+            opt_map = raw_options if isinstance(raw_options, Mapping) else {}
+            requested_window_mode = str(
+                args.get("window_mode")
+                or args.get("windowMode")
+                or opt_map.get("window_mode")
+                or opt_map.get("windowMode")
+                or args.get("route_mode")
+                or args.get("browser_mode")
+                or ""
+            ).strip().lower()
+            wants_hidden_secondary = (
+                args.get("invisible_required") is True
+                or args.get("invisibleRequired") is True
+                or args.get("hidden_secondary") is True
+                or args.get("hiddenSecondary") is True
+                or args.get("new_window_hidden") is True
+                or args.get("newWindowHidden") is True
+                or opt_map.get("invisible_required") is True
+                or opt_map.get("invisibleRequired") is True
+                or opt_map.get("hidden_secondary") is True
+                or opt_map.get("hiddenSecondary") is True
+                or opt_map.get("new_window_hidden") is True
+                or opt_map.get("newWindowHidden") is True
+                or requested_window_mode in {"hidden_secondary", "owner_chrome_profile1_hidden_secondary"}
+            )
+            if wants_hidden_secondary:
+                req_transport = (str(raw_transport).strip() if raw_transport is not None else "") or "extension"
+                raise CuaBridgeError(
+                    "OWNER_CHROME_HIDDEN_SECONDARY_UNSUPPORTED_ON_TRANSPORT",
+                    "Playwright sidecar / extension transport cannot create a zero-visible-side-effect owner Chrome hidden secondary target; use Hub owner_chrome_profile1_hidden_secondary (browser-level CDP hidden:true) instead",
+                    details={
+                        "transport": req_transport,
+                        "recommended_route": "owner_chrome_profile1_hidden_secondary",
+                        "hidden_secondary_window_supported": False,
+                        "visible_tab_strip": req_transport == "extension",
+                        "isolated_fallback": False,
+                        "attempted": False,
+                        "retry_safe": False,
+                    },
+                )
+            # Default to isolated hidden browser; never silently pick direct visible owner Chrome.
+            transport = (str(raw_transport).strip() if raw_transport is not None else "") or "isolated"
             if transport == "isolated":
                 if not isinstance(raw_options, Mapping):
                     raise CuaBridgeError("ISOLATED_BROWSER_OPTIONS_INVALID")
@@ -1249,14 +1387,49 @@ class CuaBridgeControlPlane:
                     raise CuaBridgeError("ISOLATED_BROWSER_OPTIONS_FORBIDDEN")
                 if raw_options.get("headless", True) is not True:
                     raise CuaBridgeError("ISOLATED_BROWSER_HEADLESS_REQUIRED")
+            elif transport == "extension":
+                route_mode = str(args.get("route_mode") or args.get("browser_mode") or "").strip().lower()
+                explicit_flag = args.get("owner_chrome_explicit")
+                if explicit_flag is not None and type(explicit_flag) is not bool:
+                    raise CuaBridgeError("OWNER_CHROME_EXPLICIT_FLAG_INVALID")
+                require_explicit = (
+                    getattr(self, "_require_explicit_owner_chrome", False)
+                    or os.environ.get("FF_REQUIRE_EXPLICIT_OWNER_CHROME", "").strip().lower() in {"1", "true", "yes"}
+                )
+                hub_or_hidden_expected = (
+                    explicit_flag is False
+                    or args.get("hidden_only") is True
+                    or args.get("prefer_hub") is True
+                    or route_mode in _HIDDEN_OR_HUB_ROUTE_MODES
+                    or (require_explicit and explicit_flag is not True)
+                )
+                if hub_or_hidden_expected:
+                    raise CuaBridgeError(
+                        "OWNER_CHROME_EXPLICIT_ROUTE_REQUIRED",
+                        "direct owner Chrome extension attach is blocked when Hub/hidden mode is expected",
+                        details={
+                            "recommended_route": "shared_hub_hidden_browser",
+                            "isolated_fallback": False,
+                            "owner_chrome_fallback": False,
+                            "retry_safe": False,
+                        },
+                    )
             options = raw_options if isinstance(raw_options, Mapping) else {}
+            agent_id = _normalize_scope_id(args.get("agent_id"))
+            task_id = _normalize_scope_id(args.get("task_id"))
+            default_ttl = getattr(self, "_browser_idle_ttl_s", DEFAULT_BROWSER_SURFACE_IDLE_TTL_S)
+            idle_ttl_s = _clamp_idle_ttl(args.get("idle_ttl_s"), default_ttl)
             supervisor = self._browser_supervisor(transport)
             payload = dict(options)
             if transport == "extension":
                 payload.update({"ownerBrowser": True, "ownerTransport": "extension"})
+                payload.setdefault("background", True)
                 if not bool(args.get("force_new_connection", False)):
                     for existing_id, existing in list(self._surfaces.items()):
                         if existing.get("kind") != "browser" or existing.get("transport") != "extension":
+                            continue
+                        # Never share a browser surface across different agents or tasks.
+                        if existing.get("agent_id") != agent_id or existing.get("task_id") != task_id:
                             continue
                         try:
                             _unwrap(supervisor.request("identity", {"surface_id": existing_id}), browser=True)
@@ -1267,6 +1440,7 @@ class CuaBridgeControlPlane:
                                 pass
                             self._surfaces.pop(existing_id, None)
                             continue
+                        existing["last_used_at"] = time.monotonic()
                         return {
                             "ok": True,
                             "surface_kind": kind,
@@ -1274,6 +1448,8 @@ class CuaBridgeControlPlane:
                             "route": existing.get("route", "BROWSER_PLAYWRIGHT"),
                             "capabilities": dict(existing.get("capabilities") or {}),
                             "reused": True,
+                            "agent_id": existing.get("agent_id"),
+                            "task_id": existing.get("task_id"),
                         }
             profile = options.get("chromeUserDataDir") or options.get("userDataDir")
             profile_key = "browser-profile:" + hashlib.sha256(str(profile).encode("utf-8")).hexdigest()[:24] if profile else None
@@ -1286,31 +1462,29 @@ class CuaBridgeControlPlane:
                     if transport != "extension":
                         raise
                     # Never replace the signed-in owner browser with an unrelated
-                    # anonymous/isolated profile. Report an explicit failure.
-                    # The sidecar can retain a stale extension connection after a
-                    # browser restart. Restart it ONCE only when it owns no live
-                    # extension surfaces (protect other agents' tabs).
+                    # isolated profile, and NEVER blindly restart+retry attach on
+                    # failure when a tab may have been spawned without confirmed cleanup.
                     cause = getattr(err, "code", type(err).__name__)
+                    err_details = getattr(err, "details", None)
+                    cleanup_confirmed = bool(
+                        isinstance(err_details, Mapping) and err_details.get("cleanup_confirmed") is True
+                    )
                     existing_owner_surfaces = any(
                         v.get("kind") == "browser" and v.get("transport") == "extension"
                         for v in self._surfaces.values()
                     )
-                    if existing_owner_surfaces:
-                        raise CuaBridgeError(
-                            "OWNER_CHROME_ATTACH_FAILED",
-                            details={"cause": cause, "retry": "skipped_active_surfaces",
-                                     "isolated_fallback": False},
-                        ) from err
-                    try:
-                        supervisor.restart()
-                        result = _unwrap(supervisor.request("attach", payload), browser=True)
-                    except (CuaBridgeError, SidecarError) as retry_err:
-                        raise CuaBridgeError(
-                            "OWNER_CHROME_ATTACH_FAILED",
-                            details={"cause": cause,
-                                     "retry_cause": getattr(retry_err, "code", type(retry_err).__name__),
-                                     "isolated_fallback": False},
-                        ) from retry_err
+                    retry_status = "skipped_active_surfaces" if existing_owner_surfaces else "disabled_no_blind_retry"
+                    raise CuaBridgeError(
+                        "OWNER_CHROME_ATTACH_FAILED",
+                        details={
+                            "cause": cause,
+                            "retry": retry_status,
+                            "retry_safe": False,
+                            "tab_spawned_possible": not cleanup_confirmed,
+                            "cleanup_confirmed": cleanup_confirmed,
+                            "isolated_fallback": False,
+                        },
+                    ) from err
                 if transport == "extension":
                     caps = result.get("capabilities") or {}
                     if (caps.get("owner_browser") is not True
@@ -1332,13 +1506,29 @@ class CuaBridgeControlPlane:
                                              details={"cleanup": cleanup})
             surface_id = str(result["surface_id"])
             surface_key = f"browser-surface/tab:{surface_id}"
+            now_mono = time.monotonic()
+            now_wall = time.time()
             self._surfaces[surface_id] = {
                 "kind": "browser", "transport": transport, "semantic_key": surface_key,
                 "semantic_keys": tuple([surface_key, profile_key] if profile_key else [surface_key]),
                 "route": result.get("route", "BROWSER_PLAYWRIGHT"),
                 "capabilities": dict(result.get("capabilities") or {}),
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "created_at": now_mono,
+                "created_at_wall": now_wall,
+                "last_used_at": now_mono,
+                "idle_ttl_s": idle_ttl_s,
             }
-            return {"ok": True, "surface_kind": kind, "reused": False, **result}
+            return {
+                "ok": True,
+                "surface_kind": kind,
+                "reused": False,
+                "agent_id": agent_id,
+                "task_id": task_id,
+                "idle_ttl_s": idle_ttl_s,
+                **result,
+            }
         if kind == "app":
             target = args.get("target") if isinstance(args.get("target"), Mapping) else {}
             app = str(args.get("app") or target.get("app") or "").strip()
@@ -1375,7 +1565,18 @@ class CuaBridgeControlPlane:
         surface_id = args.get("surface_id")
         if not isinstance(surface_id, str) or surface_id not in self._surfaces:
             raise CuaBridgeError("SURFACE_NOT_FOUND")
-        return surface_id, self._surfaces[surface_id]
+        surface = self._surfaces[surface_id]
+        if surface.get("kind") == "browser":
+            owner_agent = surface.get("agent_id")
+            owner_task = surface.get("task_id")
+            if owner_agent is not None and "agent_id" in args:
+                if _normalize_scope_id(args.get("agent_id")) != owner_agent:
+                    raise CuaBridgeError("SURFACE_NOT_OWNED", details={"surface_id": surface_id})
+            if owner_task is not None and "task_id" in args:
+                if _normalize_scope_id(args.get("task_id")) != owner_task:
+                    raise CuaBridgeError("SURFACE_NOT_OWNED", details={"surface_id": surface_id})
+            surface["last_used_at"] = time.monotonic()
+        return surface_id, surface
 
     def _inspect(self, command: str, args: Mapping[str, Any]) -> dict[str, Any]:
         surface_id, surface = self._surface(args)
@@ -1599,6 +1800,8 @@ class CuaBridgeControlPlane:
             step = "verify_owned_hidden_excel_com_and_task_postcondition"
         elif cli:
             step = "check_task_specific_cli_support_auth_and_pricing"
+        elif app.casefold() in _BROWSER_APP_NAMES:
+            step = "use_shared_hub_or_hidden_browser_before_explicit_owner_chrome"
         else:
             step = "research_official_api_sdk_mcp_and_optional_hidden_paths"
         from cua_router import task_orchestration_gate
@@ -1611,10 +1814,28 @@ class CuaBridgeControlPlane:
                 and task == "git.repository.status"
                 and candidates.get("task_execute_contract")):
             step = "run_explicit_git_status_task_execute_with_repo_path_and_check_receipt"
+        browser_routing = {
+            "recommended_route": "owner_chrome_profile1_hidden_secondary",
+            "primary_owner_auth_route": "owner_chrome_profile1_hidden_secondary",
+            "optional_isolated_routes": ["persistent_playwright", "private_cdp"],
+            "preferred_order": [
+                "official_api_cli_sdk_mcp",
+                "owner_chrome_profile1_hidden_secondary",
+                "shared_hub_hidden_browser",
+                "isolated_headless_playwright",
+                "explicit_owner_chrome_extension_via_hub",
+            ],
+            "extension_supports_hidden_secondary": False,
+            "extension_visible_tab_strip": True,
+            "isolated_fallback_for_owner_auth_allowed": False,
+            "direct_owner_chrome_fallback_allowed": False,
+            "requires_explicit_owner_chrome_opt_in": True,
+        }
         return {
             "schema": "ff-cua-task-preflight-v1",
             "app": app, "task": task,
             "orchestration": orchestration,
+            "browser_routing": browser_routing,
             "programmatic": candidates,
             "cli_contract": contract,
             "office_com_registration": office_com,

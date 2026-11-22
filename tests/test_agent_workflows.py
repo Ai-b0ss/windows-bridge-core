@@ -38,6 +38,58 @@ class TestAgentWorkflowManifest(unittest.TestCase):
         self.assertIn("visible_desktop_only_with_trusted_owner_grant",x["route_preference"])
         self.assertTrue("do_not_auto_replay" in x["refusals"]["outcome_unknown"])
 
+    def test_shared_hub_isolated_hidden_browser_default_and_mandatory_cleanup(self):
+        data = agent_workflows()
+        browser = data["browser_workflow"]
+        self.assertEqual(browser["preferred_route"], "shared_hub.owner_chrome_profile1_hidden_secondary")
+        primary = browser["primary_owner_auth_route"]
+        self.assertEqual(primary["route"], "owner_chrome_profile1_hidden_secondary")
+        self.assertEqual(primary["hub_op"], "owner_chrome_hidden")
+        self.assertTrue(primary["auth_inheritance"])
+        self.assertTrue(primary["profile_copy_forbidden"])
+        self.assertTrue(primary["second_chrome_process_same_profile_forbidden"])
+        self.assertTrue(primary["zero_visible_side_effects"])
+        self.assertTrue(primary["fail_closed_if_unavailable"])
+        self.assertTrue(primary["silent_fallback_to_isolated_forbidden"])
+        self.assertIs(primary["screenshot_supported"], False)
+        optional_iso = browser["optional_isolated_mode"]
+        self.assertEqual(optional_iso["hub_ops"], ["managed_browser", "private_browser"])
+        self.assertIs(optional_iso["satisfies_primary_p0_owner_chrome_profile1"], False)
+        ext = browser["owner_chrome_visible_tab_route"]
+        self.assertIs(ext["hidden_secondary_window_supported"], False)
+        self.assertTrue(ext["visible_tab_strip"])
+        self.assertTrue(ext["explicit_selection_required"])
+        self.assertTrue(browser["background_tabs"])
+        self.assertIs(browser["focus_or_foreground_input"], False)
+        self.assertEqual(browser["cleanup"]["operation"], "session_close")
+        self.assertEqual(
+            set(browser["cleanup"]["required_on"]),
+            {"success", "failure", "cancel", "timeout", "owner_stop"},
+        )
+        self.assertEqual(
+            browser["cleanup"]["verify_fields"],
+            ["cleanup_verified", "resources_retained", "owner_chrome_hidden_targets_closed", "browser_tabs_closed"],
+        )
+        self.assertTrue(browser["legacy_fallback"]["never_silently_fallback"])
+        self.assertIn("shared_hub_owner_chrome_profile1_hidden_secondary", data["route_preference"])
+        self.assertIn("shared_hub_isolated_hidden_browser", data["route_preference"])
+        self.assertIn("shared_hub_browser_background", data["route_preference"])
+        self.assertLess(
+            data["route_preference"].index("shared_hub_owner_chrome_profile1_hidden_secondary"),
+            data["route_preference"].index("shared_hub_isolated_hidden_browser"),
+        )
+
+    def test_profile_resolves_from_live_route_plan_not_legacy_route_name(self):
+        data=agent_workflows()
+        hub=data["shared_hub"]
+        primary=data["browser_workflow"]["primary_owner_auth_route"]
+        self.assertIn("profile_dir_name",hub["profile_selection_rule"])
+        self.assertIn("distinct",hub["profile_selection_rule"])
+        self.assertEqual(primary["owner_profile"],"selected_active_profile_from_live_route_plan")
+        self.assertTrue(primary["requires_selected_profile_default_browser_context"])
+        self.assertEqual(primary["profile_dir_name_examples"],["Default","Profile 1"])
+        self.assertNotIn("requires_profile1_default_browser_context",primary)
+
     def test_advertised_preflight_is_not_assumed_to_be_live_supported(self):
         data=agent_workflows()
         self.assertIs(data["preflight_actual_rpc_support_verified"], False)

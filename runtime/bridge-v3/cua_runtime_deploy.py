@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,15 +24,39 @@ _MODULE_DIR = Path(__file__).resolve().parent
 if str(_MODULE_DIR) not in sys.path:
     sys.path.insert(0, str(_MODULE_DIR))
 
-from cua_release_manifest import RUNTIME_SOURCE_MAP, git_blob_bytes, resolve_ref
+from cua_release_manifest import (
+    KNOWN_STALE_COMMITS,
+    RUNTIME_SOURCE_MAP,
+    compute_install_release_id,
+    git_blob_bytes,
+    git_commit_exists,
+    is_hex40_commit,
+    resolve_ref,
+    validate_commit_sha,
+)
 from cua_windows_paths import extended_path
 
 SCHEMA = "cua-runtime-install/v1"
 LOCK_SCHEMA = "cua-runtime-deploy-lock/v1"
 JOURNAL_SCHEMA = LOCK_SCHEMA + "/journal/v2"
+ACTIVE_RELEASE_SCHEMA = "ff-bridge-active-release/v1"
+ACTIVE_RELEASE_RELPATH = Path("state") / "active-release.json"
 MANIFEST_NAME = "installed-runtime-manifest.json"
 LOCK_NAME = ".cua-runtime-deploy-lock.json"
 TX_DIR_NAME = ".cua-deploy"
+
+_PLAYWRIGHT_FORBIDDEN_PATTERNS: tuple[tuple[str, re.Pattern[bytes]], ...] = (
+    ("pw_connect_url_artifact", re.compile(rb"pw_connect_url\.txt", re.IGNORECASE)),
+    ("chatgpt_audit_dir_ref", re.compile(rb"ChatGPT_Conversation_Audit", re.IGNORECASE)),
+    (
+        "write_file_sync_connect_href",
+        re.compile(rb"writeFileSync\s*\([^)]*(?:connect|href|token|relay)", re.IGNORECASE),
+    ),
+    (
+        "hardcoded_windows_user_path",
+        re.compile(rb"""["'][A-Za-z]:[/\\]Users[/\\][^/\\"'`]+[/\\]""", re.IGNORECASE),
+    ),
+)
 
 
 @contextmanager
@@ -783,31 +808,548 @@ def _recover_stale_pinned(runtime_root: Path, pins: _DirectoryPins) -> dict[str,
     return {"recovered": True, "txid": journal.get("txid"), "phase": "rollback_from_journal"}
 
 
-def verify_runtime(runtime_root: Path, *, allow_lock: bool = False) -> dict[str, Any]:
+def _resolve_core_bundle_path(candidate: Path) -> Path:
+    if candidate.is_file() and candidate.name.lower() == "corebundle.js":
+        return candidate
+    for rel in (
+        Path("node_modules") / "playwright-core" / "lib" / "coreBundle.js",
+        Path("playwright-core") / "lib" / "coreBundle.js",
+        Path("lib") / "coreBundle.js",
+    ):
+        probe = candidate / rel
+        if probe.is_file():
+            return probe
+    return candidate / "node_modules" / "playwright-core" / "lib" / "coreBundle.js"
+
+
+def check_playwright_integrity(
+    runtime_root: Path, *, playwright_root: Path | None = None
+) -> dict[str, Any]:
+    """Fail-closed integrity check for node_modules/playwright-core/lib/coreBundle.js.
+
+    Delegates to runtime/bridge-v3/cua_playwright_integrity.py when available,
+    falling back to an equivalent built-in pattern scan so standalone recovery
+    kits and pre-merge branches remain fail-closed without extra dependencies.
+    """
+    explicit = playwright_root is not None
+    base = Path(playwright_root) if explicit else Path(runtime_root)
+    pw_dir = base / "node_modules" / "playwright-core"
+    bundle_path = _resolve_core_bundle_path(base)
+    if not explicit and not pw_dir.exists() and not bundle_path.is_file():
+        return {"ok": True, "checked": False, "present": False, "scanner": "none"}
+    if not bundle_path.is_file():
+        return {
+            "ok": False,
+            "checked": True,
+            "present": False,
+            "error": "PLAYWRIGHT_CORE_BUNDLE_MISSING",
+            "scanner": "builtin",
+        }
+    if bundle_path.is_symlink() or getattr(bundle_path, "is_junction", lambda: False)():
+        return {
+            "ok": False,
+            "checked": True,
+            "present": True,
+            "error": "PLAYWRIGHT_CORE_BUNDLE_LINK_FORBIDDEN",
+            "scanner": "builtin",
+        }
+    # Prefer Track D's canonical cua_playwright_integrity module when present.
+    try:
+        import cua_playwright_integrity as pw_integrity  # type: ignore[import-not-found]
+    except ImportError:
+        pw_integrity = None
+    if pw_integrity is not None:
+        raw_res = None
+        scanner_name = "cua_playwright_integrity"
+        if base.is_file() and base.name.lower() == "corebundle.js" and callable(getattr(pw_integrity, "scan_core_bundle", None)):
+            raw_res = pw_integrity.scan_core_bundle(base)
+            scanner_name = "cua_playwright_integrity.scan_core_bundle"
+        elif callable(getattr(pw_integrity, "scan_playwright_root", None)):
+            raw_res = pw_integrity.scan_playwright_root(base, require_present=explicit)
+            scanner_name = "cua_playwright_integrity.scan_playwright_root"
+        elif callable(getattr(pw_integrity, "scan_core_bundle", None)):
+            raw_res = pw_integrity.scan_core_bundle(bundle_path)
+            scanner_name = "cua_playwright_integrity.scan_core_bundle"
+        if isinstance(raw_res, dict):
+            status = str(raw_res.get("status") or ("clean" if raw_res.get("ok") else "tampered"))
+            ok = bool(raw_res.get("ok"))
+            findings = raw_res.get("findings") or []
+            rules = [
+                (f.get("rule") or f.get("code") or "violation")
+                if isinstance(f, dict)
+                else str(f)
+                for f in findings
+            ]
+            return {
+                "ok": ok,
+                "status": status,
+                "checked": status != "not_installed",
+                "present": status not in {"missing", "not_installed"},
+                "scanner": scanner_name,
+                "error": None if ok else (raw_res.get("error_code") or raw_res.get("error") or "PLAYWRIGHT_CORE_BUNDLE_TAMPERED"),
+                "matched_rules": rules,
+                "finding_count": int(raw_res.get("finding_count", len(rules))),
+                "playwright_core_version": raw_res.get("playwright_core_version"),
+                "bundle_sha256": raw_res.get("sha256") or (sha256_file(bundle_path) if bundle_path.is_file() else None),
+            }
+    raw = bundle_path.read_bytes()
+    matched = [name for name, pat in _PLAYWRIGHT_FORBIDDEN_PATTERNS if pat.search(raw)]
+    if matched:
+        return {
+            "ok": False,
+            "status": "tampered",
+            "checked": True,
+            "present": True,
+            "scanner": "builtin",
+            "error": "PLAYWRIGHT_CORE_BUNDLE_TAMPERED",
+            "matched_rules": matched,
+            "finding_count": len(matched),
+            "bundle_sha256": sha256_bytes(raw),
+        }
+    return {
+        "ok": True,
+        "status": "clean",
+        "checked": True,
+        "present": True,
+        "scanner": "builtin",
+        "error": None,
+        "matched_rules": [],
+        "finding_count": 0,
+        "bundle_sha256": sha256_bytes(raw),
+    }
+
+
+def verify_runtime(
+    runtime_root: Path,
+    *,
+    allow_lock: bool = False,
+    repo: Path | None = None,
+    check_playwright: bool = False,
+    playwright_root: Path | None = None,
+) -> dict[str, Any]:
     runtime_root = extended_path(runtime_root.resolve(), force=True)
     lock_path = runtime_root / LOCK_NAME
     if lock_path.exists() and not allow_lock:
         return {"ok": False, "error": "DEPLOY_LOCK_PRESENT", "mismatches": []}
     manifest_path = runtime_root / MANIFEST_NAME
+    if manifest_path.is_symlink() or getattr(manifest_path, "is_junction", lambda: False)():
+        return {"ok": False, "error": "INSTALLED_MANIFEST_LINK_FORBIDDEN", "mismatches": []}
     if not manifest_path.is_file():
         return {"ok": False, "error": "INSTALLED_MANIFEST_MISSING", "mismatches": []}
-    manifest = _read_json(manifest_path)
-    if manifest.get("schema") != SCHEMA:
+    try:
+        manifest = _read_json(manifest_path)
+    except (OSError, ValueError, UnicodeError):
+        return {"ok": False, "error": "INSTALLED_MANIFEST_INVALID_JSON", "mismatches": []}
+    if not isinstance(manifest, dict) or manifest.get("schema") != SCHEMA:
         return {"ok": False, "error": "INSTALLED_MANIFEST_SCHEMA_INVALID", "mismatches": []}
+    source_head = manifest.get("source_head")
+    if (
+        not is_hex40_commit(source_head)
+        or str(source_head).lower() in KNOWN_STALE_COMMITS
+    ):
+        return {
+            "ok": False,
+            "error": "INSTALLED_MANIFEST_PROVENANCE_INVALID",
+            "source_head": source_head,
+            "mismatches": [],
+        }
+    if repo is not None and (repo / ".git").exists() and not git_commit_exists(repo, source_head):
+        return {
+            "ok": False,
+            "error": "INSTALLED_MANIFEST_COMMIT_UNKNOWN_IN_GIT",
+            "source_head": source_head,
+            "mismatches": [],
+        }
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        return {"ok": False, "error": "INSTALLED_MANIFEST_FILES_INVALID", "mismatches": []}
+    try:
+        expected_release_id = compute_install_release_id(source_head, files)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "INSTALLED_MANIFEST_FILES_INVALID", "mismatches": []}
+    if manifest.get("release_id") != expected_release_id:
+        return {
+            "ok": False,
+            "error": "INSTALLED_MANIFEST_RELEASE_ID_MISMATCH",
+            "source_head": source_head,
+            "release_id": manifest.get("release_id"),
+            "mismatches": [],
+        }
     mismatches = []
-    for item in manifest.get("files", []):
-        path = runtime_root / str(item["target"])
+    for item in files:
+        if not isinstance(item, dict):
+            return {"ok": False, "error": "INSTALLED_MANIFEST_FILES_INVALID", "mismatches": []}
+        try:
+            path = _recovery_target(runtime_root, item.get("target"))
+        except RuntimeError as exc:
+            return {"ok": False, "error": str(exc), "mismatches": []}
         actual = sha256_file(path) if path.is_file() else None
         if actual != item.get("sha256"):
             mismatches.append({"target": item.get("target"), "expected": item.get("sha256"), "actual": actual})
-    return {
-        "ok": not mismatches,
-        "error": None if not mismatches else "RUNTIME_HASH_MISMATCH",
-        "source_head": manifest.get("source_head"),
+    pw_result = None
+    should_check_pw = (
+        check_playwright
+        or playwright_root is not None
+        or (runtime_root / "node_modules" / "playwright-core").exists()
+    )
+    if should_check_pw:
+        pw_result = check_playwright_integrity(runtime_root, playwright_root=playwright_root)
+    pw_failed = pw_result is not None and not pw_result.get("ok")
+    error = None
+    if mismatches:
+        error = "RUNTIME_HASH_MISMATCH"
+    elif pw_failed:
+        error = pw_result.get("error") or "PLAYWRIGHT_INTEGRITY_FAILED"
+    out = {
+        "ok": (not mismatches) and (not pw_failed),
+        "error": error,
+        "source_head": source_head,
         "release_id": manifest.get("release_id"),
-        "file_count": len(manifest.get("files", [])),
+        "file_count": len(files),
         "mismatches": mismatches,
     }
+    if pw_result is not None:
+        out["playwright_integrity"] = pw_result
+    return out
+
+
+def _is_reparse(path: Path) -> bool:
+    return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
+
+
+def _assert_no_reparse_relative(base_phys: Path, target: Path) -> Path:
+    """Ensure target stays inside base_phys and introduces zero symlinks/junctions."""
+    raw_target = Path(os.path.abspath(target))
+    # Walk only the components under base_phys (the caller's base_phys may itself
+    # come from resolving a known owner junction like LOCALAPPDATA\\FF-Windows-Bridge).
+    resolved_target = raw_target.resolve()
+    try:
+        rel = resolved_target.relative_to(base_phys)
+    except ValueError as exc:
+        raise RuntimeError("ACTIVE_RELEASE_OUTSIDE_BRIDGE_ROOT") from exc
+    cursor = base_phys
+    for part in rel.parts:
+        cursor = cursor / part
+        if _is_reparse(cursor):
+            raise RuntimeError("ACTIVE_RELEASE_LINK_FORBIDDEN")
+    if _is_reparse(raw_target):
+        raise RuntimeError("ACTIVE_RELEASE_LINK_FORBIDDEN")
+    return resolved_target
+
+
+def active_release_pointer_path(bridge_root: Path) -> Path:
+    base_phys = Path(os.path.abspath(bridge_root)).resolve()
+    return base_phys / ACTIVE_RELEASE_RELPATH
+
+
+def _pointer_summary(pointer: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "release_dir": pointer.get("release_dir"),
+        "release_name": pointer.get("release_name"),
+        "source_head": pointer.get("source_head"),
+        "release_id": pointer.get("release_id"),
+        "manifest_sha256": pointer.get("manifest_sha256"),
+        "agent_entrypoint": pointer.get("agent_entrypoint", "ff_win_v3_main.py"),
+        "agent_entrypoint_sha256": pointer.get("agent_entrypoint_sha256"),
+        "playwright_root": pointer.get("playwright_root"),
+    }
+
+
+def _validate_release_dir_for_pointer(
+    bridge_root: Path,
+    release_dir: Path,
+    *,
+    repo: Path | None = None,
+    playwright_root: Path | None = None,
+    check_playwright: bool = True,
+    agent_entrypoint: str = "ff_win_v3_main.py",
+) -> dict[str, Any]:
+    base_phys = Path(os.path.abspath(bridge_root)).resolve()
+    rel_phys = _assert_no_reparse_relative(base_phys, release_dir)
+    if not rel_phys.is_dir():
+        raise RuntimeError("ACTIVE_RELEASE_DIR_MISSING")
+    manifest_path = rel_phys / MANIFEST_NAME
+    if _is_reparse(manifest_path) or not manifest_path.is_file():
+        raise RuntimeError("ACTIVE_RELEASE_MANIFEST_MISSING")
+    pw_root_phys: Path | None = None
+    if playwright_root is not None:
+        pw_raw = Path(os.path.abspath(playwright_root))
+        if _is_reparse(pw_raw) or not pw_raw.exists():
+            raise RuntimeError("PLAYWRIGHT_ROOT_INVALID")
+        pw_root_phys = pw_raw.resolve()
+    verified = verify_runtime(
+        rel_phys,
+        repo=repo,
+        check_playwright=check_playwright,
+        playwright_root=pw_root_phys,
+    )
+    if not verified.get("ok"):
+        raise RuntimeError("ACTIVE_RELEASE_UNVERIFIED:" + str(verified.get("error")))
+    manifest_bytes = manifest_path.read_bytes()
+    manifest_data = json.loads(manifest_bytes.decode("utf-8-sig"))
+    entry_path = _recovery_target(rel_phys, agent_entrypoint)
+    if not entry_path.is_file():
+        raise RuntimeError("ACTIVE_RELEASE_ENTRYPOINT_MISSING:" + agent_entrypoint)
+    file_map = {str(item["target"]): str(item["sha256"]) for item in manifest_data["files"]}
+    if agent_entrypoint not in file_map:
+        raise RuntimeError("ACTIVE_RELEASE_ENTRYPOINT_UNTRACKED:" + agent_entrypoint)
+    entry_sha = sha256_file(entry_path)
+    if entry_sha != file_map[agent_entrypoint]:
+        raise RuntimeError("ACTIVE_RELEASE_ENTRYPOINT_HASH_MISMATCH")
+    resolved_pw = pw_root_phys
+    if resolved_pw is None and (rel_phys / "node_modules" / "playwright-core").is_dir():
+        resolved_pw = rel_phys
+    return {
+        "bridge_root": str(base_phys),
+        "release_dir": str(rel_phys),
+        "manifest_path": str(manifest_path),
+        "manifest_sha256": sha256_bytes(manifest_bytes),
+        "source_head": verified["source_head"],
+        "release_id": verified["release_id"],
+        "file_count": verified["file_count"],
+        "agent_entrypoint": agent_entrypoint,
+        "agent_path": str(entry_path),
+        "agent_entrypoint_sha256": entry_sha,
+        "hub_entrypoint": "ff_hub.py" if (rel_phys / "ff_hub.py").is_file() else None,
+        "hub_path": str(rel_phys / "ff_hub.py") if (rel_phys / "ff_hub.py").is_file() else None,
+        "browser_hub_entrypoint": "ff_browser_hub.mjs" if (rel_phys / "ff_browser_hub.mjs").is_file() else None,
+        "browser_hub_path": str(rel_phys / "ff_browser_hub.mjs") if (rel_phys / "ff_browser_hub.mjs").is_file() else None,
+        "playwright_root": str(resolved_pw) if resolved_pw is not None else None,
+        "playwright_integrity": verified.get("playwright_integrity"),
+    }
+
+
+def verify_active_release_pointer(
+    bridge_root: Path, *, repo: Path | None = None, check_playwright: bool = True
+) -> dict[str, Any]:
+    base_phys = Path(os.path.abspath(bridge_root)).resolve()
+    pointer_path = base_phys / ACTIVE_RELEASE_RELPATH
+    if not pointer_path.exists():
+        return {"ok": False, "present": False, "error": "ACTIVE_RELEASE_POINTER_MISSING"}
+    try:
+        _assert_no_reparse_relative(base_phys, pointer_path)
+    except RuntimeError as exc:
+        return {"ok": False, "present": True, "error": str(exc)}
+    if not pointer_path.is_file():
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_POINTER_NOT_FILE"}
+    try:
+        pointer = _read_json(pointer_path)
+    except (OSError, ValueError, UnicodeError):
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_POINTER_INVALID_JSON"}
+    if not isinstance(pointer, dict) or pointer.get("schema") != ACTIVE_RELEASE_SCHEMA:
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_SCHEMA_INVALID"}
+    release_dir_raw = pointer.get("release_dir")
+    if not isinstance(release_dir_raw, str) or not release_dir_raw.strip():
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_DIR_INVALID"}
+    entry_name = pointer.get("agent_entrypoint") or "ff_win_v3_main.py"
+    pw_raw = pointer.get("playwright_root")
+    pw_path = Path(pw_raw) if isinstance(pw_raw, str) and pw_raw.strip() else None
+    try:
+        checked = _validate_release_dir_for_pointer(
+            base_phys,
+            Path(release_dir_raw),
+            repo=repo,
+            playwright_root=pw_path,
+            check_playwright=check_playwright,
+            agent_entrypoint=str(entry_name),
+        )
+    except RuntimeError as exc:
+        return {"ok": False, "present": True, "error": str(exc)}
+    if pointer.get("manifest_sha256") != checked["manifest_sha256"]:
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_MANIFEST_SHA_MISMATCH"}
+    if pointer.get("source_head") != checked["source_head"]:
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_SOURCE_HEAD_MISMATCH"}
+    if pointer.get("release_id") != checked["release_id"]:
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_ID_MISMATCH"}
+    if pointer.get("agent_entrypoint_sha256") != checked["agent_entrypoint_sha256"]:
+        return {"ok": False, "present": True, "error": "ACTIVE_RELEASE_ENTRYPOINT_SHA_MISMATCH"}
+    return {
+        "ok": True,
+        "present": True,
+        "error": None,
+        "pointer_path": str(pointer_path),
+        "release_name": pointer.get("release_name"),
+        "updated_at": pointer.get("updated_at"),
+        "previous": pointer.get("previous"),
+        "rolled_back_from": pointer.get("rolled_back_from"),
+        **checked,
+    }
+
+
+def resolve_active_release(
+    bridge_root: Path, *, repo: Path | None = None, check_playwright: bool = True
+) -> dict[str, Any]:
+    """Resolve active release pointer fail-closed when present, or legacy bridge-v3 when absent."""
+    base_phys = Path(os.path.abspath(bridge_root)).resolve()
+    pointer_path = base_phys / ACTIVE_RELEASE_RELPATH
+    if pointer_path.exists() or _is_reparse(pointer_path):
+        return verify_active_release_pointer(base_phys, repo=repo, check_playwright=check_playwright)
+    legacy_dir = base_phys / "bridge-v3"
+    return {
+        "ok": (legacy_dir / "ff_win_v3_main.py").is_file(),
+        "present": False,
+        "mode": "legacy_bridge_v3",
+        "release_dir": str(legacy_dir),
+        "agent_path": str(legacy_dir / "ff_win_v3_main.py"),
+        "hub_path": str(legacy_dir / "ff_hub.py") if (legacy_dir / "ff_hub.py").is_file() else None,
+        "browser_hub_path": str(legacy_dir / "ff_browser_hub.mjs") if (legacy_dir / "ff_browser_hub.mjs").is_file() else None,
+        "playwright_root": str(legacy_dir) if (legacy_dir / "node_modules" / "playwright-core").is_dir() else None,
+    }
+
+
+def stage_release_dir(
+    repo: Path,
+    release_dir: Path,
+    *,
+    ref: str = "HEAD",
+    require_clean: bool = True,
+    strict_external: bool = False,
+    playwright_root: Path | None = None,
+) -> dict[str, Any]:
+    """Stage a provenance-verified versioned release directory from Git."""
+    result = apply_runtime(
+        repo,
+        release_dir,
+        ref=ref,
+        require_clean=require_clean,
+        strict_external=strict_external,
+    )
+    pw_res = check_playwright_integrity(release_dir, playwright_root=playwright_root)
+    if not pw_res.get("ok"):
+        raise RuntimeError("PLAYWRIGHT_INTEGRITY_FAILED:" + str(pw_res.get("error")))
+    result["playwright_integrity"] = pw_res
+    return result
+
+
+def activate_release(
+    bridge_root: Path,
+    release_dir: Path,
+    *,
+    repo: Path | None = None,
+    release_name: str | None = None,
+    playwright_root: Path | None = None,
+    check_playwright: bool = True,
+    agent_entrypoint: str = "ff_win_v3_main.py",
+) -> dict[str, Any]:
+    """Atomically switch state/active-release.json to a verified release directory."""
+    base_phys = Path(os.path.abspath(bridge_root)).resolve()
+    state_dir = base_phys / "state"
+    if _is_reparse(state_dir):
+        raise RuntimeError("ACTIVE_RELEASE_STATE_LINK_FORBIDDEN")
+    checked = _validate_release_dir_for_pointer(
+        base_phys,
+        release_dir,
+        repo=repo,
+        playwright_root=playwright_root,
+        check_playwright=check_playwright,
+        agent_entrypoint=agent_entrypoint,
+    )
+    pointer_path = base_phys / ACTIVE_RELEASE_RELPATH
+    previous_summary = None
+    if pointer_path.exists():
+        _assert_no_reparse_relative(base_phys, pointer_path)
+        try:
+            existing = _read_json(pointer_path)
+        except (OSError, ValueError, UnicodeError):
+            existing = None
+        if isinstance(existing, dict) and existing.get("schema") == ACTIVE_RELEASE_SCHEMA:
+            existing_dir = existing.get("release_dir")
+            if isinstance(existing_dir, str) and _comparable_path(Path(existing_dir)) != _comparable_path(Path(checked["release_dir"])):
+                previous_summary = _pointer_summary(existing)
+            else:
+                previous_summary = existing.get("previous")
+    rel_name = release_name or Path(checked["release_dir"]).parent.name or Path(checked["release_dir"]).name
+    payload: dict[str, Any] = {
+        "schema": ACTIVE_RELEASE_SCHEMA,
+        "release_dir": checked["release_dir"],
+        "release_name": rel_name,
+        "source_head": checked["source_head"],
+        "release_id": checked["release_id"],
+        "manifest_path": checked["manifest_path"],
+        "manifest_sha256": checked["manifest_sha256"],
+        "agent_entrypoint": checked["agent_entrypoint"],
+        "agent_entrypoint_sha256": checked["agent_entrypoint_sha256"],
+        "hub_entrypoint": checked["hub_entrypoint"],
+        "browser_hub_entrypoint": checked["browser_hub_entrypoint"],
+        "playwright_root": checked["playwright_root"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "previous": previous_summary,
+    }
+    atomic_json(pointer_path, payload)
+    verified = verify_active_release_pointer(base_phys, repo=repo, check_playwright=check_playwright)
+    if not verified.get("ok"):
+        raise RuntimeError("ACTIVE_RELEASE_POST_ACTIVATE_FAILED:" + str(verified.get("error")))
+    return verified
+
+
+def rollback_active_release(
+    bridge_root: Path,
+    *,
+    target_release_dir: Path | None = None,
+    repo: Path | None = None,
+    check_playwright: bool = True,
+) -> dict[str, Any]:
+    """Safely roll back state/active-release.json to the previous verified release.
+
+    Never touches unrelated processes or owner state (chat-permission.json,
+    stop.flag, secret). Validates the target release before mutating the pointer.
+    """
+    base_phys = Path(os.path.abspath(bridge_root)).resolve()
+    pointer_path = base_phys / ACTIVE_RELEASE_RELPATH
+    if not pointer_path.is_file():
+        raise RuntimeError("ACTIVE_RELEASE_POINTER_MISSING")
+    _assert_no_reparse_relative(base_phys, pointer_path)
+    current = _read_json(pointer_path)
+    if not isinstance(current, dict) or current.get("schema") != ACTIVE_RELEASE_SCHEMA:
+        raise RuntimeError("ACTIVE_RELEASE_SCHEMA_INVALID")
+    prev = current.get("previous") if isinstance(current.get("previous"), dict) else None
+    if target_release_dir is None:
+        if not prev or not isinstance(prev.get("release_dir"), str) or not prev["release_dir"].strip():
+            raise RuntimeError("ROLLBACK_TARGET_UNAVAILABLE")
+        target_dir = Path(prev["release_dir"])
+        target_name = prev.get("release_name")
+        target_pw = Path(prev["playwright_root"]) if isinstance(prev.get("playwright_root"), str) and prev["playwright_root"].strip() else None
+        target_entry = str(prev.get("agent_entrypoint") or "ff_win_v3_main.py")
+    else:
+        target_dir = Path(target_release_dir)
+        target_name = target_dir.parent.name or target_dir.name
+        target_pw = None
+        target_entry = str(current.get("agent_entrypoint") or "ff_win_v3_main.py")
+    checked = _validate_release_dir_for_pointer(
+        base_phys,
+        target_dir,
+        repo=repo,
+        playwright_root=target_pw,
+        check_playwright=check_playwright,
+        agent_entrypoint=target_entry,
+    )
+    if prev and _comparable_path(Path(checked["release_dir"])) == _comparable_path(Path(str(prev.get("release_dir") or ""))):
+        if prev.get("manifest_sha256") and prev["manifest_sha256"] != checked["manifest_sha256"]:
+            raise RuntimeError("ROLLBACK_TARGET_MANIFEST_DRIFTED")
+        if prev.get("source_head") and prev["source_head"] != checked["source_head"]:
+            raise RuntimeError("ROLLBACK_TARGET_SOURCE_HEAD_DRIFTED")
+    payload: dict[str, Any] = {
+        "schema": ACTIVE_RELEASE_SCHEMA,
+        "release_dir": checked["release_dir"],
+        "release_name": target_name or Path(checked["release_dir"]).parent.name,
+        "source_head": checked["source_head"],
+        "release_id": checked["release_id"],
+        "manifest_path": checked["manifest_path"],
+        "manifest_sha256": checked["manifest_sha256"],
+        "agent_entrypoint": checked["agent_entrypoint"],
+        "agent_entrypoint_sha256": checked["agent_entrypoint_sha256"],
+        "hub_entrypoint": checked["hub_entrypoint"],
+        "browser_hub_entrypoint": checked["browser_hub_entrypoint"],
+        "playwright_root": checked["playwright_root"],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "previous": None,
+        "rolled_back_from": _pointer_summary(current),
+    }
+    atomic_json(pointer_path, payload)
+    verified = verify_active_release_pointer(base_phys, repo=repo, check_playwright=check_playwright)
+    if not verified.get("ok"):
+        raise RuntimeError("ROLLBACK_POST_VERIFY_FAILED:" + str(verified.get("error")))
+    return verified
 
 
 def apply_runtime(
@@ -1015,15 +1557,45 @@ def main() -> int:
     apply_p.add_argument("--strict-external-validation", action="store_true")
     verify_p = sub.add_parser("verify")
     verify_p.add_argument("--runtime-root", type=Path, required=True)
+    verify_p.add_argument("--repo", type=Path)
+    verify_p.add_argument("--playwright-root", type=Path)
     recover_p = sub.add_parser("recover")
     recover_p.add_argument("--runtime-root", type=Path, required=True)
+    activate_p = sub.add_parser("activate")
+    activate_p.add_argument("--bridge-root", type=Path, required=True)
+    activate_p.add_argument("--release-dir", type=Path, required=True)
+    activate_p.add_argument("--repo", type=Path)
+    activate_p.add_argument("--release-name")
+    activate_p.add_argument("--playwright-root", type=Path)
+    rollback_p = sub.add_parser("rollback")
+    rollback_p.add_argument("--bridge-root", type=Path, required=True)
+    rollback_p.add_argument("--release-dir", type=Path)
+    rollback_p.add_argument("--repo", type=Path)
+    pointer_p = sub.add_parser("pointer-status")
+    pointer_p.add_argument("--bridge-root", type=Path, required=True)
+    pointer_p.add_argument("--repo", type=Path)
     ns = parser.parse_args()
     try:
         if ns.command == "apply":
             result = apply_runtime(ns.repo, ns.runtime_root, ref=ns.ref, require_clean=not ns.allow_dirty,
                                    strict_external=ns.strict_external_validation)
         elif ns.command == "verify":
-            result = verify_runtime(ns.runtime_root)
+            result = verify_runtime(ns.runtime_root, repo=ns.repo, playwright_root=ns.playwright_root)
+            if not result["ok"]:
+                print(json.dumps(result, ensure_ascii=False))
+                return 3
+        elif ns.command == "activate":
+            result = activate_release(
+                ns.bridge_root,
+                ns.release_dir,
+                repo=ns.repo,
+                release_name=ns.release_name,
+                playwright_root=ns.playwright_root,
+            )
+        elif ns.command == "rollback":
+            result = rollback_active_release(ns.bridge_root, target_release_dir=ns.release_dir, repo=ns.repo)
+        elif ns.command == "pointer-status":
+            result = verify_active_release_pointer(ns.bridge_root, repo=ns.repo)
             if not result["ok"]:
                 print(json.dumps(result, ensure_ascii=False))
                 return 3

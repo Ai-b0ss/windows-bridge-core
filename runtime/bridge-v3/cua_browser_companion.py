@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import time
@@ -17,14 +18,14 @@ INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
 
 _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True) if os.name == "nt" else None
 if _kernel32 is not None:
-    _kernel32.WaitNamedPipeW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD]
-    _kernel32.WaitNamedPipeW.restype = wintypes.BOOL
     _kernel32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
     _kernel32.CreateFileW.restype = wintypes.HANDLE
     _kernel32.WriteFile.argtypes = [wintypes.HANDLE, wintypes.LPCVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
     _kernel32.WriteFile.restype = wintypes.BOOL
     _kernel32.ReadFile.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID]
     _kernel32.ReadFile.restype = wintypes.BOOL
+    _kernel32.PeekNamedPipe.argtypes = [wintypes.HANDLE, wintypes.LPVOID, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD), ctypes.POINTER(wintypes.DWORD)]
+    _kernel32.PeekNamedPipe.restype = wintypes.BOOL
     _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 
 
@@ -44,28 +45,40 @@ def _read_secret(root: Path) -> str:
     path = root / "secret"
     try:
         value = path.read_text(encoding="ascii").strip()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise CompanionError("BROWSER_COMPANION_SECRET_UNAVAILABLE") from exc
     if len(value) < 16:
         raise CompanionError("BROWSER_COMPANION_SECRET_INVALID")
     return value
 
 
+def pipe_path_for_root(package_root: str | Path) -> str:
+    root = os.path.normpath(os.path.abspath(package_root)).lower()
+    local = os.environ.get('LOCALAPPDATA')
+    if local and root == os.path.normpath(os.path.join(local, 'FF-Windows-Bridge', 'bridge-v3')).lower():
+        return PIPE_PATH
+    suffix = hashlib.sha256(root.encode('utf-16-le')).hexdigest()[:32]
+    return f'{PIPE_PATH}_{suffix}'
+
+
 class BrowserCompanionClient:
-    def __init__(self, package_root: str | Path, *, pipe_path: str = PIPE_PATH):
+    def __init__(self, package_root: str | Path, *, pipe_path: str | None = None):
         self.root = Path(package_root).resolve()
-        self.pipe_path = pipe_path
+        self.pipe_path = pipe_path or pipe_path_for_root(self.root)
 
     def _open(self, timeout_ms: int) -> int:
         if _kernel32 is None:
             raise CompanionError("BROWSER_COMPANION_PLATFORM_UNSUPPORTED")
-        timeout = max(1, min(int(timeout_ms), 30000))
-        if not _kernel32.WaitNamedPipeW(self.pipe_path, timeout):
-            raise _winerr("BROWSER_COMPANION_UNAVAILABLE")
-        handle = _kernel32.CreateFileW(self.pipe_path, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
-        if handle == INVALID_HANDLE_VALUE:
-            raise _winerr("BROWSER_COMPANION_UNAVAILABLE")
-        return handle
+        deadline = time.monotonic() + max(1, min(int(timeout_ms), 30000)) / 1000
+        while True:
+            handle = _kernel32.CreateFileW(self.pipe_path, GENERIC_READ | GENERIC_WRITE, 0, None, OPEN_EXISTING, 0, None)
+            if handle != INVALID_HANDLE_VALUE:
+                return handle
+            error = _winerr("BROWSER_COMPANION_UNAVAILABLE")
+            remaining = deadline - time.monotonic()
+            if error.details['winerror'] not in {2, 231} or remaining <= 0:
+                raise error
+            time.sleep(min(0.025, remaining))
     @staticmethod
     def _write_all(handle: int, data: bytes) -> None:
         offset = 0
@@ -80,12 +93,23 @@ class BrowserCompanionClient:
             offset += written.value
 
     @staticmethod
-    def _read_line(handle: int, limit: int = 1024 * 1024) -> bytes:
+    def _read_line(handle: int, timeout_ms: int, limit: int = 1024 * 1024) -> bytes:
         output = bytearray()
         buffer = ctypes.create_string_buffer(4096)
+        deadline = time.monotonic() + max(1, min(int(timeout_ms), 35000)) / 1000
         while len(output) < limit:
+            available = wintypes.DWORD()
+            if not _kernel32.PeekNamedPipe(handle, None, 0, None, ctypes.byref(available), None):
+                raise _winerr("BROWSER_COMPANION_IPC_READ_FAILED")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise CompanionError("BROWSER_COMPANION_IPC_RESPONSE_TIMEOUT")
+            if not available.value:
+                time.sleep(min(0.025, remaining))
+                continue
             read = wintypes.DWORD()
-            if not _kernel32.ReadFile(handle, buffer, len(buffer), ctypes.byref(read), None):
+            length = min(available.value, len(buffer), limit - len(output))
+            if not _kernel32.ReadFile(handle, buffer, length, ctypes.byref(read), None):
                 raise _winerr("BROWSER_COMPANION_IPC_READ_FAILED")
             if read.value <= 0:
                 break
@@ -107,7 +131,7 @@ class BrowserCompanionClient:
         handle = self._open(timeout_ms)
         try:
             self._write_all(handle, encoded)
-            raw = self._read_line(handle)
+            raw = self._read_line(handle, timeout_ms)
         finally:
             _kernel32.CloseHandle(handle)
         try:
@@ -116,7 +140,7 @@ class BrowserCompanionClient:
             raise CompanionError("BROWSER_COMPANION_IPC_RESPONSE_INVALID") from exc
         if not isinstance(response, dict):
             raise CompanionError("BROWSER_COMPANION_IPC_RESPONSE_INVALID")
-        if response.get("request_id") not in {None, request_id}:
+        if response.get("request_id") != request_id and (response.get("request_id") is not None or response.get("ok") is True):
             raise CompanionError("BROWSER_COMPANION_IPC_RESPONSE_MISMATCH")
         if not bool(response.get("ok", False)):
             code = str(response.get("error_code") or "BROWSER_COMPANION_REQUEST_FAILED")
@@ -128,6 +152,9 @@ class BrowserCompanionClient:
 
     def capabilities(self) -> dict[str, Any]:
         return self.request("capabilities", timeout_ms=1500)
+
+    def health(self) -> dict[str, Any]:
+        return self.request("health", timeout_ms=1500)
 
     def prepare_download(self, spec: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("download.prepare", spec, timeout_ms=1500)

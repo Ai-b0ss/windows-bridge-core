@@ -67,12 +67,16 @@ class OwnerChromeAttachTests(unittest.TestCase):
         self.assertEqual(stub.restarts, 0)
         self.assertEqual(stub.calls[0][1]["ownerTransport"], "extension")
 
-    def test_one_safe_retry_of_disconnected_extension(self):
+    def test_extension_attach_failure_does_not_blindly_restart_or_retry(self):
         stub = FakeSupervisor(BAD, GOOD)
-        result = new_plane(stub)._attach({"surface_kind": "browser", "transport": "extension"})
-        self.assertEqual(result["surface_id"], "mock-owner-surface")
-        self.assertEqual(stub.restarts, 1)
-        self.assertEqual([x[0] for x in stub.calls], ["attach", "attach"])
+        with self.assertRaises(CuaBridgeError) as ctx:
+            new_plane(stub)._attach({"surface_kind": "browser", "transport": "extension"})
+        self.assertEqual(ctx.exception.code, "OWNER_CHROME_ATTACH_FAILED")
+        self.assertEqual(ctx.exception.details["retry"], "disabled_no_blind_retry")
+        self.assertFalse(ctx.exception.details["retry_safe"])
+        self.assertFalse(ctx.exception.details["isolated_fallback"])
+        self.assertEqual(stub.restarts, 0)
+        self.assertEqual([x[0] for x in stub.calls], ["attach"])
 
     def test_active_owner_surface_prevents_restart_and_fallback(self):
         stub = FakeSupervisor(BAD)
@@ -85,14 +89,14 @@ class OwnerChromeAttachTests(unittest.TestCase):
         self.assertFalse(ctx.exception.details["isolated_fallback"])
         self.assertEqual(stub.restarts, 0)
 
-    def test_double_failure_does_not_fall_back_to_isolated(self):
+    def test_attach_failure_does_not_fall_back_to_isolated_or_double_tabs(self):
         stub = FakeSupervisor(BAD, BAD)
         with self.assertRaises(CuaBridgeError) as ctx:
             new_plane(stub)._attach({"surface_kind": "browser", "transport": "extension"})
         self.assertEqual(ctx.exception.code, "OWNER_CHROME_ATTACH_FAILED")
         self.assertFalse(ctx.exception.details["isolated_fallback"])
-        self.assertEqual(stub.restarts, 1)
-        self.assertEqual(len(stub.calls), 2)
+        self.assertEqual(stub.restarts, 0)
+        self.assertEqual(len(stub.calls), 1)
 
     def test_non_owner_profile_capability_is_rejected(self):
         bad_capabilities = {

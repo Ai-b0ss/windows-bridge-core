@@ -20,46 +20,111 @@ from cua_programmatic_discovery import discover_programmatic_surfaces, owned_tcp
 _EDITOR_VALUE_JS = r"""const editorValue=e=>{if(!e.isContentEditable)return e.value||'';const walk=n=>{if(n.nodeType===3)return n.nodeValue||'';if(n.nodeType!==1||n.getAttribute('aria-hidden')==='true')return '';if(n.tagName==='BR')return '\n';const children=[...n.childNodes].filter(x=>x.nodeType!==1||x.getAttribute('aria-hidden')!=='true'),block=n!==e&&['P','DIV'].includes(n.tagName);if(block&&children.length===1&&children[0].tagName==='BR')return '\n';let s=children.map(walk).join('');return block?s+'\n':s;};return walk(e).replace(/\r\n/g,'\n').replace(/\n$/,'');};"""
 
 
+class _LocalWebSocketHandshakeError(RuntimeError):
+    def __init__(
+        self,
+        message: str = "WS_HANDSHAKE_FAILED",
+        *,
+        status_code: int | None = None,
+        closed_before_response: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.closed_before_response = closed_before_response
+
+
 class _LocalWebSocket:
     def __init__(self, url: str, timeout: float):
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost"} or not parsed.port:
+        if parsed.scheme != "ws" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"} or not parsed.port:
             raise RuntimeError("LOCAL_WS_URL_REQUIRED")
+        self._deadline = time.monotonic() + timeout
+        self._buffer = bytearray()
+        self.frame_dirty = False
         self.sock = socket.create_connection((parsed.hostname, parsed.port), timeout=timeout)
+        try:
+            self._handshake(parsed)
+        except BaseException:
+            self.close()
+            raise
+        self.set_deadline(None)
         self.sock.settimeout(timeout)
+
+    @classmethod
+    def from_adopted_socket(cls, sock: socket.socket, *, buffered: bytes = b"", timeout: float = 5.0) -> "_LocalWebSocket":
+        """Wrap an already-upgraded loopback WebSocket without a new handshake."""
+        inst = cls.__new__(cls)
+        inst._deadline = None
+        inst._buffer = bytearray(buffered)
+        inst.frame_dirty = False
+        inst.sock = sock
+        inst.sock.settimeout(timeout)
+        return inst
+
+    def buffered_bytes(self) -> bytes:
+        return bytes(self._buffer)
+
+    def set_deadline(self, deadline: float | None) -> None:
+        self._deadline = deadline
+
+    def _apply_deadline(self) -> None:
+        if self._deadline is not None:
+            remaining = self._deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("WS_DEADLINE_EXCEEDED")
+            self.sock.settimeout(remaining)
+
+    def _handshake(self, parsed) -> None:
         key = base64.b64encode(os.urandom(16)).decode("ascii")
         path = parsed.path or "/"
         if parsed.query:
             path += "?" + parsed.query
+        host = f"[{parsed.hostname}]" if ":" in (parsed.hostname or "") else parsed.hostname
         request = (
-            f"GET {path} HTTP/1.1\r\nHost: {parsed.hostname}:{parsed.port}\r\n"
+            f"GET {path} HTTP/1.1\r\nHost: {host}:{parsed.port}\r\n"
             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
         )
+        self._apply_deadline()
         self.sock.sendall(request.encode("ascii"))
         header = bytearray()
         while b"\r\n\r\n" not in header and len(header) < 16384:
+            self._apply_deadline()
             chunk = self.sock.recv(4096)
             if not chunk:
                 break
             header.extend(chunk)
-        text = header.decode("latin1", "replace")
-        if not text.startswith("HTTP/1.1 101"):
-            self.sock.close()
-            raise RuntimeError("WS_HANDSHAKE_FAILED")
+        headers, separator, rest = header.partition(b"\r\n\r\n")
+        text = headers.decode("latin1", "replace")
+        if not separator or len(headers) >= 16384 or not text.startswith("HTTP/1.1 101 "):
+            status_code: int | None = None
+            first_line = text.split("\r\n", 1)[0]
+            parts = first_line.split(" ", 2)
+            if len(parts) >= 2 and parts[0] in {"HTTP/1.1", "HTTP/1.0"} and len(parts[1]) == 3 and parts[1].isdigit():
+                status_code = int(parts[1])
+            raise _LocalWebSocketHandshakeError(
+                "WS_HANDSHAKE_FAILED",
+                status_code=status_code,
+                closed_before_response=(not header or not separator),
+            )
         expected = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()).decode("ascii")
-        if f"sec-websocket-accept: {expected}".lower() not in text.lower():
-            self.sock.close()
+        fields = dict(line.split(":", 1) for line in text.split("\r\n")[1:] if ":" in line)
+        if not any(name.casefold() == "sec-websocket-accept" and value.strip() == expected for name, value in fields.items()):
             raise RuntimeError("WS_ACCEPT_MISMATCH")
+        self._buffer.extend(rest)
 
     def _recv_exact(self, n: int) -> bytes:
-        out = bytearray()
-        while len(out) < n:
-            chunk = self.sock.recv(n - len(out))
+        # Keep unread bytes inside self._buffer until all n bytes arrive so a
+        # timeout at a frame boundary never drops partial data from the stream.
+        while len(self._buffer) < n:
+            self._apply_deadline()
+            chunk = self.sock.recv(n - len(self._buffer))
             if not chunk:
                 raise EOFError("WS_EOF")
-            out.extend(chunk)
-        return bytes(out)
+            self._buffer.extend(chunk)
+        out = bytes(self._buffer[:n])
+        del self._buffer[:n]
+        return out
 
     def send(self, text: str) -> None:
         payload = text.encode("utf-8")
@@ -75,12 +140,20 @@ class _LocalWebSocket:
             head.append(0x80 | 127)
             head.extend(struct.pack("!Q", n))
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.sock.sendall(bytes(head) + mask + masked)
+        self._apply_deadline()
+        try:
+            self.sock.sendall(bytes(head) + mask + masked)
+        except Exception:
+            self.frame_dirty = True
+            raise
 
     def recv(self) -> str:
         parts = bytearray()
         while True:
             b1, b2 = self._recv_exact(2)
+            # Once a frame header has been consumed from the buffer, any
+            # mid-frame interruption leaves the stream desynchronized.
+            self.frame_dirty = True
             fin, opcode = bool(b1 & 0x80), b1 & 0x0F
             n = b2 & 0x7F
             if n == 126:
@@ -96,15 +169,22 @@ class _LocalWebSocket:
                 raise EOFError("WS_CLOSED")
             if opcode == 0x9:
                 self._send_control(0xA, payload)
+                if not parts:
+                    self.frame_dirty = False
                 continue
             if opcode in (0x1, 0x0):
                 parts.extend(payload)
                 if fin:
+                    self.frame_dirty = False
                     return parts.decode("utf-8")
+            elif not parts:
+                self.frame_dirty = False
 
     def _send_control(self, opcode: int, payload: bytes) -> None:
+        payload = payload[:125]
         mask = os.urandom(4)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self._apply_deadline()
         self.sock.sendall(bytes([0x80 | opcode, 0x80 | len(payload)]) + mask + masked)
 
     def close(self) -> None:

@@ -624,6 +624,28 @@ def _gui_cursor(core: Any, args: dict[str, Any]) -> dict[str, Any]:
     return {"x": point.x, "y": point.y}
 
 
+def _release_provenance(core: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only active release pointer and installed manifest provenance status."""
+    import cua_runtime_deploy as deploy
+
+    bridge_root = Path(getattr(core, "BRIDGE_ROOT", Path(__file__).resolve().parents[1]))
+    current_dir = Path(__file__).resolve().parent
+    pointer = deploy.resolve_active_release(bridge_root, check_playwright=False)
+    local_verify = deploy.verify_runtime(current_dir, allow_lock=True, check_playwright=False)
+    return {
+        "ok": bool(pointer.get("ok")),
+        "pointer_present": bool(pointer.get("present")),
+        "mode": "active_release_pointer" if pointer.get("present") else pointer.get("mode", "legacy_bridge_v3"),
+        "release_name": pointer.get("release_name"),
+        "source_head": pointer.get("source_head") or local_verify.get("source_head"),
+        "release_id": pointer.get("release_id") or local_verify.get("release_id"),
+        "pointer_error": pointer.get("error"),
+        "running_manifest_ok": bool(local_verify.get("ok")),
+        "running_source_head": local_verify.get("source_head"),
+        "running_release_id": local_verify.get("release_id"),
+    }
+
+
 def register(core: Any) -> None:
     core.OPS["read_multiple_files"] = lambda args: _read_multiple_files_paged(core, args)
     core.OPS.update(
@@ -635,6 +657,7 @@ def register(core: Any) -> None:
             "finish_file_write_stream": lambda args: _finish_file_write_stream(core, args),
             "close_file_stream": lambda args: _close_file_stream(core, args),
             "list_file_streams": lambda args: _list_file_streams(core, args),
+            "release_provenance": lambda args: _release_provenance(core, args),
             "gui_screenshot": lambda args: _capture_screen_png(core, args),
             "gui_list_windows": lambda args: _list_windows(core, args),
             "gui_focus_window": lambda args: _focus_window(core, args),
@@ -655,6 +678,7 @@ def register(core: Any) -> None:
                 "manifest_multi_file_read": True,
                 "large_file_streaming": True,
                 "atomic_streamed_upload": True,
+                "atomic_release_pointer": True,
                 "gui_screenshot": platform.system().lower() == "windows",
                 "gui_windows": platform.system().lower() == "windows",
                 "gui_mouse": platform.system().lower() == "windows",

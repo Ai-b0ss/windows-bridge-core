@@ -16,6 +16,13 @@ import tarfile
 import zipfile
 
 PREVIOUS_RELEASE_SHA = "46e43217fe6cace1f7a55c8aa00afba694fd03926c276565671a7566cee0d540"
+TEMPLATE_SOURCE_COMMIT = "HEAD_RESOLVED_AT_RELEASE_BUILD"
+KNOWN_STALE_COMMITS = frozenset({
+    "c034e527a77b737b266c3c7df8b8521032be6f8a",  # legacy ancestor monorepo (2026-10-13)
+    "abd6666b1fc630e84debeef961d0b60da9d0e631",  # legacy ancestor monorepo (2026-09-27)
+    "8f5104895aa51212e86bdd9cf2922197ef026210",  # legacy ancestor monorepo (2026-09-30)
+})
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}\Z", re.ASCII)
 ASSET_HASHES = {
     "assets/python-3.13.9-embed-amd64.zip": "91d828c2da3a029b41699e918674a0cb379c02cf20dab9c501306885f837402a",
     "assets/node-v22.14.0-win-x64.zip": "55b639295920b219bb2acbcfa00f90393a2789095b7323f79475c9f34795f217",
@@ -28,7 +35,9 @@ ROOT_FILES = {
     "ADDONS.cmd", "OPTIONAL-ADDONS.md", "REMOTE-PAIRING.md",
     "CHATGPT-REMOTE-CONTROL.md",
 }
-TOOL_FILES = {"tools/bridge_remote_gh.py", "tools/optional_addons.py", "tools/cua_cold_rollback_bundle.py", "tools/cua_cold_recovery_watchdog.py"}
+TOOL_FILES = {"tools/bridge_remote_gh.py", "tools/optional_addons.py", "tools/cua_cold_rollback_bundle.py", "tools/cua_cold_recovery_watchdog.py",
+              "tools/private_desktop_client.py","tools/private_desktop_runtime.py", "tools/agent_entry.py",
+              "tools/canary_release_workflow.py", "tools/canary_cutover_c1_c2.ps1", "tools/canary_rollback_c1_c2.ps1"}
 TEXT_EXTENSIONS = (".py", ".ps1", ".cmd", ".json", ".mjs", ".js", ".cs", ".md", ".txt")
 SECRET_PATTERNS = (
     rb"gh[pousr]_[A-Za-z0-9]{24,}", rb"github_pat_[A-Za-z0-9_]{30,}",
@@ -41,10 +50,80 @@ def sha(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def is_hex40_commit(value: object) -> bool:
+    return isinstance(value, str) and bool(_HEX40_RE.fullmatch(value))
+
+
+def git_commit_exists(repo: Path, commit: str) -> bool:
+    if not is_hex40_commit(commit):
+        return False
+    done = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-t", commit],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return done.returncode == 0 and done.stdout.strip() == "commit"
+
+
+def validate_source_commit(
+    commit: object, *, repo: Path | None = None, allow_template: bool = False
+) -> str:
+    if not isinstance(commit, str) or not commit.strip() or commit != commit.strip():
+        raise ValueError("SOURCE_COMMIT_MISSING_OR_INVALID")
+    if commit.lower() in KNOWN_STALE_COMMITS:
+        raise ValueError("STALE_SOURCE_COMMIT_FORBIDDEN: " + commit)
+    if allow_template and commit == TEMPLATE_SOURCE_COMMIT:
+        return TEMPLATE_SOURCE_COMMIT
+    if not is_hex40_commit(commit):
+        raise ValueError("SOURCE_COMMIT_NOT_HEX40: " + commit)
+    if repo is not None and (repo / ".git").exists() and not git_commit_exists(repo, commit):
+        raise ValueError("SOURCE_COMMIT_UNKNOWN_IN_GIT: " + commit)
+    return commit
+
+
+def verify_release_manifest_provenance(
+    manifest: object, *, repo: Path | None = None, mode: str = "assembled"
+) -> dict:
+    """Validate release-manifest.json provenance for template or assembled builds."""
+    if not isinstance(manifest, dict) or manifest.get("schema") != "ff-gh-release-v1":
+        raise ValueError("RELEASE_MANIFEST_SCHEMA_INVALID")
+    if mode == "template":
+        source_commit = manifest.get("source_commit")
+        if isinstance(source_commit, str) and source_commit.lower() in KNOWN_STALE_COMMITS:
+            raise ValueError("STALE_SOURCE_COMMIT_FORBIDDEN: " + source_commit)
+        if source_commit != TEMPLATE_SOURCE_COMMIT:
+            raise ValueError(
+                "TEMPLATE_SOURCE_COMMIT_MUST_BE_PLACEHOLDER: expected "
+                + TEMPLATE_SOURCE_COMMIT
+                + ", got "
+                + repr(source_commit)
+            )
+        if manifest.get("source_bytes_verified_against_commit") is True:
+            raise ValueError("TEMPLATE_CANNOT_CLAIM_ASSEMBLED_VERIFICATION")
+        public_commit = manifest.get("public_source_commit")
+        if public_commit is not None:
+            raise ValueError("TEMPLATE_CANNOT_CARRY_PUBLIC_SOURCE_COMMIT")
+        return {"ok": True, "mode": mode, "source_commit": source_commit}
+    if mode != "assembled":
+        raise ValueError("UNKNOWN_PROVENANCE_MODE: " + str(mode))
+    source_commit = validate_source_commit(
+        manifest.get("source_commit"), repo=repo, allow_template=False
+    )
+    public_commit = validate_source_commit(
+        manifest.get("public_source_commit"), repo=repo, allow_template=False
+    )
+    if source_commit != public_commit:
+        raise ValueError("SOURCE_COMMIT_PUBLIC_MISMATCH")
+    if manifest.get("source_bytes_verified_against_commit") is not True:
+        raise ValueError("SOURCE_BYTES_NOT_VERIFIED_AGAINST_COMMIT")
+    return {"ok": True, "mode": mode, "source_commit": source_commit}
+
+
 def bundled_subtree_file(name: str) -> bool:
     path = Path(name)
     return (path.parts[0] in {"runtime", "tests"} and
-            "__pycache__" not in path.parts and
+            not {"__pycache__", "node_modules"} & set(path.parts) and
             path.suffix.lower() not in {".pyc", ".pyd", ".exe", ".dll", ".zip"})
 
 
@@ -60,12 +139,17 @@ def source_tree(repo: Path) -> dict[str, bytes]:
         if not root.is_dir():
             raise ValueError("Required public source tree missing: " + subtree)
         for file in sorted(root.rglob("*")):
+            name = file.relative_to(repo).as_posix()
+            # npm ci installs reproducible dependencies locally for tests.
+            # Never bundle their untracked bytes or accidentally package a
+            # vendor token/cache. Still reject any unexpected source file or
+            # symlink outside the dependency directory.
+            if "node_modules" in file.relative_to(repo).parts:
+                continue
             if file.is_symlink():
                 raise ValueError("Public source file/link not allowed: " + str(file))
-            if file.is_file():
-                name = file.relative_to(repo).as_posix()
-                if bundled_subtree_file(name):
-                    bundle[name] = file.read_bytes()
+            if file.is_file() and bundled_subtree_file(name):
+                bundle[name] = file.read_bytes()
     if "runtime/bridge-v3/ff_win_v3_main.py" not in bundle:
         raise ValueError("Core runtime entrypoint missing")
     return bundle
@@ -78,8 +162,9 @@ def verify_source_commit(repo: Path, contents: dict[str, bytes]) -> str:
     diff (which can trust assume-unchanged/skip-worktree flags). Pin HEAD once
     so concurrent branch movement cannot relabel the archive.
     """
-    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+    head = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "HEAD^{commit}"],
                           capture_output=True, text=True, check=True).stdout.strip()
+    validate_source_commit(head, repo=repo, allow_template=False)
     raw = subprocess.run(["git", "-c", "core.autocrlf=false", "-c", "core.eol=lf",
                           "-C", str(repo), "archive", "--format=tar", head],
                          capture_output=True, check=True).stdout
@@ -98,7 +183,14 @@ def verify_source_commit(repo: Path, contents: dict[str, bytes]) -> str:
 
 
 def refresh_source_manifest(repo: Path) -> dict:
-    """Refresh the checked-in template; assemble still verifies release provenance."""
+    """Refresh the checked-in template; assemble still verifies release provenance.
+
+    A committed manifest file cannot hold its own Git commit SHA due to SHA-1
+    circularity. Replace any stale/legacy 40-char commit SHA (or any Git checkout
+    template) with TEMPLATE_SOURCE_COMMIT so provenance is never stuck at an
+    obsolete ancestor commit, while assemble() stamps and verifies the exact
+    40-char Git HEAD into built release archives.
+    """
     path = repo / "release-manifest.json"
     manifest = json.loads(path.read_text(encoding="utf-8"))
     contents = source_tree(repo)
@@ -108,8 +200,24 @@ def refresh_source_manifest(repo: Path) -> dict:
              name not in ROOT_FILES | TOOL_FILES}
     files.update({name: sha(data) for name, data in contents.items()})
     manifest["files"] = dict(sorted(files.items()))
-    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    return {"ok": True, "output": str(path), "source_files": len(contents)}
+    current_commit = manifest.get("source_commit")
+    if (
+        (repo / ".git").exists()
+        or not isinstance(current_commit, str)
+        or not current_commit.strip()
+        or current_commit.lower() in KNOWN_STALE_COMMITS
+        or is_hex40_commit(current_commit)
+    ):
+        manifest["source_commit"] = TEMPLATE_SOURCE_COMMIT
+        manifest.pop("public_source_commit", None)
+        manifest.pop("source_bytes_verified_against_commit", None)
+    path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    return {
+        "ok": True,
+        "output": str(path),
+        "source_files": len(contents),
+        "source_commit": manifest.get("source_commit"),
+    }
 
 
 def assemble(repo: Path, previous: Path, output: Path) -> dict:
@@ -171,6 +279,9 @@ def assemble(repo: Path, previous: Path, output: Path) -> dict:
         if bad:
             raise ValueError("OUTPUT_ZIP_CRC_FAILED")
         checked = json.loads(z.read("release-manifest.json"))
+        verify_release_manifest_provenance(checked, repo=repo, mode="assembled")
+        if checked.get("source_commit") != head:
+            raise ValueError("OUTPUT_MANIFEST_COMMIT_MISMATCH")
         for path, expected in checked["files"].items():
             if sha(z.read(path)) != expected:
                 raise ValueError("OUTPUT_MANIFEST_HASH_FAILED: " + path)

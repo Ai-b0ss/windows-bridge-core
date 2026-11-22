@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import tempfile
@@ -13,6 +14,13 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA = "cua-release-manifest/v1"
+TEMPLATE_SOURCE_COMMIT = "HEAD_RESOLVED_AT_RELEASE_BUILD"
+KNOWN_STALE_COMMITS = frozenset({
+    "c034e527a77b737b266c3c7df8b8521032be6f8a",  # legacy ancestor monorepo (2026-10-13)
+    "abd6666b1fc630e84debeef961d0b60da9d0e631",  # legacy ancestor monorepo (2026-09-27)
+    "8f5104895aa51212e86bdd9cf2922197ef026210",  # legacy ancestor monorepo (2026-09-30)
+})
+_HEX40_RE = re.compile(r"^[0-9a-f]{40}\Z", re.ASCII)
 COMPONENTS = (
     "docs/HIDDEN_PANEL_AGENT_GUIDE.md",
     "tools/ff_win_v3_agent.py",
@@ -152,8 +160,66 @@ def _sha256(path: Path) -> str:
 
 
 
+def is_hex40_commit(value: Any) -> bool:
+    return isinstance(value, str) and bool(_HEX40_RE.fullmatch(value))
+
+
+def git_commit_exists(repo: Path, commit: str) -> bool:
+    if not is_hex40_commit(commit):
+        return False
+    cp = subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-t", commit],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    return cp.returncode == 0 and cp.stdout.strip() == "commit"
+
+
+def validate_commit_sha(commit: Any, *, repo: Path | None = None) -> str:
+    if not isinstance(commit, str) or not commit:
+        raise RuntimeError("SOURCE_COMMIT_MISSING")
+    lower = commit.lower()
+    if lower in KNOWN_STALE_COMMITS:
+        raise RuntimeError(f"STALE_SOURCE_COMMIT_FORBIDDEN:{commit}")
+    if not is_hex40_commit(commit):
+        raise RuntimeError(f"SOURCE_COMMIT_INVALID:{commit}")
+    if repo is not None and (repo / ".git").exists():
+        if not git_commit_exists(repo, commit):
+            raise RuntimeError(f"SOURCE_COMMIT_UNKNOWN_IN_GIT:{commit}")
+    return commit
+
+
+def compute_install_release_id(source_head: str, files: list[dict[str, Any]]) -> str:
+    identity = {"head": source_head, "files": files}
+    encoded = json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def verify_installed_manifest_provenance(
+    manifest: Any, *, repo: Path | None = None
+) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or manifest.get("schema") != "cua-runtime-install/v1":
+        raise RuntimeError("INSTALLED_MANIFEST_SCHEMA_INVALID")
+    source_head = validate_commit_sha(manifest.get("source_head"), repo=repo)
+    files = manifest.get("files")
+    if not isinstance(files, list) or not files:
+        raise RuntimeError("INSTALLED_MANIFEST_FILES_INVALID")
+    expected_release_id = compute_install_release_id(source_head, files)
+    if manifest.get("release_id") != expected_release_id:
+        raise RuntimeError("INSTALLED_MANIFEST_RELEASE_ID_MISMATCH")
+    return {
+        "ok": True,
+        "source_head": source_head,
+        "release_id": expected_release_id,
+        "file_count": len(files),
+    }
+
+
 def resolve_ref(repo: Path, ref: str = "HEAD") -> str:
-    return _run(["git", "rev-parse", ref], repo)
+    head = _run(["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], repo)
+    return validate_commit_sha(head, repo=repo)
 
 
 def git_blob_bytes(repo: Path, ref: str, rel: str) -> bytes:

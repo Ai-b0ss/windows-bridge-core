@@ -29,6 +29,12 @@ def _object_arg(args: dict[str, Any], key: str, *, default_empty: bool = True) -
     return dict(value)
 
 
+_FORBIDDEN_PHYSICAL_OPS = frozenset({
+    "physical_sequence", "send_input", "mouse_click", "mouse_move",
+    "key_tap", "key_chord", "unicode_char", "visual_click", "switch_desktop",
+})
+
+
 def dispatch(core: NativeSemanticCore, request: dict[str, Any]) -> dict[str, Any]:
     op = request.get("op")
     args = request.get("args")
@@ -36,6 +42,12 @@ def dispatch(core: NativeSemanticCore, request: dict[str, Any]) -> dict[str, Any
         args = {}
     if not isinstance(args, dict):
         raise NativeError("INVALID_ARGUMENT", "args must be an object")
+    if op in _FORBIDDEN_PHYSICAL_OPS:
+        raise NativeError(
+            "PHYSICAL_INPUT_FORBIDDEN",
+            f"Physical input op {op!r} is forbidden in the native semantic sidecar",
+            {"op": op, "physical_input_used": False, "retry_safe": False},
+        )
 
     if op == "capabilities":
         result = dict(core.capabilities())

@@ -77,6 +77,9 @@ def _state(path: Path) -> dict:
     if (data.get("source_head") != saved.get("source_head")
             or data.get("candidate_head") != saved.get("candidate_head")):
         raise RuntimeError("WATCH_SOURCE_IDENTITY_INVALID")
+    if (str(data.get("source_head") or "").lower() in bundle.deploy.KNOWN_STALE_COMMITS
+            or str(data.get("candidate_head") or "").lower() in bundle.deploy.KNOWN_STALE_COMMITS):
+        raise RuntimeError("WATCH_SOURCE_COMMIT_STALE")
     old_agents = [x for x in saved["source_files"] if x["target"] == "ff_win_v3_agent.py"]
     candidate_agents = [x for x in saved["candidate_files"] if x["target"] == "ff_win_v3_agent.py"]
     if (len(old_agents) != 1 or len(candidate_agents) != 1

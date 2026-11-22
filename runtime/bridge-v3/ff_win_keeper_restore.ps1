@@ -1,10 +1,12 @@
 [CmdletBinding()]
-param()
+param([string]$BridgeRoot = '')
 $ErrorActionPreference='Continue'
 $ProgressPreference='SilentlyContinue'
-$bridgeRoot=Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\bridge-v3'
+$bridgeBase=if($BridgeRoot -and $BridgeRoot.Trim()){[IO.Path]::GetFullPath($BridgeRoot.Trim())}else{Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge'}
+$bridgeRoot=Join-Path $bridgeBase 'bridge-v3'
 $keeperPath=Join-Path $bridgeRoot 'ff_win_v3_keeper.ps1'
 $ownerChromeBootstrapPath=Join-Path $bridgeRoot 'cua_owner_chrome_logon.ps1'
+$activeReleaseInfo=$null
 function KeeperProcs { @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine -and $_.CommandLine -match '(?i)ff_win_v3_keeper\.ps1'}|ForEach-Object{[pscustomobject]@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId}}) }
 function RelayProcs { @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue|Where-Object{$_.CommandLine -and $_.CommandLine -match '(?i)(desktop-commander.*remote|wonderwhy-er.*remote)'}|ForEach-Object{[pscustomobject]@{pid=[int]$_.ProcessId;ppid=[int]$_.ParentProcessId;name=$_.Name}}) }
 $events=@()
@@ -16,7 +18,21 @@ if($runtimeDependencyOk){
     if($errors.Count -ne 0){$runtimeDependencyOk=$false;$events+=('runtime script parse failed: '+[IO.Path]::GetFileName($script))}
   }
 }else{$events+='keeper runtime dependency missing'}
-$before=[ordered]@{keeper=@(KeeperProcs);relay=@(RelayProcs);keeper_path_exists=(Test-Path -LiteralPath $keeperPath);owner_chrome_bootstrap_exists=(Test-Path -LiteralPath $ownerChromeBootstrapPath);runtime_dependency_ok=$runtimeDependencyOk}
+if($runtimeDependencyOk){
+  try{
+    . $keeperPath -LoadFunctionsOnly -BridgeRoot $bridgeBase
+    $resolved=Resolve-FF3ActiveRelease
+    $activeReleaseInfo=[ordered]@{ok=[bool]$resolved.ok;mode=[string]$resolved.mode;release_name=[string]$resolved.release_name;source_head=[string]$resolved.source_head;error=[string]$resolved.error}
+    if($resolved.present -and -not $resolved.ok){
+      $runtimeDependencyOk=$false
+      $events+=('active release pointer invalid: '+[string]$resolved.error)
+    }
+  }catch{
+    $runtimeDependencyOk=$false
+    $events+=('active release resolution failed: '+$_.Exception.Message)
+  }
+}
+$before=[ordered]@{keeper=@(KeeperProcs);relay=@(RelayProcs);keeper_path_exists=(Test-Path -LiteralPath $keeperPath);owner_chrome_bootstrap_exists=(Test-Path -LiteralPath $ownerChromeBootstrapPath);active_release=$activeReleaseInfo;runtime_dependency_ok=$runtimeDependencyOk}
 if($runtimeDependencyOk -and @(KeeperProcs).Count -eq 0){
   try{
     $task=Get-ScheduledTask -TaskName 'FF-Windows-Bridge-Interactive' -ErrorAction SilentlyContinue
@@ -30,6 +46,7 @@ if($runtimeDependencyOk -and @(KeeperProcs).Count -eq 0){
     $psi=New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName=$ps.Source
     $psi.Arguments=('-NoLogo -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "'+$keeperPath+'"')
+    if($BridgeRoot -and $BridgeRoot.Trim()){$psi.Arguments+=' -BridgeRoot "'+$bridgeBase+'"'}
     $psi.WorkingDirectory=$bridgeRoot
     $psi.UseShellExecute=$false
     $psi.CreateNoWindow=$true

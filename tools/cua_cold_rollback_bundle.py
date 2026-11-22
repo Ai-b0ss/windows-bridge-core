@@ -102,6 +102,8 @@ def preflight(repo: Path, runtime: Path, *, trusted_head: str, candidate_ref: st
         raise RuntimeError("INSTALLED_RUNTIME_MISSING")
     if not (len(trusted_head) == 40 and all(c in "0123456789abcdef" for c in trusted_head)):
         raise RuntimeError("TRUSTED_HEAD_NOT_PINNED")
+    if trusted_head.lower() in deploy.KNOWN_STALE_COMMITS:
+        raise RuntimeError("TRUSTED_HEAD_STALE_FORBIDDEN")
     proof = deploy.plan_manifest_reconciliation(repo, runtime, trusted_head=trusted_head, ref=candidate_ref)
     history = legacy_journals(runtime)
     if not proof.get("provenance_verified") or proof.get("unresolved_deploy_transactions") != len(history):
@@ -169,13 +171,20 @@ def capture(repo: Path, runtime: Path, snapshot: Path, *, trusted_head: str,
         if hashlib.sha256(data).hexdigest() != proof["old_manifest_sha256"]:
             raise RuntimeError("MANIFEST_CHANGED_DURING_SNAPSHOT")
         _atomic_write(snapshot / "previous-manifest.json", data)
+        pointer_src = runtime.parent / deploy.ACTIVE_RELEASE_RELPATH
+        pointer_sha = None
+        if pointer_src.is_file() and not (pointer_src.is_symlink() or getattr(pointer_src, "is_junction", lambda: False)()):
+            pointer_bytes = pointer_src.read_bytes()
+            pointer_sha = hashlib.sha256(pointer_bytes).hexdigest()
+            _atomic_write(snapshot / "previous-active-release.json", pointer_bytes)
         record = {"schema": SCHEMA, "source_head": trusted_head,
                   "candidate_head": proof["candidate_head"],
                   "previous_manifest_sha256": proof["old_manifest_sha256"],
                   "source_files": records,
                   "candidate_files": [{"target": entry["target"], "sha256": entry["sha256"]}
                                       for entry in proof["_candidate_plan"]["files"]],
-                  "historical_journals": proof["historical_journals"]}
+                  "historical_journals": proof["historical_journals"],
+                  **({"previous_active_release_sha256": pointer_sha} if pointer_sha is not None else {})}
         _atomic_write(snapshot / "bundle.json", (json.dumps(record, sort_keys=True, indent=2) + "\n").encode("utf-8"))
         verify_bundle(snapshot)
         # Before using the snapshot, confirm that no file changed since copy.
@@ -215,6 +224,11 @@ def verify_bundle(snapshot: Path) -> dict:
     _plain(manifest, must_file=True)
     if digest(manifest) != record["previous_manifest_sha256"]:
         raise RuntimeError("SNAPSHOT_MANIFEST_CORRUPT")
+    if "previous_active_release_sha256" in record:
+        pointer_snap = snapshot / "previous-active-release.json"
+        _plain(pointer_snap, must_file=True)
+        if digest(pointer_snap) != record["previous_active_release_sha256"]:
+            raise RuntimeError("SNAPSHOT_ACTIVE_RELEASE_CORRUPT")
     return record
 
 
@@ -251,6 +265,21 @@ def runtime_aliases(runtime: Path, requested_runtime: Path | None = None,
                 _add(cand)
                 installed_user_alias = True
         except (OSError, ValueError):
+            pass
+    # Also include any active release directory referenced by state/active-release.json
+    # so quiescence checks never miss a live Bridge running from runtime-releases/<rel>.
+    for parent in {runtime.parent, requested_runtime.parent if requested_runtime is not None else runtime.parent}:
+        ptr = parent / deploy.ACTIVE_RELEASE_RELPATH
+        try:
+            if ptr.is_file() and not ptr.is_symlink():
+                doc = json.loads(ptr.read_text(encoding="utf-8-sig"))
+                rel_dir = doc.get("release_dir") if isinstance(doc, dict) else None
+                if isinstance(rel_dir, str) and rel_dir.strip():
+                    rel_path = Path(rel_dir)
+                    _add(rel_path)
+                    if rel_path.exists():
+                        _add(rel_path.resolve())
+        except (OSError, ValueError, UnicodeError):
             pass
     return aliases, installed_user_alias
 
@@ -410,6 +439,12 @@ def restore(snapshot: Path, runtime: Path, *, offline_confirmed: bool = False,
             continue  # do not rewrite an unchanged file under the live peer
         _atomic_write(dst, src.read_bytes())
     _atomic_write(manifest, (snapshot / "previous-manifest.json").read_bytes())
+    if "previous_active_release_sha256" in record:
+        pointer_dst = runtime.parent / deploy.ACTIVE_RELEASE_RELPATH
+        pointer_dst.parent.mkdir(parents=True, exist_ok=True)
+        _atomic_write(pointer_dst, (snapshot / "previous-active-release.json").read_bytes())
+        if digest(pointer_dst) != record["previous_active_release_sha256"]:
+            raise RuntimeError("RESTORED_ACTIVE_RELEASE_VERIFICATION_FAILED")
     for name, hash_value in previous.items():
         if digest(deploy._recovery_target(runtime, name)) != hash_value:
             raise RuntimeError("RESTORED_FILE_VERIFICATION_FAILED:" + name)

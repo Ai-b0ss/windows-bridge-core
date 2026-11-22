@@ -103,6 +103,30 @@ class TestReleaseBuildContract(unittest.TestCase):
         self.assertTrue(all(not name.endswith((".jsonl",".sqlite3",".db",".pfx")) for name in contents))
         self.assertEqual(len(contents),len(set(contents)))
 
+    def test_npm_dependencies_not_bundled_but_untracked_source_remains_visible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for name in builder.ROOT_FILES | builder.TOOL_FILES:
+                dest = root / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_text("fixture", encoding="utf-8")
+            core = root / "runtime/bridge-v3/ff_win_v3_main.py"
+            core.parent.mkdir(parents=True)
+            core.write_text("print('core')", encoding="utf-8")
+            own = root / "tests/test_new_feature.py"
+            own.parent.mkdir(parents=True)
+            own.write_text("print('new')", encoding="utf-8")
+            installed = root / "runtime/bridge-v3/node_modules/playwright/lib/index.js"
+            installed.parent.mkdir(parents=True)
+            installed.write_text("local vendor dependency", encoding="utf-8")
+            result = builder.source_tree(root)
+            self.assertIn("tests/test_new_feature.py", result,
+                          "new untracked source must still be checked by commit verification")
+            self.assertIn("runtime/bridge-v3/ff_win_v3_main.py", result)
+            self.assertNotIn("runtime/bridge-v3/node_modules/playwright/lib/index.js", result,
+                             "local npm install must not contaminate a source-only release")
+            self.assertFalse(any("node_modules" in name.split("/") for name in result))
+
     def test_vendor_assets_have_explicit_sha256(self):
         self.assertEqual(len(builder.ASSET_HASHES),3)
         self.assertTrue(all(x.startswith("assets/") and x.endswith(".zip") for x in builder.ASSET_HASHES))
