@@ -29,7 +29,7 @@ def agent_workflows() -> dict:
             "session_secret_must_remain_private": True,
             "stable_client_identity": (
                 "The authenticated local FF Windows Bridge gateway automatically provisions a HMAC key "
-                "and receives full Hub permission for existing operation classes without manual grants. "
+                "and receives scoped permission for owner Chrome hidden tabs, scripts, reads and owned resources without manual grants. "
                 "Chats still use distinct agent_id/task_id for session isolation. The proof authenticates "
                 "the Bridge gateway, NOT a specific ChatGPT account; all clients authorized on the same "
                 "Bridge share this trust. Caller-supplied agent_id is never proof of origin. "

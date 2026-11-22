@@ -1,4 +1,4 @@
-"""Automatic full local Hub permission for a verified Windows Bridge gateway.
+"""Scoped hidden-Chrome Hub permission for a verified Windows Bridge gateway.
 
 No running Windows, Chrome or installed key is touched.
 """
@@ -11,7 +11,7 @@ import unittest
 from unittest.mock import patch
 RUNTIME=pathlib.Path(__file__).resolve().parents[1]/"runtime"/"bridge-v3"
 sys.path.insert(0,str(RUNTIME))
-from ff_hub import Hub
+from ff_hub import Hub, AUTO_GATEWAY_RISK_CLASSES
 from ff_hub_client_identity import (
     PRINCIPAL, KEY_FILENAME, PROOF_FIELD, ensure_gateway_key,
     sign_gateway_request, verify_gateway_request,
@@ -83,13 +83,35 @@ class FullPermissionTests(unittest.TestCase):
         self.assertNotEqual(a["session_id"],b["session_id"])
         self.assertEqual(self.hub.policy.describe()["grants"],[])
         for session in (a,b):
+            self.assertEqual(AUTO_GATEWAY_RISK_CLASSES, frozenset({
+                "owner_chrome_hidden_secondary", "browser_script", "read_diagnose", "own_resources",
+            }))
             for risk in RISK_CLASSES:
                 result=self.decision(session,risk)
-                self.assertEqual(result["decision"],"allow",(risk,result))
-                self.assertEqual(result["reason"],"TRUSTED_WINDOWS_BRIDGE_GATEWAY")
-                self.assertIsNone(result["grant_id"])
+                if risk in AUTO_GATEWAY_RISK_CLASSES:
+                    self.assertEqual(result["decision"],"allow",(risk,result))
+                    self.assertEqual(result["reason"],"TRUSTED_WINDOWS_BRIDGE_GATEWAY")
+                    self.assertIsNone(result["grant_id"])
+                else:
+                    # Preserve each class's pre-existing base policy; never add
+                    # a new gateway-wide allow for classes outside this scope.
+                    self.assertNotEqual(result["reason"],"TRUSTED_WINDOWS_BRIDGE_GATEWAY")
+                    unsigned=self.decision(session,risk,signed=False)
+                    self.assertEqual(result["decision"],unsigned["decision"],(risk,result,unsigned))
             self.assertEqual(self.decision(session,"owner_chrome_hidden_secondary",host="new.example")["decision"],"allow")
             self.assertEqual(self.decision(session,"browser_script",host="any.example")["decision"],"allow")
+
+    def test_sensitive_effects_never_inherit_gateway_permission(self):
+        session=self.open("chat-auto-sensitive",True)
+        for risk in ("financial", "external_send", "system_settings", "delete_user_data",
+                     "secret_use", "project_write", "terminal_execute", "foreground_input",
+                     "app_launch"):
+            with self.subTest(risk=risk):
+                self.assertEqual(self.decision(session,risk)["decision"],"needs_owner")
+        baseline=self.decision(session,"browser_own_tabs",signed=False)
+        signed=self.decision(session,"browser_own_tabs",signed=True)
+        self.assertEqual(signed["decision"],baseline["decision"])
+        self.assertNotEqual(signed["reason"],"TRUSTED_WINDOWS_BRIDGE_GATEWAY")
 
     def test_unverified_client_cannot_inherit_trusted_gateway_even_same_session(self):
         s=self.open("chat-auto-A",True)

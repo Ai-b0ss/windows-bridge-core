@@ -118,7 +118,7 @@ class StableClientHubTests(unittest.TestCase):
             self.assertEqual(authorized["verified_client_principal"], PRINCIPAL)
             self.assertEqual(self.check(session, signed=False)["decision"], "needs_owner")
             self.assertEqual(self.check(session, host="other.example", signed=True)["decision"], "allow")
-            self.assertEqual(self.check(session, signed=True, risk_class="project_write")["decision"], "allow")
+            self.assertEqual(self.check(session, signed=True, risk_class="project_write")["decision"], "needs_owner")
 
     def test_revoked_legacy_grant_does_not_revoke_authenticated_gateway(self):
         new_chat = self.session("chat-a")

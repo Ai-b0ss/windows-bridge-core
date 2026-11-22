@@ -77,7 +77,7 @@ Technical limits you cannot and must not work around: UAC elevation prompts and 
 
 ## Identity and automatic Hub access across chats
 
-The connected Windows Bridge gateway automatically provisions and signs its own local HMAC key. A verified gateway obtains full local Hub permission without grants per chat. Separate agent_id/task_id/session_secret values remain necessary for resource isolation, but never for another manual approval.
+The connected Windows Bridge gateway automatically provisions and signs its own local HMAC key. A verified gateway obtains **scoped hidden owner-Chrome permission** (owner_chrome_hidden_secondary, browser_script, read_diagnose, own_resources) without grants per chat; all other Hub risk classes keep their existing grant policy. Separate agent_id/task_id/session_secret values remain necessary for resource isolation, but never for another manual approval.
 
 This authentication proves the **Windows Bridge gateway**, not the originating ChatGPT account. All clients authenticated to the same Bridge endpoint share that trust; unsigned direct Hub requests, forged signatures, and spoofed agent_id labels do not. Respect the owner's explicit task-specific restrictions and any independent platform, Chrome and Windows requirements.
 

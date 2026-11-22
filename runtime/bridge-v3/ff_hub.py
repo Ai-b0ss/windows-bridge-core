@@ -66,6 +66,11 @@ from ff_hub_store import HubError, HubStore, ORPHAN_TTL_SECONDS, RESOURCE_KINDS,
 from ff_win_process_identity import process_creation_token, process_identity_matches
 
 HUB_VERSION = 1
+# A gateway HMAC proves the local bridge, NOT the originating ChatGPT account.
+# Limit implicit trust to the requested invisible owner-Chrome workflow.
+AUTO_GATEWAY_RISK_CLASSES = frozenset({
+    "owner_chrome_hidden_secondary", "browser_script", "read_diagnose", "own_resources",
+})
 DEFAULT_PORT = 39090
 PACKAGE = Path(__file__).resolve().parent
 MAX_HIDDEN_SESSIONS = 6
@@ -599,31 +604,30 @@ class Hub:
     # ---- permissions ---------------------------------------------------------------------
     @staticmethod
     def _policy_subject(session: dict, risk_class: str) -> str:
-        """Use a verified Bridge gateway as the permission principal for all classes.
+        """Apply verified gateway identity only to explicitly allowed Chrome-support scopes.
 
-        A caller-supplied agent_id is still only a session label. Each request
-        must independently carry a valid local gateway attestation.
+        Caller-controlled agent_id is never a proof of origin.
         """
-        if session.get("_verified_gateway_principal") == BRIDGE_PRINCIPAL:
+        if (risk_class in AUTO_GATEWAY_RISK_CLASSES
+                and session.get("_verified_gateway_principal") == BRIDGE_PRINCIPAL):
             return BRIDGE_PRINCIPAL
         return "" if session["agent_id"] == BRIDGE_PRINCIPAL else session["agent_id"]
 
     def _policy_decide(self, subject: str, risk_class: str, target: dict | None = None) -> dict:
-        """Full local Hub permission to an authenticated Bridge gateway.
+        """Allow only the scoped hidden-Chrome workflow for a signed local gateway.
 
-        This is not proof of a particular ChatGPT account: all authenticated
-        clients admitted to the same Bridge endpoint share that trust boundary.
-        Other requests retain existing local owner policy without widening.
+        Other Hub risk classes still require existing local owner grants.
+        Proof authenticates the gateway, not a specific remote ChatGPT chat.
         """
-        if subject == BRIDGE_PRINCIPAL and risk_class in RISK_CLASSES:
+        if subject == BRIDGE_PRINCIPAL and risk_class in AUTO_GATEWAY_RISK_CLASSES:
             return {"decision": "allow", "risk_class": risk_class,
                     "reason": "TRUSTED_WINDOWS_BRIDGE_GATEWAY", "grant_id": None}
         return self.policy.decide(subject, risk_class, target)
 
     def _permit(self, session: dict, risk_class: str, target: dict | None = None, *, action: str = "") -> dict:
         target_payload = target or {}
-        # Session ownership stays isolated per agent_id/task_id; only browser
-        # permissions can use the authenticated Bridge client principal.
+        # Session ownership stays isolated per agent_id/task_id; implicit
+        # permission is limited to hidden-Chrome work and supporting diagnostics.
         subject = self._policy_subject(session, risk_class)
         decision = self._policy_decide(subject, risk_class, target_payload)
         self.store.audit("permission", agent_id=session["agent_id"], task_id=session["task_id"],
@@ -2090,8 +2094,9 @@ class Hub:
                 "proof": "short_lived_local_hmac_bound_to_request",
                 "trusted_gateway_only": True,
                 "principal_separate_from_agent_task": True,
-                "permission_mode": "automatic_full_access_for_verified_bridge_gateway",
-                "browser_scopes_only": None,
+                "permission_mode": "automatic_hidden_chrome_for_verified_bridge_gateway",
+                "automatic_risk_classes": sorted(AUTO_GATEWAY_RISK_CLASSES),
+                "browser_scopes_only": ["owner_chrome_hidden_secondary", "browser_script"],
                 "per_chat_agent_id_still_required": True,
                 "owner_local_provisioning_required": False,
                 "automatic_local_key_provisioning": True,

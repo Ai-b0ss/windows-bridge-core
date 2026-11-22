@@ -65,7 +65,7 @@ class HubGateway:
             "agent_identity": "client labels within trusted same-user transport, not an OS security boundary",
             "stable_client_principal": "bridge-chatgpt-connector",
             "client_identity_proof": "local_gateway_hmac_automatically_provisioned",
-            "connector_auto_permission": "verified_windows_bridge_gateway",
+            "connector_auto_permission": "verified_windows_bridge_gateway_hidden_chrome_scoped",
             "agent_id_is_not_policy_principal": True,
             "live_browser_or_gui_verified": False,
         }
