@@ -126,6 +126,7 @@ class _AdvancedSyntheticHttp404CDPServer:
         self.nav_destroy_polls = 0
         self.postcond_destroy_polls = 0
         self.click_redirect_url: str | None = None
+        self.eval_expressions: list[str] = []
         self._pending_nav: dict[str, dict] = {}
         self._stop = threading.Event()
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -245,13 +246,18 @@ class _AdvancedSyntheticHttp404CDPServer:
                             }
                         else:
                             self.targets[tid]["url"] = next_url
-                            self.targets[tid]["title"] = f"Title {next_url}"
-                            self.targets[tid]["text"] = f"Body {next_url}"
+                            if next_url.rstrip("/") == "https://example.com":
+                                self.targets[tid]["title"] = "Example Domain"
+                                self.targets[tid]["text"] = "Example Domain"
+                            else:
+                                self.targets[tid]["title"] = f"Title {next_url}"
+                                self.targets[tid]["text"] = f"Body {next_url}"
                     _ws_send_text(conn, json.dumps({"id": rid, "result": {"frameId": "F1"}}))
                 elif method == "Runtime.evaluate":
                     tid = self._sessions.get(sid or "", "")
                     rec = self.targets.get(tid, {"url": "about:blank", "title": "", "text": ""})
                     expr = str(params.get("expression") or "")
+                    self.eval_expressions.append(expr)
                     if self.stall_eval_once_s > 0 and "STALL_PROBE" in expr:
                         delay = self.stall_eval_once_s
                         self.stall_eval_once_s = 0.0
@@ -302,6 +308,20 @@ class _AdvancedSyntheticHttp404CDPServer:
                         val = {"url": rec["url"], "title": rec["title"]}
                     elif "({url:location.href})" in expr:
                         val = {"url": rec["url"]}
+                    elif "document.body" in expr and "Example Domain" in expr and ".includes(" in expr:
+                        # The hidden target has textContent but no rendered innerText.
+                        # Require the explicit textContent fallback; the old expression stays false.
+                        val = "textContent" in expr and "visible.trim()" in expr
+                    elif 'document.querySelector("h1")' in expr:
+                        has_fallback = "textContent" in expr and "visible.trim()" in expr
+                        val = {
+                            "url": rec["url"],
+                            "title": rec["title"],
+                            "text": "Example Domain" if has_fallback else "",
+                            "found": True,
+                            "tag_name": "H1",
+                            "text_source": "textContent" if has_fallback else "innerText",
+                        }
                     else:
                         val = {"url": rec["url"], "title": rec["title"], "text": rec["text"]}
                     _ws_send_text(conn, json.dumps({"id": rid, "result": {"result": {"value": val}}}))
@@ -335,6 +355,93 @@ class OwnerChromeAutonomousChainTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
+
+    def test_hidden_read_uses_text_content_when_inner_text_is_empty_and_cleans_up(self) -> None:
+        ws_secret = "/devtools/browser/secret-hidden-read-text-fallback"
+        srv = _AdvancedSyntheticHttp404CDPServer(ws_path=ws_secret).start()
+        udd = self.root / "udd-read-text"
+        udd.mkdir()
+        _write_profile_state(udd, srv.port, ws_secret, active_profile="Default")
+        hub_state = self.root / "hub-read-text"
+        hub_state.mkdir()
+        Policy(hub_state / "policy.json").add_grant(
+            ["owner_chrome_hidden_secondary"],
+            agents=["chatgpt-gpt6-owner-browser"],
+            note="scoped owner browser read test",
+        )
+        mgr = owner_secondary.OwnerChromeHiddenSecondaryManager(
+            hub_state,
+            profile_dir_name="Default",
+            user_data_dir=udd,
+        )
+        hub = Hub(hub_state, owner_chrome_secondary=mgr)
+        try:
+            sess = hub.dispatch({
+                "op": "session_open",
+                "args": {"agent_id": "chatgpt-gpt6-owner-browser", "task_id": "read-text-fallback"},
+            })
+            auth = {"session_id": sess["session_id"], "session_secret": sess["session_secret"]}
+            opened = hub.dispatch({
+                **auth,
+                "op": "owner_chrome_hidden",
+                "request_key": "read-text-open-0001",
+                "args": {"command": "open", "url": "https://example.com/"},
+            })
+            self.assertTrue(opened["hidden"])
+            self.assertTrue(opened["windowless"])
+            self.assertFalse(opened["visible_window_created"])
+            self.assertEqual(opened["profile_dir_name"], "Default")
+            self.assertEqual(opened["title"], "Example Domain")
+            tab_id = opened["tab_id"]
+
+            ready = hub.dispatch({
+                **auth,
+                "op": "owner_chrome_hidden",
+                "args": {
+                    "command": "wait_for",
+                    "tab_id": tab_id,
+                    "timeout_ms": 1000,
+                    "condition": {"text_present": "Example Domain"},
+                },
+            })
+            self.assertTrue(ready["satisfied"])
+
+            read = hub.dispatch({
+                **auth,
+                "op": "owner_chrome_hidden",
+                "args": {"command": "read", "tab_id": tab_id, "selector": "h1"},
+            })
+            self.assertEqual(read["text"], "Example Domain")
+            self.assertTrue(read["found"])
+            self.assertEqual(read["tag_name"], "H1")
+            self.assertEqual(read["text_source"], "textContent")
+            self.assertTrue(any(
+                'document.querySelector("h1")' in expression
+                and "visible.trim()" in expression
+                and "textContent" in expression
+                for expression in srv.eval_expressions
+            ))
+
+            closed = hub.dispatch({
+                **auth,
+                "op": "owner_chrome_hidden",
+                "request_key": "read-text-close-0001",
+                "args": {"command": "close", "tab_id": tab_id},
+            })
+            self.assertTrue(closed["target_closed_in_browser"])
+            self.assertEqual(srv.targets, {})
+
+            session_closed = hub.dispatch({
+                **auth,
+                "op": "session_close",
+                "request_key": "read-text-session-close-0001",
+            })
+            self.assertTrue(session_closed["cleanup_verified"])
+            self.assertEqual(session_closed["resources_retained"], 0)
+        finally:
+            hub.shutdown()
+            hub.store.close()
+            srv.close()
 
     def test_dynamic_config_profile_reload_preserves_approved_cdp_socket(self) -> None:
         ws_secret = "/devtools/browser/secret-dynamic-profile-reload"

@@ -672,6 +672,16 @@ class _BrowserCDPClient:
                 ) from exc
 
 
+def _dom_text_value_expr(element_expr: str) -> str:
+    """Read rendered text when available, falling back to DOM text in windowless targets."""
+    return (
+        f"(()=>{{const e={element_expr};"
+        "const visible=typeof e?.innerText==='string'?e.innerText:'';"
+        "const raw=typeof e?.textContent==='string'?e.textContent:'';"
+        "return visible.trim()?visible:raw;})()"
+    )
+
+
 class OwnerChromeHiddenSecondaryManager:
     """Manages windowless hidden secondary targets in an already-running Chrome Profile 1.
 
@@ -1639,7 +1649,7 @@ class OwnerChromeHiddenSecondaryManager:
         def eval_once() -> bool:
             ctype = condition.get("type")
             if ctype == "text_includes" and isinstance(condition.get("value"), str):
-                return self._eval(rec, f"(document.body?.innerText||'').includes({json.dumps(condition['value'])})") is True
+                return self._eval(rec, f"{_dom_text_value_expr('document.body')}.includes({json.dumps(condition['value'])})") is True
             if ctype == "url_equals" and isinstance(condition.get("value"), str):
                 return self._eval(rec, f"location.href==={json.dumps(condition['value'])}") is True
             if ctype == "url_contains" and isinstance(condition.get("value"), str):
@@ -1657,9 +1667,9 @@ class OwnerChromeHiddenSecondaryManager:
                 )
                 return self._eval(rec, expr) is True
             if isinstance(condition.get("text_present"), str):
-                return self._eval(rec, f"(document.body?.innerText||'').includes({json.dumps(condition['text_present'])})") is True
+                return self._eval(rec, f"{_dom_text_value_expr('document.body')}.includes({json.dumps(condition['text_present'])})") is True
             if isinstance(condition.get("text_absent"), str):
-                return self._eval(rec, f"!(document.body?.innerText||'').includes({json.dumps(condition['text_absent'])})") is True
+                return self._eval(rec, f"!({_dom_text_value_expr('document.body')}).includes({json.dumps(condition['text_absent'])})") is True
             if isinstance(condition.get("url_contains"), str):
                 return self._eval(rec, f"location.href.includes({json.dumps(condition['url_contains'])})") is True
             if isinstance(condition.get("target"), dict) and isinstance(condition["target"].get("selector"), str):
@@ -2078,7 +2088,7 @@ class OwnerChromeHiddenSecondaryManager:
                     "(()=>{const nodes=[...document.querySelectorAll('input,textarea,button,select,a,[role=button],[contenteditable=true]')]"
                     ".filter(e=>e.getClientRects().length).slice(0,128);"
                     f"window.__ffhsec={{token:{json.dumps(token)},nodes}};"
-                    "return {url:location.href,title:document.title,text:(document.body?.innerText||'').slice(0,16000),"
+                    f"return {{url:location.href,title:document.title,text:({_dom_text_value_expr('document.body')}).slice(0,16000),"
                     "controls:nodes.map((e,i)=>({ref:String(i),tag:e.tagName.toLowerCase(),type:e.type||'',id:e.id,"
                     "name:e.getAttribute('aria-label')||e.labels?.[0]?.innerText||e.innerText||e.name||'',"
                     "value:e.isContentEditable?(e.textContent??''):(e.value??null),"
@@ -2100,25 +2110,43 @@ class OwnerChromeHiddenSecondaryManager:
                 if isinstance(selector, str) and selector:
                     expr = (
                         f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-                        "if(!e)return {url:location.href,title:document.title,text:''};"
+                        "if(!e)return {url:location.href,title:document.title,text:'',found:false,text_source:'none'};"
                         "const tag=String(e.tagName||'').toUpperCase();"
                         "const typ=String(e.type||'').toLowerCase();"
                         "if(tag==='INPUT'||tag==='TEXTAREA'){"
                         "const chk=tag==='INPUT'&&(typ==='checkbox'||typ==='radio');"
                         "return {url:location.href,title:document.title,text:chk?(e.checked?'checked':'unchecked'):String(e.value??''),"
-                        "value:String(e.value??''),...(chk?{checked:Boolean(e.checked)}:{})};}"
+                        "value:String(e.value??''),found:true,tag_name:tag,text_source:'value',...(chk?{checked:Boolean(e.checked)}:{})};}"
                         "if(tag==='SELECT'){"
                         "return {url:location.href,title:document.title,text:String(e.value??''),value:String(e.value??''),"
-                        "selected:[...(e.selectedOptions||[])].map(o=>o.value)};}"
-                        "return {url:location.href,title:document.title,text:(e.innerText??e.textContent??'')};})()"
+                        "selected:[...(e.selectedOptions||[])].map(o=>o.value),found:true,tag_name:tag,text_source:'value'};}"
+                        "const visible=typeof e.innerText==='string'?e.innerText:'';"
+                        "const raw=typeof e.textContent==='string'?e.textContent:'';"
+                        "const useVisible=visible.trim().length>0;"
+                        "return {url:location.href,title:document.title,text:useVisible?visible:raw,"
+                        "found:true,tag_name:tag,text_source:useVisible?'innerText':'textContent'};})()"
                     )
                 else:
-                    expr = "({url:location.href,title:document.title,text:(document.body?.innerText||'')})"
+                    expr = (
+                        f"(()=>{{const e=document.body;const visible=typeof e?.innerText==='string'?e.innerText:'';"
+                        "const raw=typeof e?.textContent==='string'?e.textContent:'';"
+                        "const useVisible=visible.trim().length>0;"
+                        "return {url:location.href,title:document.title,text:useVisible?visible:raw,"
+                        "found:Boolean(e),tag_name:e?String(e.tagName||'').toUpperCase():null,"
+                        "text_source:e?(useVisible?'innerText':'textContent'):'none'};})()"
+                    )
                 data = self._eval(rec, expr, timeout_s=min(timeout, 10.0))
+                if not isinstance(data, dict):
+                    raise OwnerChromeSecondaryError(
+                        "READ_RESULT_INVALID",
+                        "page read did not return a structured DOM result",
+                        attempted=True,
+                        retry_safe=False,
+                    )
                 text = str(data.get("text") or "")
                 rec["url"] = str(data.get("url") or rec["url"])
                 rec["title"] = str(data.get("title") or rec["title"])
-                extra = {k: data[k] for k in ("value", "checked", "selected") if k in data}
+                extra = {k: data[k] for k in ("value", "checked", "selected", "found", "tag_name", "text_source") if k in data}
                 return {
                     "tab_id": rec["tab_id"],
                     "target_id": rec["target_id"],
