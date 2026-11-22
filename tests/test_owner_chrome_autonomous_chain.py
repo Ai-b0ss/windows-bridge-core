@@ -1096,6 +1096,10 @@ class OwnerChromeAutonomousChainTests(unittest.TestCase):
 
             # Drive full form + navigation + reload + idempotency through Bridge HubGateway -> NEW Hub B -> REAL Chrome 158!
             gw = HubGateway(bridge_root, client_factory=lambda _s: HubClient(hub_state, timeout=20.0), starter=lambda _s: None)
+            # This isolated fixture routes the gateway to a nonstandard Hub
+            # state root. Signing and verifying must use the SAME state root;
+            # the production Bridge always derives both from BRIDGE_ROOT/state/hub.
+            gw.state_dir = hub_state
             sess = gw.call({"op": "session_open", "args": {"agent_id": "chatgpt-gpt6-owner-browser", "task_id": "real-c158-form"}})
             auth = {"session_id": sess["session_id"], "session_secret": sess["session_secret"]}
             opened = gw.call({

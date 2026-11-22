@@ -127,6 +127,29 @@ class BrowserRoutesTests(unittest.TestCase):
         self.assertIn("companion", diag)
         self.assertTrue(diag["companion"]["service_worker_error_guards"])
 
+    def test_attested_gateway_route_plan_does_not_need_agent_grant(self) -> None:
+        from types import SimpleNamespace
+        from ff_hub_client_identity import PRINCIPAL
+        calls = []
+        policy = Policy(self.state_dir / "unsigned-policy.json")
+        def decide(subject, risk_class, target):
+            calls.append((subject, risk_class, target))
+            if subject == PRINCIPAL:
+                return {"decision": "allow", "reason": "TRUSTED_WINDOWS_BRIDGE_GATEWAY", "grant_id": None}
+            return policy.decide(subject, risk_class, target)
+        stub = SimpleNamespace(policy=policy, _policy_decide=decide, owner_chrome_secondary=None)
+        result = route_plan(
+            {"policy_subject": PRINCIPAL},
+            surface="browser", capability="background_tab_read",
+            url="https://example.com/", visibility="strict_invisible", hub=stub,
+        )
+        self.assertTrue(any(subject == PRINCIPAL and risk == "owner_chrome_hidden_secondary"
+                            for subject, risk, target in calls))
+        # Route might be unavailable without Chrome; authorization itself is
+        # independent of hardware readiness and does not require agent_id.
+        self.assertTrue(result.get("routes"))
+        self.assertEqual(policy.describe()["grants"], [])
+
     def test_managed_browser_entry_lifecycle_and_cleanup(self) -> None:
         managed = _FakeManagedBrowser()
         Policy(self.state_dir / "policy.json").add_grant(
