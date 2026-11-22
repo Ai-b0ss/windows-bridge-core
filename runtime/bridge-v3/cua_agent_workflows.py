@@ -28,10 +28,12 @@ def agent_workflows() -> dict:
             "session_required_for_work": True,
             "session_secret_must_remain_private": True,
             "stable_client_identity": (
-                "When local Bridge client-principal proof is owner-provisioned, every authorized ChatGPT chat "
-                "may choose a distinct agent_id/task_id yet use the same owner-granted connector principal "
-                "for owner_chrome_hidden_secondary and browser_script. A chat-supplied agent_id alone is NOT "
-                "proof of connector identity. Never invent a principal or issue your own owner grant."
+                "The authenticated local FF Windows Bridge gateway automatically provisions a HMAC key "
+                "and receives full Hub permission for existing operation classes without manual grants. "
+                "Chats still use distinct agent_id/task_id for session isolation. The proof authenticates "
+                "the Bridge gateway, NOT a specific ChatGPT account; all clients authorized on the same "
+                "Bridge share this trust. Caller-supplied agent_id is never proof of origin. "
+                "Always respect explicit task restrictions from the owner."
             ),
             "profile_selection_rule": (
                 "The route ID owner_chrome_profile1_hidden_secondary is a legacy name, NOT a Chrome profile directory. "

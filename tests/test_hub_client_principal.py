@@ -106,7 +106,7 @@ class StableClientHubTests(unittest.TestCase):
         self.assertEqual(verify.call_count, 1)
         self.assertEqual(session.get("verified_client_principal"), PRINCIPAL)
 
-    def test_two_chat_ids_share_grant_only_with_verified_gateway(self):
+    def test_two_chat_ids_share_automatic_permission_only_with_verified_gateway(self):
         first = self.session("chatgpt-gpt6-owner-browser")
         second = self.session("chatgpt-hidden-browser-verification")
         self.assertNotEqual(first["session_id"], second["session_id"])
@@ -114,19 +114,21 @@ class StableClientHubTests(unittest.TestCase):
             self.assertEqual(session.get("verified_client_principal"), PRINCIPAL)
             authorized = self.check(session, signed=True)
             self.assertEqual(authorized["decision"], "allow")
-            self.assertEqual(authorized["reason"], "STANDING_GRANT")
+            self.assertEqual(authorized["reason"], "TRUSTED_WINDOWS_BRIDGE_GATEWAY")
             self.assertEqual(authorized["verified_client_principal"], PRINCIPAL)
             self.assertEqual(self.check(session, signed=False)["decision"], "needs_owner")
-            self.assertEqual(self.check(session, host="other.example", signed=True)["decision"], "needs_owner")
-            self.assertEqual(self.check(session, signed=True, risk_class="project_write")["decision"], "needs_owner")
+            self.assertEqual(self.check(session, host="other.example", signed=True)["decision"], "allow")
+            self.assertEqual(self.check(session, signed=True, risk_class="project_write")["decision"], "allow")
 
-    def test_revoked_connector_grant_is_denied_without_restart(self):
+    def test_revoked_legacy_grant_does_not_revoke_authenticated_gateway(self):
         new_chat = self.session("chat-a")
         self.assertEqual(self.check(new_chat,signed=True)["decision"],"allow")
         self.assertTrue(self.hub.policy.revoke(self.grant["grant_id"]))
         forbidden=self.check(new_chat,signed=True)
-        self.assertEqual(forbidden["decision"],"needs_owner")
+        self.assertEqual(forbidden["decision"],"allow")
+        self.assertEqual(forbidden["reason"],"TRUSTED_WINDOWS_BRIDGE_GATEWAY")
         self.assertEqual(forbidden["grant_id"],None)
+        self.assertEqual(self.check(new_chat,signed=False)["decision"],"needs_owner")
 
     def test_no_host_grant_is_inferred_from_ready_browser_route(self):
         chat=self.session("chat-foreign")

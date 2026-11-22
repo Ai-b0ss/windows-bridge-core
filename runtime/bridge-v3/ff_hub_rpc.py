@@ -64,7 +64,8 @@ class HubGateway:
             "automatic_mutation_replay": False, "foreground_input_available": False,
             "agent_identity": "client labels within trusted same-user transport, not an OS security boundary",
             "stable_client_principal": "bridge-chatgpt-connector",
-            "client_identity_proof": "local_gateway_hmac_opt_in; absent without owner-provisioned key",
+            "client_identity_proof": "local_gateway_hmac_automatically_provisioned",
+            "connector_auto_permission": "verified_windows_bridge_gateway",
             "agent_id_is_not_policy_principal": True,
             "live_browser_or_gui_verified": False,
         }
@@ -83,12 +84,15 @@ class HubGateway:
         # the Hub RPC API. Arbitrary endpoints, state roots and keys cannot be
         # selected by the caller of this gateway.
         from ff_hub import HubClient, HubError, ensure_running
-        from ff_hub_client_identity import sign_gateway_request
+        from ff_hub_client_identity import ensure_gateway_key, sign_gateway_request
         try:
             # Only this trusted local gateway can add the principal proof.
             # Client-requested proof fields are rejected by request_fields.
             (self._starter or ensure_running)(self.state_dir)
             client = (self._client_factory or HubClient)(self.state_dir)
+            # Authentication of the outer Windows Bridge request happens before
+            # this local gateway. No local operator step or per-chat grant needed.
+            ensure_gateway_key(self.state_dir)
             # Sign immediately before I/O. A cold-start Hub may take longer
             # than the attestation TTL to start.
             signed_request = sign_gateway_request(request, self.state_dir)

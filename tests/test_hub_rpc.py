@@ -54,9 +54,14 @@ class TestHubGateway(unittest.TestCase):
         request = {"op": "browser", "args": {"command": "act"}, "session_id": "session-a",
                    "session_secret": "test-secret", "request_key": "fixed-key"}
         self.assertEqual(self.gateway.call(request), {"state": "completed"})
-        self.assertEqual(self.requests, [request])
+        self.assertEqual(len(self.requests), 1)
         self.assertEqual(len(self.started), 1)
         self.assertIsNot(self.requests[0], request)
+        from ff_hub_client_identity import PROOF_FIELD, PRINCIPAL, KEY_FILENAME, verify_gateway_request
+        signed = self.requests[0]
+        self.assertEqual({k:v for k,v in signed.items() if k != PROOF_FIELD}, request)
+        self.assertEqual(verify_gateway_request(signed, self.gateway.state_dir), PRINCIPAL)
+        self.assertTrue((self.gateway.state_dir / KEY_FILENAME).is_file())
 
     def test_rejects_endpoint_injection_and_malformed_requests_before_start(self):
         self.enable()

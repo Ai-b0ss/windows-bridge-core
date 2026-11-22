@@ -599,21 +599,33 @@ class Hub:
     # ---- permissions ---------------------------------------------------------------------
     @staticmethod
     def _policy_subject(session: dict, risk_class: str) -> str:
-        """A verified gateway principal applies only to explicitly scoped browser grants."""
-        if risk_class in {"owner_chrome_hidden_secondary", "browser_script"}:
-            if session.get("_verified_gateway_principal") == BRIDGE_PRINCIPAL:
-                return BRIDGE_PRINCIPAL
-            # The reserved principal cannot be claimed by choosing its string
-            # as an unauthenticated user-controlled agent_id.
-            return "" if session["agent_id"] == BRIDGE_PRINCIPAL else session["agent_id"]
-        return session["agent_id"]
+        """Use a verified Bridge gateway as the permission principal for all classes.
+
+        A caller-supplied agent_id is still only a session label. Each request
+        must independently carry a valid local gateway attestation.
+        """
+        if session.get("_verified_gateway_principal") == BRIDGE_PRINCIPAL:
+            return BRIDGE_PRINCIPAL
+        return "" if session["agent_id"] == BRIDGE_PRINCIPAL else session["agent_id"]
+
+    def _policy_decide(self, subject: str, risk_class: str, target: dict | None = None) -> dict:
+        """Full local Hub permission to an authenticated Bridge gateway.
+
+        This is not proof of a particular ChatGPT account: all authenticated
+        clients admitted to the same Bridge endpoint share that trust boundary.
+        Other requests retain existing local owner policy without widening.
+        """
+        if subject == BRIDGE_PRINCIPAL and risk_class in RISK_CLASSES:
+            return {"decision": "allow", "risk_class": risk_class,
+                    "reason": "TRUSTED_WINDOWS_BRIDGE_GATEWAY", "grant_id": None}
+        return self.policy.decide(subject, risk_class, target)
 
     def _permit(self, session: dict, risk_class: str, target: dict | None = None, *, action: str = "") -> dict:
         target_payload = target or {}
         # Session ownership stays isolated per agent_id/task_id; only browser
         # permissions can use the authenticated Bridge client principal.
         subject = self._policy_subject(session, risk_class)
-        decision = self.policy.decide(subject, risk_class, target_payload)
+        decision = self._policy_decide(subject, risk_class, target_payload)
         self.store.audit("permission", agent_id=session["agent_id"], task_id=session["task_id"],
                          session_id=session["session_id"], risk_class=risk_class, action=action,
                          target=target_payload, decision=decision["decision"], reason=decision["reason"],
@@ -954,11 +966,11 @@ class Hub:
         if not host:
             return False
         if provider == OWNER_CHROME_HIDDEN_ROUTE:
-            return self.policy.decide(agent_id, "owner_chrome_hidden_secondary", {"host": host}).get("decision") == "allow"
+            return self._policy_decide(agent_id, "owner_chrome_hidden_secondary", {"host": host}).get("decision") == "allow"
         if provider == OWNER_CHROME_ROUTE:
             return (
-                self.policy.decide(agent_id, "browser_own_tabs", {"host": host}).get("decision") == "allow"
-                and self.policy.decide(agent_id, "read_diagnose", {"host": host}).get("decision") == "allow"
+                self._policy_decide(agent_id, "browser_own_tabs", {"host": host}).get("decision") == "allow"
+                and self._policy_decide(agent_id, "read_diagnose", {"host": host}).get("decision") == "allow"
             )
         return False
 
@@ -1132,7 +1144,7 @@ class Hub:
                     )
                     opened_url = str(tab.get("url") or validated_url)
                     opened_host = _extract_url_host(opened_url)
-                    if opened_host and opened_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, opened_host):
+                    if opened_host and opened_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary" if provider == OWNER_CHROME_HIDDEN_ROUTE else "browser_own_tabs"), provider, opened_host):
                         redirect_blocked_host = opened_host
                     else:
                         if read_mode in {"observe", "snapshot"}:
@@ -1144,7 +1156,7 @@ class Hub:
                             content = self._call_owner_chrome_secondary("read", read_args)
                         final_url = str(content.get("url") or opened_url)
                         final_host = _extract_url_host(final_url)
-                        if final_host and final_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, final_host):
+                        if final_host and final_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary" if provider == OWNER_CHROME_HIDDEN_ROUTE else "browser_own_tabs"), provider, final_host):
                             redirect_blocked_host = final_host
                             content = None
                 finally:
@@ -1303,7 +1315,7 @@ class Hub:
                     )
                     opened_url = str(tab.get("url") or validated_url)
                     opened_host = _extract_url_host(opened_url)
-                    if opened_host and opened_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, opened_host):
+                    if opened_host and opened_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary" if provider == OWNER_CHROME_HIDDEN_ROUTE else "browser_own_tabs"), provider, opened_host):
                         redirect_blocked_host = opened_host
                     else:
                         if read_mode in {"snapshot", "observe"}:
@@ -1315,7 +1327,7 @@ class Hub:
                             content = self.browser.call("read", read_args)
                         final_url = str(content.get("url") or opened_url)
                         final_host = _extract_url_host(final_url)
-                        if final_host and final_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary") if provider == OWNER_CHROME_HIDDEN_ROUTE else session["agent_id"], provider, final_host):
+                        if final_host and final_host != host and not self._host_allowed_for_provider(self._policy_subject(session, "owner_chrome_hidden_secondary" if provider == OWNER_CHROME_HIDDEN_ROUTE else "browser_own_tabs"), provider, final_host):
                             redirect_blocked_host = final_host
                             content = None
                 finally:
@@ -2078,10 +2090,13 @@ class Hub:
                 "proof": "short_lived_local_hmac_bound_to_request",
                 "trusted_gateway_only": True,
                 "principal_separate_from_agent_task": True,
-                "browser_scopes_only": ["owner_chrome_hidden_secondary", "browser_script"],
+                "permission_mode": "automatic_full_access_for_verified_bridge_gateway",
+                "browser_scopes_only": None,
                 "per_chat_agent_id_still_required": True,
-                "owner_local_provisioning_required": True,
+                "owner_local_provisioning_required": False,
+                "automatic_local_key_provisioning": True,
                 "remote_grant_issuance": False,
+                "authenticates_chatgpt_account": False,
                 "same_user_windows_is_not_security_isolation": True,
             },
             "session_timeouts": {
@@ -2580,9 +2595,9 @@ class Hub:
             return journaled(artifact) if args.get("command") == "put" else artifact()
         if op == "permission_check":
             risk_class = str(args.get("risk_class") or "")
-            result = self.policy.decide(self._policy_subject(session, risk_class), risk_class,
+            result = self._policy_decide(self._policy_subject(session, risk_class), risk_class,
                                         args.get("target") if isinstance(args.get("target"), dict) else None)
-            if gateway_principal and risk_class in {"owner_chrome_hidden_secondary", "browser_script"}:
+            if gateway_principal:
                 result["verified_client_principal"] = gateway_principal
             return result
         if op == "permission_describe":
