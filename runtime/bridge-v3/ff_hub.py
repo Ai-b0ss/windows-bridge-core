@@ -3136,10 +3136,12 @@ def handover_upgrade(
         str(standby_ep_file),
     ]
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    job_breakaway = False
     with open(state_dir / "hub.log", "ab", buffering=0) as log:
         options = dict(stdin=subprocess.DEVNULL, stdout=log, stderr=log, cwd=str(new_runtime), close_fds=True)
         try:
             proc = subprocess.Popen(argv, creationflags=flags | 0x01000000, **options)
+            job_breakaway = True
         except OSError:
             proc = subprocess.Popen(argv, creationflags=flags, **options)
 
@@ -3224,6 +3226,7 @@ def handover_upgrade(
                         "port": int(ep["port"]),
                         "package": ep.get("package"),
                         "cdp_handed_over": cdp_handed_over,
+                        "job_breakaway": job_breakaway,
                         "owner_chrome_secondary": st.get("owner_chrome_secondary"),
                     }
         except HubError:

@@ -422,6 +422,7 @@ def safe_decode(data: bytes) -> str:
     return data.decode("utf-8", errors="replace")
 
 
+JOB_OBJECT_LIMIT_BREAKAWAY_OK = 0x00000800
 JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 
@@ -483,7 +484,12 @@ def create_kill_on_close_job():
     if not handle:
         raise RPCError("PROCESS_OWNERSHIP_JOB_CREATE_FAILED", details={"winerror": ctypes.get_last_error()})
     info = _JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
-    info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    # Ordinary run_code children stay bound and terminate on job close, while
+    # explicit CREATE_BREAKAWAY_FROM_JOB infrastructure starters (Hub/standby)
+    # survive the 30-minute drain exit of an older Bridge instance.
+    info.BasicLimitInformation.LimitFlags = (
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK
+    )
     ok = kernel32.SetInformationJobObject(handle, JOB_OBJECT_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info), ctypes.sizeof(info))
     if not ok:
         error = ctypes.get_last_error()
