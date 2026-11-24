@@ -2615,7 +2615,7 @@ class Hub:
             name = args.get("name")
             target = {"secret": name}
             if args.get("use") == "http" and isinstance(args.get("request"), dict):
-                target["host"] = urllib.parse.urlsplit(str(args["request"].get("url") or "")).hostname or ""
+                target["host"] = _extract_url_host(args["request"].get("url"))
             elif args.get("use") == "process" and isinstance(args.get("request"), dict):
                 argv = args["request"].get("argv")
                 if isinstance(argv, list) and argv and isinstance(argv[0], str):

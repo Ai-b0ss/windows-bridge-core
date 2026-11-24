@@ -412,6 +412,127 @@ class PolicyAndBrokerTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, "SECRET_HEADER_FORBIDDEN")
                 value.assert_not_called()
 
+    def test_secret_invalid_port_url_and_timeout_raise_before_value_is_read(self):
+        with tempfile.TemporaryDirectory() as work:
+            vault = Vault(work)
+            allowed = {"hosts": ["example.com"], "commands": [os.path.normcase(os.path.abspath(sys.executable))]}
+            with patch.object(vault, "_allowed", return_value=allowed), patch.object(vault, "_value") as value:
+                for bad_url in ("https://example.com:99999/", "https://[::1/"):
+                    with self.assertRaises(SecretError) as caught:
+                        vault.use_http("agent", "key", {"url": bad_url, "headers": {"Authorization": "{{secret}}"}})
+                    self.assertEqual(caught.exception.code, "SECRET_URL_INVALID")
+                    self.assertFalse(caught.exception.details["execution_started"])
+                for bad_timeout in ("bad", True, False, 0, -1, float("nan"), float("inf")):
+                    with self.assertRaises(SecretError) as caught:
+                        vault.use_http("agent", "key", {
+                            "url": "https://example.com/",
+                            "headers": {"Authorization": "{{secret}}"},
+                            "timeout_s": bad_timeout,
+                        })
+                    self.assertEqual(caught.exception.code, "SECRET_REQUEST_INVALID")
+                    self.assertFalse(caught.exception.details["execution_started"])
+                    with self.assertRaises(SecretError) as caught:
+                        vault.use_process("agent", "key", {
+                            "argv": [sys.executable],
+                            "env_name": "TOK",
+                            "timeout_s": bad_timeout,
+                        })
+                    self.assertEqual(caught.exception.code, "SECRET_PROCESS_INVALID")
+                    self.assertFalse(caught.exception.details["execution_started"])
+                value.assert_not_called()
+
+    def test_secret_use_marks_network_failure_and_process_timeout_unknown_in_journal(self):
+        import subprocess
+        import urllib.error
+        with tempfile.TemporaryDirectory() as work:
+            hub = Hub(Path(work), browser=Browser())
+            try:
+                sess = hub.dispatch({"op": "session_open", "args": {"agent_id": "a", "task_id": "sec-unknown"}})
+                hub.policy.add_grant(["secret_use"], agents=["a"], secrets=["demo"])
+                allowed = {"hosts": ["api.example.invalid"], "commands": [os.path.normcase(os.path.abspath(sys.executable))]}
+
+                def call(args, key):
+                    return hub.dispatch({
+                        "op": "secret_use",
+                        "args": args,
+                        "session_id": sess["session_id"],
+                        "session_secret": sess["session_secret"],
+                        "request_key": key,
+                    })
+
+                http_args = {
+                    "name": "demo",
+                    "use": "http",
+                    "request": {"url": "https://api.example.invalid/", "headers": {"Authorization": "{{secret}}"}},
+                }
+
+                class _FailingOpener:
+                    def open(self, *args, **kwargs):
+                        raise urllib.error.URLError("timed out after connect")
+
+                with patch.object(hub.vault, "_allowed", return_value=allowed), \
+                     patch.object(hub.vault, "_value", return_value="secret-val"), \
+                     patch("ff_hub_secrets.urllib.request.build_opener", return_value=_FailingOpener()):
+                    with self.assertRaises(HubError) as caught:
+                        call(http_args, "secret-http-fail-1")
+                    self.assertEqual(caught.exception.code, "SECRET_REQUEST_FAILED")
+                    self.assertTrue(caught.exception.details["outcome_unknown"])
+                st = hub.dispatch({
+                    "op": "request_status",
+                    "args": {"request_key": "secret-http-fail-1"},
+                    "session_id": sess["session_id"],
+                    "session_secret": sess["session_secret"],
+                })
+                self.assertEqual(st["state"], "unknown")
+                with self.assertRaises(HubError) as replay:
+                    call(http_args, "secret-http-fail-1")
+                self.assertEqual(replay.exception.code, "REQUEST_OUTCOME_UNKNOWN")
+
+                proc_args = {
+                    "name": "demo",
+                    "use": "process",
+                    "request": {"argv": [sys.executable, "-c", "pass"], "env_name": "TOK", "timeout_s": 1},
+                }
+                with patch.object(hub.vault, "_allowed", return_value=allowed), \
+                     patch.object(hub.vault, "_value", return_value="secret-val"), \
+                     patch("ff_hub_secrets.subprocess.run", side_effect=subprocess.TimeoutExpired([sys.executable], 1)):
+                    with self.assertRaises(HubError) as caught:
+                        call(proc_args, "secret-proc-timeout-1")
+                    self.assertEqual(caught.exception.code, "SECRET_PROCESS_TIMEOUT")
+                    self.assertTrue(caught.exception.details["outcome_unknown"])
+                st_proc = hub.dispatch({
+                    "op": "request_status",
+                    "args": {"request_key": "secret-proc-timeout-1"},
+                    "session_id": sess["session_id"],
+                    "session_secret": sess["session_secret"],
+                })
+                self.assertEqual(st_proc["state"], "unknown")
+                with self.assertRaises(HubError) as replay_proc:
+                    call(proc_args, "secret-proc-timeout-1")
+                self.assertEqual(replay_proc.exception.code, "REQUEST_OUTCOME_UNKNOWN")
+
+                # Malformed IPv6 URL must not raise HUB_INTERNAL_ERROR in dispatch; journal marks execution_started=False.
+                bad_ipv6 = {
+                    "name": "demo",
+                    "use": "http",
+                    "request": {"url": "https://[::1/", "headers": {"Authorization": "{{secret}}"}},
+                }
+                with patch.object(hub.vault, "_allowed", return_value=allowed):
+                    with self.assertRaises(HubError) as caught:
+                        call(bad_ipv6, "secret-bad-ipv6-1")
+                    self.assertEqual(caught.exception.code, "SECRET_URL_INVALID")
+                st_bad = hub.dispatch({
+                    "op": "request_status",
+                    "args": {"request_key": "secret-bad-ipv6-1"},
+                    "session_id": sess["session_id"],
+                    "session_secret": sess["session_secret"],
+                })
+                self.assertEqual(st_bad["state"], "failed")
+                self.assertFalse(st_bad["execution_started"])
+            finally:
+                hub.shutdown()
+                hub.store.close()
+
     def test_singleton_lock_cannot_be_acquired_twice(self):
         with tempfile.TemporaryDirectory() as work:
             with _HubLease(Path(work)):
