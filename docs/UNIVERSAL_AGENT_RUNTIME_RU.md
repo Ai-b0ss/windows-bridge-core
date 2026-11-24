@@ -373,7 +373,7 @@ AppExecutionAlias, закреплённую за ним JobObject и точны�
 
 Независимо проверен основной Chrome 158.0.8127.36 (профиль Default,
 расширение Playwright 0.5.0); Playwright 1.65.1 установлен в отдельной
-тестовой папке K:\FF-Windows-Bridge\state\hub-playwright-165, без
+приватной тестовой папке state владельца, без
 обновления установленного Bridge. Ветка feat/universal-agent-runtime.
 
 Owner Chrome smoke через защищённый DPAPI launcher: 20 PASS / 0 FAIL,
@@ -449,8 +449,8 @@ toImpl/CRPage — **непубличный API Playwright**, зафиксиро�
 блокером Chrome 158. Продолжает действовать fail-closed правило: отсутствие
 строгого доказательства идентичности или владельца не разрешает управление.
 
-Playwright 1.65.1 для испытаний установлен отдельно в
-K:\FF-Windows-Bridge\state\hub-playwright-165.
+Playwright 1.65.1 для испытаний установлен отдельно в приватном каталоге state
+владельца; конкретный локальный путь не является частью публичной конфигурации.
 Установленный боевой Bridge не перезапускался.
 
 

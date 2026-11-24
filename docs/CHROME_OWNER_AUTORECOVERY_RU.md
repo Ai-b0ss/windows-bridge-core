@@ -13,17 +13,17 @@
 
 ## Испытания
 
-1. На реальном Chrome Default запуск без видимого окна восстановил процесс PID 10004 и слушателя 127.0.0.1:9222.
-2. Служебное окно позволило Chrome Consent Watcher обработать диалог. В журнале: CDP_DIALOG_APPROVED hub=2988 chrome=10004. Reconnect worker подтвердил connected=true. Служебное окно затем было закрыто; Hub сохранил соединение и keepalive.
+1. На реальном Chrome Default запуск без видимого окна восстановил процесс Chrome и слушателя `127.0.0.1:9222`.
+2. Служебное окно позволило Chrome Consent Watcher обработать диалог. В журнале зафиксировано событие `CDP_DIALOG_APPROVED` для активной пары процессов Hub и Chrome. Reconnect worker подтвердил `connected=true`. Служебное окно затем было закрыто; Hub сохранил соединение и keepalive.
 3. 7/7 изолированных тестов нового Python-модуля прошли, включая ограничения по чужим окнам, портам, отсутствию согласия, количеству попыток и точному закрытию окна.
 4. При установке задачи Windows нужна новая проверка после потери процесса Chrome, включая очистку ресурса и отсутствие изменений активного окна по окончании.
 
 ## Автозапуск
 
-Задача планировщика: FF-OwnerChrome-CDP-Supervisor, запуск при входе владельца в Windows, только в интерактивном сеансе.
-Python: C:/Users/user/AppData/Local/Programs/Python/Python313/python.exe
-Скрипт: K:/FF-Windows-Bridge/state/chrome-cdp-consent-watcher/chrome_owner_autorecover.py
-Аргументы: --hub-state K:/FF-Windows-Bridge/state/hub --workdir K:/FF-Windows-Bridge/state/chrome-cdp-consent-watcher --interval 15
+Задача планировщика: `FF-OwnerChrome-CDP-Supervisor`, запуск при входе владельца в Windows, только в интерактивном сеансе.
+Python: `<PYTHON_EXE>`
+Скрипт: `<BRIDGE_ROOT>/state/chrome-cdp-consent-watcher/chrome_owner_autorecover.py`
+Аргументы: `--hub-state <BRIDGE_ROOT>/state/hub --workdir <BRIDGE_ROOT>/state/chrome-cdp-consent-watcher --interval 15`
 
 Отключение: Stop-ScheduledTask и Disable-ScheduledTask для FF-OwnerChrome-CDP-Supervisor.
 Безопасная диагностика без вмешательств: --dry-run.
