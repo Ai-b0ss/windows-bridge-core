@@ -2100,6 +2100,17 @@ class OwnerChromeHiddenSecondaryManager:
                 rec["snapshot"] = token
                 rec["url"] = str(data.get("url") or rec["url"])
                 rec["title"] = str(data.get("title") or rec["title"])
+                # Supply snapshot-independent targets for explicitly named controls.
+                # Anonymous and overly long names keep the original strict ref contract.
+                for control in data.get("controls", []):
+                    name = control.get("name")
+                    if isinstance(name, str) and name.strip() and len(name.strip()) <= 512:
+                        control["locator"] = {
+                            "accessible_name": name.strip(),
+                            "tag": control.get("tag"),
+                            "type": control.get("type", ""),
+                            "document_url": rec["url"],
+                        }
                 return {**data, "snapshot": token, "tab_id": rec["tab_id"], "target_id": rec["target_id"], "route": ROUTE_NAME}
 
             if op == "read":
@@ -2187,17 +2198,56 @@ class OwnerChromeHiddenSecondaryManager:
                 selector = args.get("selector")
                 if not selector and isinstance(target.get("selector"), str):
                     selector = target["selector"]
+                # Accept both the documented nested target form and the legacy top-level form.
                 snap = args.get("snapshot")
+                nested_snap = target.get("snapshot")
+                if snap is not None and nested_snap is not None and snap != nested_snap:
+                    raise OwnerChromeSecondaryError("TARGET_INVALID", "conflicting snapshot values", attempted=False)
+                if snap is None:
+                    snap = nested_snap
                 ref = args.get("ref") if args.get("ref") is not None else target.get("ref")
+                if args.get("ref") is not None and target.get("ref") is not None and args["ref"] != target["ref"]:
+                    raise OwnerChromeSecondaryError("TARGET_INVALID", "conflicting ref values", attempted=False)
                 target_id_attr = target.get("id")
                 target_name_attr = target.get("name")
                 target_label = target.get("label")
+                accessible_name = target.get("accessible_name")
+                semantic_target = accessible_name is not None
 
                 has_explicit_target = bool(
-                    selector or ref is not None or target_id_attr or target_name_attr or target_label
+                    selector or ref is not None or target_id_attr or target_name_attr or target_label or semantic_target
                 )
+                if semantic_target:
+                    if (not isinstance(accessible_name, str) or not accessible_name.strip()
+                            or len(accessible_name) > 512 or selector or ref is not None
+                            or target_id_attr or target_name_attr or target_label):
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid or mixed semantic target", attempted=False)
+                    if target.get("tag") is not None and not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", str(target["tag"])):
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid semantic tag", attempted=False)
+                    if target.get("type") is not None and (not isinstance(target["type"], str) or len(target["type"]) > 64):
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid semantic type", attempted=False)
+                    expected_url = target.get("document_url")
+                    if not isinstance(expected_url, str) or not expected_url or len(expected_url) > 8192:
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "semantic target requires observed document_url", attempted=False)
                 if operation == "press" and not has_explicit_target:
                     locate_js = "const e=document.activeElement||document.body;if(!e)return {error:'TARGET_NOT_FOUND'};"
+                elif semantic_target:
+                    # Resolve the exact visible accessible name in the same document URL.
+                    # This avoids dependence on an index into a historical DOM snapshot.
+                    locate_js = (
+                        f"if(location.href!=={json.dumps(expected_url)})return {{error:'TAB_DOCUMENT_CHANGED'}};"
+                        f"const wanted={json.dumps(accessible_name.strip())};"
+                        f"const wantedTag={json.dumps(target.get('tag'))};"
+                        f"const wantedType={json.dumps(target.get('type'))};"
+                        "const nodes=[...document.querySelectorAll('input,textarea,button,select,a,[role=button],[contenteditable=true]')].filter(el=>{"
+                        "if(!el.isConnected||!el.getClientRects().length||el.closest('[inert]')||el.disabled||el.getAttribute('aria-disabled')==='true')return false;"
+                        "const style=getComputedStyle(el);if(style.visibility==='hidden'||style.visibility==='collapse')return false;"
+                        "const name=(el.getAttribute('aria-label')||el.labels?.[0]?.innerText||el.innerText||el.name||'').trim();"
+                        "return name===wanted&&(wantedTag===null||el.tagName.toLowerCase()===wantedTag)&&(wantedType===null||(el.type||'')===wantedType);});"
+                        "if(nodes.length===0)return {error:'TARGET_NOT_FOUND'};"
+                        "if(nodes.length!==1)return {error:'TARGET_AMBIGUOUS'};"
+                        "const e=nodes[0];"
+                    )
                 elif selector:
                     if not isinstance(selector, str) or len(selector) > 512:
                         raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid selector", attempted=False)
@@ -2334,11 +2384,21 @@ class OwnerChromeHiddenSecondaryManager:
                 }[operation]
                 url_before = rec["url"]
                 rec["snapshot"] = None
-                outcome = self._eval(
-                    rec,
-                    "(()=>{" + host_guard_js + locate_js + action_js + "return {acted:true,url:location.href,title:document.title,detail:detail};})()",
-                    timeout_s=min(timeout, 10.0),
-                )
+                expression = "(()=>{" + host_guard_js + locate_js + action_js + "return {acted:true,url:location.href,title:document.title,detail:detail};})()"
+                # Only explicit semantic locators may wait for hydration. A returned
+                # TARGET_NOT_FOUND is produced before any input; never replay an
+                # exception, ambiguous action, failed postcondition or changed URL.
+                deadline = time.monotonic() + min(max(timeout, 0.0), 1.0)
+                resolution_attempts = 0
+                while True:
+                    resolution_attempts += 1
+                    outcome = self._eval(rec, expression, timeout_s=min(timeout, 10.0))
+                    if (not semantic_target or not isinstance(outcome, dict)
+                            or outcome.get("error") != "TARGET_NOT_FOUND"
+                            or outcome.get("attempted") is not None
+                            or resolution_attempts >= 4 or time.monotonic() >= deadline):
+                        break
+                    time.sleep(min(0.15, max(0.0, deadline - time.monotonic())))
                 if not isinstance(outcome, dict) or outcome.get("error"):
                     err_code = str((outcome or {}).get("error") or "ACTION_FAILED")
                     was_attempted = bool((outcome or {}).get("attempted", False))
@@ -2363,6 +2423,7 @@ class OwnerChromeHiddenSecondaryManager:
                     "acted": True,
                     "verified": verified,
                     "action": operation,
+                    "resolution_attempts": resolution_attempts,
                     "detail": outcome.get("detail"),
                     "tab_id": rec["tab_id"],
                     "target_id": rec["target_id"],
