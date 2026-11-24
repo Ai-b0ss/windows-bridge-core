@@ -51,6 +51,248 @@ MAX_TARGETS_PER_OWNER = 8
 MAX_TARGETS_TOTAL = 24
 DEFAULT_VIEWPORT = (1280, 800)
 
+# Windowless hidden targets (Target.createTarget({hidden: true})) have no OS compositor
+# BeginMainFrame cycle in Chrome 158+, causing both requestIdleCallback (even with
+# {timeout}) and requestAnimationFrame to starve indefinitely. SPAs such as Gemini
+# (Angular/RxJS idle-gated loaders like _.HD/_.FD/_.Odc) deadlock their Send action
+# without a bounded timer-backed fallback installed before document bootstrap.
+_HIDDEN_TARGET_LIVENESS_JS = r"""(() => {
+  const G = globalThis;
+  const MARK = Symbol.for("__ff_hidden_target_liveness_v1__");
+  if (G[MARK]) return;
+  try {
+    Object.defineProperty(G, MARK, { value: true, configurable: false, enumerable: false });
+  } catch (_) {
+    G[MARK] = true;
+  }
+  const nativeSetTimeout = typeof G.setTimeout === "function" ? G.setTimeout.bind(G) : null;
+  const nativeClearTimeout = typeof G.clearTimeout === "function" ? G.clearTimeout.bind(G) : null;
+  if (!nativeSetTimeout || !nativeClearTimeout) return;
+  const nowMs = () => {
+    try {
+      if (G.performance && typeof G.performance.now === "function") return G.performance.now();
+    } catch (_) {}
+    return Date.now();
+  };
+  if (typeof G.requestIdleCallback === "function") {
+    const origRIC = G.requestIdleCallback.bind(G);
+    const origCancelRIC = typeof G.cancelIdleCallback === "function" ? G.cancelIdleCallback.bind(G) : null;
+    const pendingIdle = new Map();
+    let nextIdleId = 1;
+    G.requestIdleCallback = function requestIdleCallback(cb, opts) {
+      if (typeof cb !== "function") {
+        throw new TypeError("Failed to execute 'requestIdleCallback': parameter 1 is not of type 'IdleRequestCallback'.");
+      }
+      const id = nextIdleId++;
+      const hasTimeout = !!(opts && typeof opts === "object" && opts.timeout != null && Number.isFinite(Number(opts.timeout)));
+      const rawTimeout = hasTimeout ? Math.max(0, Number(opts.timeout)) : null;
+      const fallbackDelay = rawTimeout === null ? 24 : Math.min(rawTimeout, 24);
+      const entry = { done: false, nativeId: null, timerId: null };
+      pendingIdle.set(id, entry);
+      const fire = (fromFallback, nativeDeadline) => {
+        if (entry.done) return;
+        entry.done = true;
+        pendingIdle.delete(id);
+        if (entry.timerId !== null) {
+          nativeClearTimeout(entry.timerId);
+          entry.timerId = null;
+        }
+        if (fromFallback && entry.nativeId !== null && origCancelRIC) {
+          try { origCancelRIC(entry.nativeId); } catch (_) {}
+          entry.nativeId = null;
+        }
+        const deadline = nativeDeadline || (() => {
+          const started = nowMs();
+          return {
+            didTimeout: rawTimeout !== null && fallbackDelay >= rawTimeout,
+            timeRemaining() {
+              const rem = 50 - (nowMs() - started);
+              return rem > 0 ? rem : 0;
+            },
+          };
+        })();
+        cb(deadline);
+      };
+      try {
+        entry.nativeId = opts === undefined ? origRIC((d) => fire(false, d)) : origRIC((d) => fire(false, d), opts);
+      } catch (_) {
+        entry.nativeId = null;
+      }
+      if (!entry.done) {
+        entry.timerId = nativeSetTimeout(() => fire(true, null), fallbackDelay);
+      }
+      return id;
+    };
+    G.cancelIdleCallback = function cancelIdleCallback(id) {
+      const entry = pendingIdle.get(id);
+      if (!entry) {
+        if (origCancelRIC) {
+          try { origCancelRIC(id); } catch (_) {}
+        }
+        return;
+      }
+      entry.done = true;
+      pendingIdle.delete(id);
+      if (entry.timerId !== null) {
+        nativeClearTimeout(entry.timerId);
+        entry.timerId = null;
+      }
+      if (entry.nativeId !== null && origCancelRIC) {
+        try { origCancelRIC(entry.nativeId); } catch (_) {}
+        entry.nativeId = null;
+      }
+    };
+  }
+  if (typeof G.requestAnimationFrame === "function") {
+    const origRAF = G.requestAnimationFrame.bind(G);
+    const origCancelRAF = typeof G.cancelAnimationFrame === "function" ? G.cancelAnimationFrame.bind(G) : null;
+    const pendingRaf = new Map();
+    let nextRafId = 1;
+    G.requestAnimationFrame = function requestAnimationFrame(cb) {
+      if (typeof cb !== "function") {
+        throw new TypeError("Failed to execute 'requestAnimationFrame': parameter 1 is not of type 'FrameRequestCallback'.");
+      }
+      const id = nextRafId++;
+      const entry = { done: false, nativeId: null, timerId: null };
+      pendingRaf.set(id, entry);
+      const fire = (fromFallback, ts) => {
+        if (entry.done) return;
+        entry.done = true;
+        pendingRaf.delete(id);
+        if (entry.timerId !== null) {
+          nativeClearTimeout(entry.timerId);
+          entry.timerId = null;
+        }
+        if (fromFallback && entry.nativeId !== null && origCancelRAF) {
+          try { origCancelRAF(entry.nativeId); } catch (_) {}
+          entry.nativeId = null;
+        }
+        cb(typeof ts === "number" ? ts : nowMs());
+      };
+      try {
+        entry.nativeId = origRAF((ts) => fire(false, ts));
+      } catch (_) {
+        entry.nativeId = null;
+      }
+      if (!entry.done) {
+        entry.timerId = nativeSetTimeout(() => fire(true, null), 32);
+      }
+      return id;
+    };
+    G.cancelAnimationFrame = function cancelAnimationFrame(id) {
+      const entry = pendingRaf.get(id);
+      if (!entry) {
+        if (origCancelRAF) {
+          try { origCancelRAF(id); } catch (_) {}
+        }
+        return;
+      }
+      entry.done = true;
+      pendingRaf.delete(id);
+      if (entry.timerId !== null) {
+        nativeClearTimeout(entry.timerId);
+        entry.timerId = null;
+      }
+      if (entry.nativeId !== null && origCancelRAF) {
+        try { origCancelRAF(entry.nativeId); } catch (_) {}
+        entry.nativeId = null;
+      }
+    };
+  }
+})();"""
+
+_NAMED_KEYS: dict[str, tuple[str, str, int]] = {
+    "enter": ("Enter", "Enter", 13),
+    "return": ("Enter", "Enter", 13),
+    "tab": ("Tab", "Tab", 9),
+    "escape": ("Escape", "Escape", 27),
+    "esc": ("Escape", "Escape", 27),
+    "backspace": ("Backspace", "Backspace", 8),
+    "delete": ("Delete", "Delete", 46),
+    "del": ("Delete", "Delete", 46),
+    "insert": ("Insert", "Insert", 45),
+    "space": (" ", "Space", 32),
+    "spacebar": (" ", "Space", 32),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37),
+    "arrowup": ("ArrowUp", "ArrowUp", 38),
+    "arrowright": ("ArrowRight", "ArrowRight", 39),
+    "arrowdown": ("ArrowDown", "ArrowDown", 40),
+    "home": ("Home", "Home", 36),
+    "end": ("End", "End", 35),
+    "pageup": ("PageUp", "PageUp", 33),
+    "pagedown": ("PageDown", "PageDown", 34),
+}
+
+
+def _parse_press_key(raw_key: str) -> dict[str, Any]:
+    """Parse a key or modifier chord (e.g. 'Enter', 'Shift+Enter', 'Ctrl+k') into KeyboardEventInit fields."""
+    ctrl = shift = alt = meta = False
+    if raw_key == "+":
+        base = "+"
+    else:
+        tokens: list[str] = []
+        i = 0
+        while i < len(raw_key):
+            j = raw_key.find("+", i)
+            if j == -1:
+                tokens.append(raw_key[i:])
+                break
+            if j == i and tokens:
+                tokens.append("+")
+                i = j + 1
+                continue
+            tokens.append(raw_key[i:j])
+            i = j + 1
+            if i == len(raw_key):
+                tokens.append("+")
+        if not tokens:
+            base = raw_key
+        else:
+            for mod in tokens[:-1]:
+                m = mod.strip().lower()
+                if m in {"ctrl", "control"}:
+                    ctrl = True
+                elif m == "shift":
+                    shift = True
+                elif m in {"alt", "option"}:
+                    alt = True
+                elif m in {"meta", "cmd", "command", "win", "super"}:
+                    meta = True
+            base = tokens[-1]
+
+    low = base.lower()
+    if base == " ":
+        key_val, code_val, key_code = " ", "Space", 32
+    elif low in _NAMED_KEYS:
+        key_val, code_val, key_code = _NAMED_KEYS[low]
+    elif re.fullmatch(r"f([1-9]|1[0-2])", low):
+        n = int(low[1:])
+        key_val, code_val, key_code = f"F{n}", f"F{n}", 111 + n
+    elif len(base) == 1:
+        key_val = base
+        if "a" <= low <= "z":
+            code_val = f"Key{base.upper()}"
+            key_code = ord(base.upper())
+        elif "0" <= base <= "9":
+            code_val = f"Digit{base}"
+            key_code = ord(base)
+        else:
+            code_val = base
+            key_code = ord(base.upper()) if ord(base) < 128 else 0
+    else:
+        key_val, code_val, key_code = base, base, 0
+
+    return {
+        "key": key_val,
+        "code": code_val,
+        "keyCode": key_code,
+        "which": key_code,
+        "ctrlKey": ctrl,
+        "shiftKey": shift,
+        "altKey": alt,
+        "metaKey": meta,
+    }
+
 
 class OwnerChromeSecondaryError(RuntimeError):
     def __init__(self, code: str, message: str | None = None, **details: Any):
@@ -1844,6 +2086,19 @@ class OwnerChromeHiddenSecondaryManager:
                         session_id=session_id,
                         timeout=5.0,
                     )
+                    self._cdp.send("Page.enable", {}, session_id=session_id, timeout=5.0)
+                    self._cdp.send(
+                        "Emulation.setFocusEmulationEnabled",
+                        {"enabled": True},
+                        session_id=session_id,
+                        timeout=5.0,
+                    )
+                    self._cdp.send(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": _HIDDEN_TARGET_LIVENESS_JS},
+                        session_id=session_id,
+                        timeout=5.0,
+                    )
                     rec = {
                         "tab_id": tab_id,
                         "target_id": target_id,
@@ -1857,6 +2112,11 @@ class OwnerChromeHiddenSecondaryManager:
                         "viewport": {"width": width, "height": height},
                         "created_at": time.time(),
                     }
+                    if url == "about:blank":
+                        try:
+                            self._eval(rec, _HIDDEN_TARGET_LIVENESS_JS, timeout_s=3.0)
+                        except OwnerChromeSecondaryError:
+                            pass
                     if url != "about:blank":
                         nav = self._cdp.send("Page.navigate", {"url": url}, session_id=session_id, timeout=min(timeout, 15.0))
                         if nav.get("errorText"):
@@ -2311,6 +2571,21 @@ class OwnerChromeHiddenSecondaryManager:
                     "e.click();"
                 )
 
+                press_spec = _parse_press_key(key) if operation == "press" and isinstance(key, str) else None
+                press_js = (
+                    f"const ks={json.dumps(press_spec or {})};"
+                    "if(typeof e.focus==='function')e.focus({preventScroll:true});"
+                    "const kinit={...ks,bubbles:true,cancelable:true,composed:true,view:window};"
+                    "const proceed=e.dispatchEvent(new KeyboardEvent('keydown',kinit));"
+                    "e.dispatchEvent(new KeyboardEvent('keyup',kinit));"
+                    "const hasMods=Boolean(ks.ctrlKey||ks.shiftKey||ks.altKey||ks.metaKey);"
+                    "let detail='dispatched';"
+                    "if(!proceed){detail='prevented_by_page';}"
+                    "else if(ks.key==='Enter'&&!hasMods&&e.tagName!=='TEXTAREA'&&e.form&&typeof e.form.requestSubmit==='function'){"
+                    "const isSub=(e.tagName==='BUTTON'&&(e.type||'submit')==='submit')||(e.tagName==='INPUT'&&['submit','image'].includes(String(e.type||'').toLowerCase()));"
+                    "if(isSub)e.form.requestSubmit(e);else e.form.requestSubmit();detail='form_submitted';}"
+                )
+
                 action_js = {
                     "fill": (
                         "if(e.readOnly)return {error:'TARGET_NOT_EDITABLE'};"
@@ -2370,17 +2645,7 @@ class OwnerChromeHiddenSecondaryManager:
                         "if(after)return {error:'ACTION_NO_EFFECT',attempted:true};"
                         "const detail={mode:'dom-check',checked:false};"
                     ),
-                    "press": (
-                        f"const k={json.dumps(key or '')};"
-                        "const kinit={key:k,code:k.length===1?'Key'+k.toUpperCase():k,bubbles:true,cancelable:true,composed:true};"
-                        "const proceed=e.dispatchEvent(new KeyboardEvent('keydown',kinit));"
-                        "e.dispatchEvent(new KeyboardEvent('keyup',kinit));"
-                        "let detail='dispatched';"
-                        "if(!proceed){detail='prevented_by_page';}"
-                        "else if(k==='Enter'&&e.tagName!=='TEXTAREA'&&e.form&&typeof e.form.requestSubmit==='function'){"
-                        "const isSub=(e.tagName==='BUTTON'&&(e.type||'submit')==='submit')||(e.tagName==='INPUT'&&['submit','image'].includes(String(e.type||'').toLowerCase()));"
-                        "if(isSub)e.form.requestSubmit(e);else e.form.requestSubmit();detail='form_submitted';}"
-                    ),
+                    "press": press_js,
                 }[operation]
                 url_before = rec["url"]
                 rec["snapshot"] = None
