@@ -53,6 +53,78 @@ def chrome_path():
     return next((p.resolve() for p in candidates if p.is_file() and not linked(p)), None)
 
 
+def chrome_binary_version(executable: str | Path) -> tuple[int, int, int, int] | None:
+    """Read the PE VS_FIXEDFILEINFO version tuple of a Windows Chrome executable without launching it."""
+    if os.name != "nt":
+        return None
+    path = Path(executable)
+    if not path.is_file():
+        return None
+
+    class _VsFixedFileInfo(ctypes.Structure):
+        _fields_ = [
+            ("dwSignature", w.DWORD),
+            ("dwStrucVersion", w.DWORD),
+            ("dwFileVersionMS", w.DWORD),
+            ("dwFileVersionLS", w.DWORD),
+            ("dwProductVersionMS", w.DWORD),
+            ("dwProductVersionLS", w.DWORD),
+            ("dwFileFlagsMask", w.DWORD),
+            ("dwFileFlags", w.DWORD),
+            ("dwFileOS", w.DWORD),
+            ("dwFileType", w.DWORD),
+            ("dwFileSubtype", w.DWORD),
+            ("dwFileDateMS", w.DWORD),
+            ("dwFileDateLS", w.DWORD),
+        ]
+
+    try:
+        version_dll = ctypes.WinDLL("version", use_last_error=True)
+        version_dll.GetFileVersionInfoSizeW.argtypes = [w.LPCWSTR, ctypes.POINTER(w.DWORD)]
+        version_dll.GetFileVersionInfoSizeW.restype = w.DWORD
+        version_dll.GetFileVersionInfoW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, ctypes.c_void_p]
+        version_dll.GetFileVersionInfoW.restype = w.BOOL
+        version_dll.VerQueryValueW.argtypes = [
+            ctypes.c_void_p, w.LPCWSTR, ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(w.UINT),
+        ]
+        version_dll.VerQueryValueW.restype = w.BOOL
+
+        handle = w.DWORD(0)
+        size = int(version_dll.GetFileVersionInfoSizeW(str(path), ctypes.byref(handle)))
+        if size <= 0 or size > 16 * 1024 * 1024:
+            return None
+        buf = ctypes.create_string_buffer(size)
+        if not version_dll.GetFileVersionInfoW(str(path), 0, size, buf):
+            return None
+        ptr = ctypes.c_void_p()
+        length = w.UINT(0)
+        if not version_dll.VerQueryValueW(buf, "\\", ctypes.byref(ptr), ctypes.byref(length)):
+            return None
+        struct_size = ctypes.sizeof(_VsFixedFileInfo)
+        buf_addr = ctypes.addressof(buf)
+        if (
+            not ptr.value
+            or int(length.value) < struct_size
+            or ptr.value < buf_addr
+            or ptr.value + struct_size > buf_addr + size
+        ):
+            return None
+        info = _VsFixedFileInfo.from_address(ptr.value)
+        if info.dwSignature != 0xFEEF04BD:
+            return None
+        ms, ls = info.dwProductVersionMS, info.dwProductVersionLS
+        if ms == 0 and ls == 0:
+            ms, ls = info.dwFileVersionMS, info.dwFileVersionLS
+        return (
+            int(ms >> 16),
+            int(ms & 0xFFFF),
+            int(ls >> 16),
+            int(ls & 0xFFFF),
+        )
+    except OSError:
+        return None
+
+
 def _private(desktop, hwnd=None, *, require_current_thread_on_desktop=True):
     identity = desktop_identity(hwnd if require_current_thread_on_desktop else None)
     if (not isinstance(desktop, str) or not desktop.startswith("FFBridge-Agent-")

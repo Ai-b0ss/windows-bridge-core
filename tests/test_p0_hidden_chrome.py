@@ -470,6 +470,101 @@ class ProfileIsolationContractTests(unittest.TestCase):
             profiles.ManagedBrowserProfiles(owner_chrome)
         self.assertEqual(exc.exception.code, "OWNER_BROWSER_PROFILE_FORBIDDEN")
 
+    @unittest.skipUnless(os.name == "nt", "Windows 8.3 short-path canonicalization vs junction rejection")
+    def test_windows_83_short_path_accepted_while_short_junction_and_owner_profile_rejected(self):
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetShortPathNameW.argtypes = [wt.LPCWSTR, wt.LPWSTR, wt.DWORD]
+        k32.GetShortPathNameW.restype = wt.DWORD
+
+        def _short_path(p: Path) -> str:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = k32.GetShortPathNameW(str(p), buf, len(buf))
+            return buf.value if n else str(p)
+
+        long_root = Path(self.tmp.name) / "isolated-long-profile-root"
+        long_root.mkdir()
+        short_root_str = _short_path(long_root)
+        if "~" not in short_root_str:
+            self.skipTest("Volume does not generate Windows 8.3 short paths")
+        short_root = Path(short_root_str)
+
+        # Pure 8.3 short path is canonicalized to its long path without triggering link false positives.
+        target, pid = profiles.resolve_isolated_profile_dir(short_root, profile_id="short-ok-1")
+        self.assertEqual(pid, "short-ok-1")
+        self.assertEqual(profiles._norm_key(target), profiles._norm_key(long_root.resolve() / "short-ok-1"))
+
+        lease = profiles.PersistentBrowserProfile(short_root, profile_id="short-persist-1")
+        try:
+            self.assertTrue((lease.path / "owner.json").is_file())
+        finally:
+            lease.close()
+
+        # NTFS junction accessed by EITHER long name OR 8.3 short name MUST still fail closed!
+        outside = Path(self.tmp.name) / "outside-junction-target"
+        outside.mkdir()
+        junc = long_root / "sneaky-long-junction"
+        mk = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junc), str(outside)],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if mk.returncode != 0:
+            self.skipTest("Could not create test NTFS junction on this host")
+        try:
+            short_junc = Path(_short_path(junc))
+            for candidate in (junc, short_junc, short_junc / "nested"):
+                with self.subTest(candidate=str(candidate)):
+                    with self.assertRaises(profiles.ProfileIsolationError) as exc:
+                        profiles.assert_not_owner_browser_profile(candidate)
+                    self.assertEqual(exc.exception.code, "ISOLATED_PROFILE_LINK_FORBIDDEN")
+
+            # Dangling/broken NTFS junction (target removed) MUST still fail closed!
+            outside.rmdir()
+            for candidate in (junc, short_junc, junc / "future-child"):
+                with self.subTest(dangling_candidate=str(candidate)):
+                    with self.assertRaises(profiles.ProfileIsolationError) as exc:
+                        profiles.assert_not_owner_browser_profile(candidate)
+                    self.assertEqual(exc.exception.code, "ISOLATED_PROFILE_LINK_FORBIDDEN")
+        finally:
+            subprocess.run(
+                ["cmd", "/c", "rmdir", str(junc)],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+
+        # Lowercase \\?\unc\ extended UNC path must never be rewritten into a local CWD path.
+        from cua_windows_paths import expand_windows_short_path
+        unc_in = Path(r"\\?\unc\localhost\nonexistent-share-ff-test")
+        unc_out = expand_windows_short_path(unc_in)
+        self.assertTrue(str(unc_out).lower().startswith("\\\\?\\unc\\"), str(unc_out))
+
+        # Owner Chrome profile accessed via 8.3 short path prefix MUST still fail closed!
+        local_app = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        short_local = Path(_short_path(Path(local_app)))
+        owner_short = short_local / "Google" / "Chrome" / "User Data"
+        with self.assertRaises(profiles.ProfileIsolationError) as exc:
+            profiles.resolve_isolated_profile_dir(short_root, profile_dir=owner_short)
+        self.assertEqual(exc.exception.code, "OWNER_BROWSER_PROFILE_FORBIDDEN")
+
+    @unittest.skipUnless(os.name == "nt", "Windows PE binary version helper")
+    def test_chrome_binary_version_reads_pe_and_rejects_non_pe(self):
+        non_pe = Path(self.tmp.name) / "not-a-pe.txt"
+        non_pe.write_text("hello", encoding="utf-8")
+        self.assertIsNone(hidden_chrome.chrome_binary_version(non_pe))
+        self.assertIsNone(hidden_chrome.chrome_binary_version(Path(self.tmp.name) / "missing.exe"))
+
+        py_ver = hidden_chrome.chrome_binary_version(sys.executable)
+        self.assertIsInstance(py_ver, tuple)
+        self.assertEqual(len(py_ver), 4)
+        self.assertGreaterEqual(py_ver[0], 3)
+
+        chrome_exe = hidden_chrome.chrome_path()
+        if chrome_exe is not None:
+            cver = hidden_chrome.chrome_binary_version(chrome_exe)
+            self.assertIsInstance(cver, tuple)
+            self.assertEqual(len(cver), 4)
+            self.assertGreater(cver[0], 0)
+
 
 class HiddenChromeAndPrivateBrowserUnitTests(unittest.TestCase):
     def test_launch_chrome_refuses_owner_profile_before_spawn(self):
@@ -1258,7 +1353,18 @@ class RealWindowsOwnerChromeProfile1Gate2ALiveTests(unittest.TestCase):
             raise unittest.SkipTest("Interactive Windows desktop unavailable")
         cls.exe = hidden_chrome.chrome_path()
         if cls.exe is None:
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                raise AssertionError("FF_REQUIRE_CHROME_158=1 requires installed Google Chrome >= 158.0.8127.2")
             raise unittest.SkipTest("Chrome executable not installed")
+        cls.chrome_ver = hidden_chrome.chrome_binary_version(cls.exe)
+        if cls.chrome_ver is None:
+            raise AssertionError(f"Could not read PE version metadata from {cls.exe}")
+        if not owner_secondary._version_at_least(cls.chrome_ver, owner_secondary.MIN_HIDDEN_TARGET_CHROME):
+            got = ".".join(str(x) for x in cls.chrome_ver)
+            req = ".".join(str(x) for x in owner_secondary.MIN_HIDDEN_TARGET_CHROME)
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                raise AssertionError(f"FF_REQUIRE_CHROME_158=1 requires Chrome >= {req}, found {got} at {cls.exe}")
+            raise unittest.SkipTest(f"Installed Chrome binary {got} < required {req}")
         cls.server, cls.server_thread, cls.base_url = _start_httponly_auth_server()
 
     @classmethod
