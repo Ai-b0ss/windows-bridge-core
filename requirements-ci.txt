@@ -1,0 +1,4 @@
+# Explicit pinned CI/test/tool-only Python dependencies.
+# Deployable runtime under runtime/bridge-v3/ remains strictly stdlib-only.
+psutil==7.2.2
+cryptography==46.0.3

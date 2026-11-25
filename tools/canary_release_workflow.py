@@ -30,6 +30,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import shlex
 import shutil
 import socket
 import sqlite3
@@ -49,6 +50,7 @@ BRIDGE_V3_DIR = ROOT / "runtime" / "bridge-v3"
 if str(BRIDGE_V3_DIR) not in sys.path:
     sys.path.insert(0, str(BRIDGE_V3_DIR))
 
+from cua_windows_paths import expand_windows_short_path  # noqa: E402
 from ff_win_process_identity import process_creation_token  # noqa: E402
 
 SCHEMA_OWNER = "ff-canary-shadow-owner-v1"
@@ -162,7 +164,10 @@ def _is_reparse_point(path: Path) -> bool:
             return True
     if os.name == "nt":
         try:
-            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.GetFileAttributesW.argtypes = [ctypes.wintypes.LPCWSTR]
+            k32.GetFileAttributesW.restype = ctypes.wintypes.DWORD
+            attrs = int(k32.GetFileAttributesW(str(path)))
             if attrs != 0xFFFFFFFF and (attrs & 0x0400):
                 return True
         except Exception:
@@ -173,9 +178,8 @@ def _is_reparse_point(path: Path) -> bool:
 def assert_no_reparse(path: Path, *, must_file: bool = False) -> None:
     cursor = Path(os.path.abspath(str(path)))
     while True:
-        if cursor.exists() or cursor.is_symlink():
-            if _is_reparse_point(cursor):
-                raise CanaryError("REPARSE_POINT_FORBIDDEN", "Symlinks and NTFS junctions are forbidden", path=str(cursor))
+        if os.path.lexists(str(cursor)) and _is_reparse_point(cursor):
+            raise CanaryError("REPARSE_POINT_FORBIDDEN", "Symlinks and NTFS junctions are forbidden", path=str(cursor))
         if cursor.parent == cursor:
             break
         cursor = cursor.parent
@@ -1599,24 +1603,115 @@ def write_process_lease(
     return lease
 
 
-def _cmdline_contains_path(cmdline: str, target_path: str) -> bool:
-    """Verify target_path appears as a complete path argument in cmdline (no prefix collisions)."""
-    if not isinstance(cmdline, str) or not cmdline.strip():
-        return False
-    cmd_norm = cmdline.replace("\\", "/").casefold()
-    candidates = {_norm_path(target_path)}
-    p = Path(target_path)
+def _has_reparse_ancestor(path: Path) -> bool:
+    cursor = Path(os.path.abspath(str(path)))
+    while True:
+        if os.path.lexists(str(cursor)) and _is_reparse_point(cursor):
+            return True
+        if cursor.parent == cursor:
+            return False
+        cursor = cursor.parent
+
+
+def _exe_norm_path(path: Path | str) -> str:
+    return _norm_path(expand_windows_short_path(path))
+
+
+def _split_windows_cmdline(cmdline: str) -> list[str]:
+    if not isinstance(cmdline, str) or not cmdline.strip() or "\x00" in cmdline:
+        return []
+    if os.name == "nt":
+        try:
+            shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            shell32.CommandLineToArgvW.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+            shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.wintypes.LPWSTR)
+            kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+            kernel32.LocalFree.restype = ctypes.c_void_p
+            argc = ctypes.c_int(0)
+            argv_ptr = shell32.CommandLineToArgvW(cmdline, ctypes.byref(argc))
+            if argv_ptr:
+                try:
+                    return [argv_ptr[i] for i in range(int(argc.value)) if argv_ptr[i] is not None]
+                finally:
+                    kernel32.LocalFree(argv_ptr)
+        except Exception:
+            pass
     try:
-        if p.exists():
-            candidates.add(_norm_path(p.resolve()))
+        return shlex.split(cmdline, posix=False)
+    except ValueError:
+        return cmdline.split()
+
+
+def _cmdline_contains_path(cmdline: str, target_path: str) -> bool:
+    """Verify target_path appears as a complete path argument in cmdline (no prefix/link collisions).
+
+    Supports Windows 8.3 short paths (e.g. C:\\Users\\RUNNER~1\\...) ONLY by expanding
+    reparse-free existing paths via GetLongPathNameW and verifying exact physical
+    equivalence against os.path.realpath. Symlinks, NTFS junctions, SUBST redirections,
+    embedded NUL bytes, `..` traversals, and prefix collisions are rejected fail-closed.
+    """
+    if not isinstance(cmdline, str) or not cmdline.strip() or "\x00" in cmdline:
+        return False
+    if not isinstance(target_path, str) or not target_path.strip() or "\x00" in target_path:
+        return False
+
+    target_norms = {_norm_path(target_path)}
+    try:
+        target_norms.add(_norm_path(expand_windows_short_path(target_path)))
     except OSError:
         pass
-    for cand in candidates:
-        if not cand:
+    p = Path(target_path)
+    try:
+        if p.exists() and not _has_reparse_ancestor(p):
+            target_norms.add(_norm_path(p.resolve()))
+    except OSError:
+        pass
+    target_norms.discard("")
+    if not target_norms:
+        return False
+
+    tokens = _split_windows_cmdline(cmdline)
+    search_tokens = tokens[1:] if len(tokens) > 1 else tokens
+    candidates: list[str] = []
+    for tok in search_tokens:
+        raw_tok = tok.strip()
+        if not raw_tok:
             continue
-        pattern = r'(?:^|[\s"\'=])' + re.escape(cand) + r'(?:$|[\s"\'])'
-        if re.search(pattern, cmd_norm):
+        candidates.append(raw_tok)
+        if raw_tok.startswith("-") and "=" in raw_tok:
+            rhs = raw_tok.split("=", 1)[1]
+            if rhs:
+                candidates.append(rhs)
+
+    for raw_val in candidates:
+        val = raw_val
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+            val = val[1:-1]
+        if not val or "\x00" in val:
+            continue
+        if ".." in re.split(r"[\\/]+", val):
+            continue
+        direct_norm = val.replace("\\", "/").rstrip("/").casefold()
+        if direct_norm in target_norms:
             return True
+        if os.path.isabs(val) and _norm_path(val) in target_norms:
+            return True
+        if os.name == "nt" and "~" in val and os.path.isabs(val):
+            cand = Path(val)
+            try:
+                if not cand.exists() or _has_reparse_ancestor(cand):
+                    continue
+                long_cand = expand_windows_short_path(cand)
+                if _has_reparse_ancestor(long_cand):
+                    continue
+                real_cand = os.path.realpath(str(cand))
+                if _norm_path(long_cand) != _norm_path(real_cand):
+                    continue
+                if _norm_path(long_cand) in target_norms:
+                    return True
+            except OSError:
+                continue
     return False
 
 
@@ -1705,9 +1800,13 @@ def verify_process_lease(
     ):
         raise CanaryError("PROCESS_LEASE_INVALID", "Malformed or incomplete 4-factor fields in process lease", role=role)
     exe_sha_expected = exe_sha_raw.lower()
-    # Entrypoint MUST reside strictly within shadow_root.
-    ep_norm = _norm_path(entry_expected)
-    root_norms = {_norm_path(root), _norm_path(root.resolve())}
+    # Entrypoint MUST be an absolute, reparse-free path strictly within shadow_root.
+    ep_path = Path(entry_expected)
+    if not ep_path.is_absolute() or "\x00" in entry_expected or ".." in re.split(r"[\\/]+", entry_expected):
+        raise CanaryError("PROCESS_LEASE_INVALID", "Lease entrypoint must be a clean absolute path", role=role)
+    assert_no_reparse(ep_path)
+    ep_norm = _norm_path(expand_windows_short_path(entry_expected))
+    root_norms = {_norm_path(root), _norm_path(expand_windows_short_path(root)), _norm_path(root.resolve())}
     if not any(ep_norm.startswith(rn + "/") for rn in root_norms):
         raise CanaryError("PROCESS_PATH_OUTSIDE_SHADOW_ROOT", "Lease entrypoint escapes shadow root", role=role)
 
@@ -1727,7 +1826,7 @@ def verify_process_lease(
             )
         return {"alive": False, "identity_matched": False, "reason": "PID_REUSED_OR_EXITED_NO_KILL", "lease": lease}
 
-    if _norm_path(live["executable_path"]) != _norm_path(exe_expected):
+    if _exe_norm_path(live["executable_path"]) != _exe_norm_path(exe_expected):
         raise CanaryError(
             "PROCESS_IDENTITY_MISMATCH",
             "Process executable image path does not match lease",
@@ -1822,7 +1921,7 @@ def stop_leased_process(
 
     pid = int(lease["pid"])
     expected_ct = int(lease["create_time_filetime"])
-    expected_exe = _norm_path(lease["executable_path"])
+    expected_exe = _exe_norm_path(lease["executable_path"])
     expected_exe_sha = str(lease["executable_sha256"]).lower()
     entry_expected = str(lease["entrypoint_path"])
     leased_port = int(lease["port"])
@@ -1853,7 +1952,7 @@ def stop_leased_process(
                     if receipt_store is not None:
                         receipt_store.record_lease(run_id, lease, "identity_mismatch_no_kill")
                     return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PID_REUSED_OR_EXITED_NO_KILL"}
-                if _norm_path(actual_exe) != expected_exe:
+                if _exe_norm_path(actual_exe) != expected_exe:
                     raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable path mismatch before graceful stop", role=role, pid=pid)
                 actual_exe_sha = _hash_live_executable_or_raise(actual_exe, role=role, pid=pid)
                 if not hmac.compare_digest(actual_exe_sha, expected_exe_sha):
@@ -1944,7 +2043,7 @@ def stop_leased_process(
             if receipt_store is not None:
                 receipt_store.record_lease(run_id, lease, "identity_mismatch_no_kill")
             return {"stopped": True, "terminated": False, "role": role, "pid": pid, "reason": "PID_REUSED_OR_EXITED_NO_KILL"}
-        if _norm_path(actual_exe) != expected_exe:
+        if _exe_norm_path(actual_exe) != expected_exe:
             raise CanaryError("PROCESS_IDENTITY_MISMATCH", "Handle executable path mismatch before stop", role=role, pid=pid)
         actual_exe_sha = _hash_live_executable_or_raise(actual_exe, role=role, pid=pid)
         if not hmac.compare_digest(actual_exe_sha, expected_exe_sha):

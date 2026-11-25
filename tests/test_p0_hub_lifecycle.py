@@ -1302,13 +1302,29 @@ class OwnerChromeHiddenSecondaryHubTests(unittest.TestCase):
         import secrets
         from types import SimpleNamespace
         import cua_hidden_chrome as hidden_chrome
-        from cua_owner_chrome_secondary import OwnerChromeHiddenSecondaryManager, ROUTE_NAME
+        from cua_owner_chrome_secondary import (
+            MIN_HIDDEN_TARGET_CHROME,
+            OwnerChromeHiddenSecondaryManager,
+            ROUTE_NAME,
+            _version_at_least,
+        )
         from cua_sidecar_supervisor import _bind_windows_kill_on_close_job, _close_windows_job_handle
         from ff_agent_entry import entry_call
 
         chrome_exe = hidden_chrome.chrome_path()
         if not chrome_exe:
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail("FF_REQUIRE_CHROME_158=1 requires installed Google Chrome >= 158.0.8127.2")
             self.skipTest("Chrome executable not installed")
+        chrome_ver = hidden_chrome.chrome_binary_version(chrome_exe)
+        if chrome_ver is None:
+            self.fail(f"Could not read PE version metadata from {chrome_exe}")
+        if not _version_at_least(chrome_ver, MIN_HIDDEN_TARGET_CHROME):
+            got = ".".join(str(x) for x in chrome_ver)
+            req = ".".join(str(x) for x in MIN_HIDDEN_TARGET_CHROME)
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail(f"FF_REQUIRE_CHROME_158=1 requires Chrome >= {req}, found {got} at {chrome_exe}")
+            self.skipTest(f"Installed Chrome binary {got} < required {req}")
 
         # Ephemeral local 127.0.0.1 HTTP auth server (HttpOnly cookie + localStorage + POST action)
         auth_token = "p0-hub-synth-token-158"

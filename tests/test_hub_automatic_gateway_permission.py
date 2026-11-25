@@ -41,29 +41,40 @@ class KeyBootstrap(unittest.TestCase):
 
     @unittest.skipUnless(os.name == "nt", "Windows DACL")
     def test_created_key_has_protected_windows_acl(self):
-        import os
         import subprocess
         ensure_gateway_key(self.root)
         path = str(self.root / KEY_FILENAME).replace("'", "''")
         ps = (
+            "$ErrorActionPreference='Stop';"
             "$a=Get-Acl -LiteralPath '" + path + "';"
-            "$d=@{Protected=$a.AreAccessRulesProtected;"
+            "$me=[System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value;"
+            "$d=@{Protected=[bool]$a.AreAccessRulesProtected;CurrentUserSid=$me;"
             "Entries=@($a.Access|ForEach-Object {"
-            "@{Name=$_.IdentityReference.Value;Inherited=$_.IsInherited;"
-            "Rights=$_.FileSystemRights.ToString()}})};"
+            "@{Name=$_.IdentityReference.Value;"
+            "Sid=$_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value;"
+            "Inherited=[bool]$_.IsInherited;"
+            "Rights=$_.FileSystemRights.ToString();"
+            "Type=$_.AccessControlType.ToString()}})};"
             "$d|ConvertTo-Json -Compress -Depth 5"
         )
+        # Clear inherited PSModulePath so a parent PowerShell 7 (pwsh) shell cannot
+        # poison Windows PowerShell 5.1 autoloading of Microsoft.PowerShell.Security.
+        clean_env = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
         result = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps],
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15
+            ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+            env=clean_env,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         acl = json.loads(result.stdout)
-        self.assertTrue(acl["Protected"])
+        self.assertIs(acl["Protected"], True, acl)
         entries = acl["Entries"]
-        self.assertEqual(len(entries), 3, entries)
-        self.assertTrue(all(not entry["Inherited"] for entry in entries))
-        self.assertTrue(all(entry["Rights"] == "FullControl" for entry in entries))
+        expected_sids = {"S-1-5-18", "S-1-5-32-544", acl["CurrentUserSid"]}
+        self.assertEqual(len(entries), len(expected_sids), entries)
+        self.assertEqual({entry["Sid"] for entry in entries}, expected_sids, entries)
+        self.assertTrue(all(entry["Inherited"] is False for entry in entries), entries)
+        self.assertTrue(all(entry["Rights"] == "FullControl" for entry in entries), entries)
+        self.assertTrue(all(entry["Type"] == "Allow" for entry in entries), entries)
 
     def test_invalid_file_is_never_overwritten(self):
         key=self.root/KEY_FILENAME

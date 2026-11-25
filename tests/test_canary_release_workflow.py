@@ -6,6 +6,8 @@ production ports, other git worktrees, or the visible desktop.
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes
 import hashlib
 import json
 import os
@@ -1290,6 +1292,139 @@ class TestEndToEndShadowStageHealthRollbackAndReceipts(unittest.TestCase):
             # Valid 4-factor lease stops the verified idle process cleanly.
             stopped = canary.stop_leased_process(
                 self.shadow,
+                "c2_gateway",
+                idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
+            )
+            self.assertTrue(stopped["stopped"])
+            self.assertIsNotNone(proc.wait(timeout=5))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    @unittest.skipUnless(os.name == "nt", "Windows 8.3 short-path 4-factor lease verification")
+    def test_4factor_lease_accepts_windows_83_short_path_and_rejects_junction_or_traversal(self):
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetShortPathNameW.argtypes = [ctypes.wintypes.LPCWSTR, ctypes.wintypes.LPWSTR, ctypes.wintypes.DWORD]
+        k32.GetShortPathNameW.restype = ctypes.wintypes.DWORD
+
+        def _short_path(p: Path) -> str:
+            buf = ctypes.create_unicode_buffer(1024)
+            n = k32.GetShortPathNameW(str(p), buf, len(buf))
+            return buf.value if n else str(p)
+
+        long_shadow = self.base / "shadow-long-root-83" / "тень-приёмка"
+        owner = canary.ensure_shadow_owner(long_shadow, create=True)
+        script_dir = long_shadow / "state" / "nested-long-dir"
+        script_dir.mkdir(parents=True, exist_ok=True)
+        script = script_dir / "dummy_worker_long.py"
+        script.write_text("import time\ntime.sleep(60)\n", encoding="utf-8")
+
+        short_parent = _short_path(long_shadow.parent)
+        if "~" not in short_parent:
+            self.skipTest("Volume does not generate Windows 8.3 short paths")
+
+        # Simulate Windows runner %TEMP% where an ancestor is 8.3-shortened while children are long.
+        mixed_short_script = str(Path(short_parent) / "тень-приёмка" / "state" / "nested-long-dir" / "dummy_worker_long.py")
+        full_short_script = _short_path(script)
+        canonical_long = str(script.resolve())
+
+        self.assertTrue(canary._cmdline_contains_path(f'"{sys.executable}" "{mixed_short_script}" --run', canonical_long))
+        self.assertTrue(canary._cmdline_contains_path(f'"{sys.executable}" "{full_short_script}" --run', canonical_long))
+        self.assertFalse(canary._cmdline_contains_path(f'"{sys.executable}" "{mixed_short_script}.evil"', canonical_long))
+        # Embedded NUL byte must fail closed before Win32 CommandLineToArgvW truncation.
+        self.assertFalse(canary._cmdline_contains_path(f'"{sys.executable}" "{canonical_long}\x00.evil"', canonical_long))
+        # Non-flag key=value injection and argv[0] spoofing must not match.
+        self.assertFalse(canary._cmdline_contains_path(f'"{sys.executable}" foo={canonical_long}', canonical_long))
+        self.assertFalse(canary._cmdline_contains_path(f'"{canonical_long}" --other', canonical_long))
+        traversal = str(script_dir / ".." / "nested-long-dir" / "dummy_worker_long.py")
+        self.assertFalse(canary._cmdline_contains_path(f'"{sys.executable}" "{traversal}"', canonical_long))
+
+        # NTFS junction (active AND dangling) pointing to script_dir MUST be rejected via both long and 8.3 short names!
+        junc_dir = self.base / "sneaky-junction-dir-long"
+        mk = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(junc_dir), str(script_dir)],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if mk.returncode == 0:
+            try:
+                short_junc_script = str(Path(_short_path(junc_dir)) / script.name)
+                long_junc_script = str(junc_dir / script.name)
+                self.assertFalse(canary._cmdline_contains_path(f'"{sys.executable}" "{long_junc_script}"', canonical_long))
+                self.assertFalse(canary._cmdline_contains_path(f'"{sys.executable}" "{short_junc_script}"', canonical_long))
+            finally:
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", str(junc_dir)],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+
+        # Non-existent clean path must NOT false-positive as a reparse point.
+        clean_future = self.base / "nonexistent-clean-dir" / "future.py"
+        self.assertFalse(canary._is_reparse_point(clean_future))
+        self.assertFalse(canary._has_reparse_ancestor(clean_future))
+        canary.assert_no_reparse(clean_future)
+
+        # Dangling NTFS junction must be caught by assert_no_reparse and _has_reparse_ancestor.
+        dangling_target = self.base / "dangling-target-dir"
+        dangling_target.mkdir()
+        dangling_junc = self.base / "dangling-junction-dir"
+        mk_d = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(dangling_junc), str(dangling_target)],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if mk_d.returncode == 0:
+            try:
+                dangling_target.rmdir()
+                self.assertTrue(canary._has_reparse_ancestor(dangling_junc))
+                self.assertTrue(canary._has_reparse_ancestor(dangling_junc / "future.py"))
+                with self.assertRaises(canary.CanaryError) as ctx:
+                    canary.assert_no_reparse(dangling_junc)
+                self.assertEqual(ctx.exception.code, "REPARSE_POINT_FORBIDDEN")
+                with self.assertRaises(canary.CanaryError) as ctx:
+                    canary.assert_no_reparse(dangling_junc / "future.py")
+                self.assertEqual(ctx.exception.code, "REPARSE_POINT_FORBIDDEN")
+            finally:
+                subprocess.run(
+                    ["cmd", "/c", "rmdir", str(dangling_junc)],
+                    capture_output=True,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+
+        # Real child process launched with mixed 8.3 short path matches 4-factor lease and stops cleanly.
+        proc = subprocess.Popen(
+            [sys.executable, mixed_short_script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        try:
+            ident = canary.query_process_identity_exact(proc.pid)
+            self.assertIsNotNone(ident)
+            canary.write_process_lease(
+                Path(short_parent) / "тень-приёмка",
+                role="c2_gateway",
+                pid=proc.pid,
+                create_time_filetime=ident["create_time_filetime"],
+                executable_path=ident["executable_path"],
+                entrypoint_path=mixed_short_script,
+                port=_free_ports(1)[0],
+                release_id="rel-short83",
+                owner_scope_id=owner["owner_scope_id"],
+            )
+            verified = canary.verify_process_lease(
+                Path(short_parent) / "тень-приёмка",
+                "c2_gateway",
+                require_alive=True,
+                check_cmdline=True,
+            )
+            self.assertTrue(verified["identity_matched"])
+            self.assertTrue(verified["cmdline_verified"])
+            stopped = canary.stop_leased_process(
+                Path(short_parent) / "тень-приёмка",
                 "c2_gateway",
                 idle_checker=lambda: {"idle_verified": True, "active_sessions": 0},
             )
