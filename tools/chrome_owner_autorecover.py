@@ -93,6 +93,38 @@ def configured_port(user_data:Path) -> int:
     return 9222
 
 
+def trusted_hub_pending_socket(hub_pid:int, chrome_pid:int, port:int)->bool:
+    """Only show the one-off helper for a fresh connection from the live Hub.
+
+    Transferred WSADuplicateSocket sockets can retain their originating PID;
+    do not infer consent eligibility from sockets owned by an old process.
+    """
+    try:
+        for c in psutil.net_connections(kind="tcp"):
+            if (c.status=="ESTABLISHED" and c.pid==hub_pid and c.laddr and c.raddr
+                    and c.laddr.ip in ("127.0.0.1","::1")
+                    and c.raddr.ip in ("127.0.0.1","::1")
+                    and c.raddr.port==port):
+                return True
+    except (psutil.Error,OSError):
+        pass
+    return False
+
+
+def fresh_support_request(workdir:Path, hub_pid:int, chrome_pid:int, port:int)->bool:
+    """A short-lived, matching request from the owner-verified consent watcher."""
+    try:
+        raw=json.loads((workdir/"support-window-request.json").read_text(encoding="utf-8-sig"))
+        if raw.get("schema")!="ff-consent-helper-request-v1":return False
+        if (int(raw.get("hub_pid",-1))!=hub_pid
+                or int(raw.get("chrome_pid",-1))!=chrome_pid
+                or int(raw.get("cdp_port",-1))!=port):return False
+        age=time.time()-float(raw.get("issued_at",0))
+        return 0<=age<=25
+    except (OSError,ValueError,TypeError):
+        return False
+
+
 def remote_debugging_enabled(user_data:Path) -> bool:
     try:
         settings=json.loads((user_data/"Local State").read_text(encoding="utf-8-sig"))
@@ -164,6 +196,9 @@ class Recovery:
         self.attempt_window=time.monotonic()
         self.status_file=workdir/"chrome-owner-recovery-status.json"
         self.log_file=workdir/"chrome-owner-recovery.log"
+        self.last_report_code=None
+        self.last_log_time=0.0
+        self.attempt_hub_pid=None
 
     def report(self,code:str,**extra):
         now=time.time()
@@ -171,8 +206,12 @@ class Recovery:
         tmp=self.status_file.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(status,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
         os.replace(tmp,self.status_file)
-        with self.log_file.open("a",encoding="utf-8") as log:
-            log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {code} {json.dumps(extra,ensure_ascii=False)}\n")
+        # Log transitions and a periodic heartbeat, not 240 identical lines/hour.
+        if code != self.last_report_code or now-self.last_log_time>=120:
+            with self.log_file.open("a",encoding="utf-8") as log:
+                log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {code} {json.dumps(extra,ensure_ascii=False)}\n")
+            self.last_report_code=code
+            self.last_log_time=now
         return status
 
     def step(self,*,allow_support:bool=True)->dict:
@@ -182,7 +221,17 @@ class Recovery:
         if not remote_debugging_enabled(self.user_data):
             return self.report("OWNER_CHROME_REMOTE_DEBUG_DISABLED")
         status=hub_status(self.hub_state)
-        if status is None:return self.report("HUB_UNAVAILABLE")
+        if status is None:
+            # CLI status occasionally times out during Chrome's pending CDP handshake.
+            # Avoid opening any helper windows on an indeterminate Hub state.
+            return self.report("HUB_UNAVAILABLE")
+        hub_pid=status.get("pid")
+        if self.attempt_hub_pid is None:
+            self.attempt_hub_pid=hub_pid
+        elif hub_pid!=self.attempt_hub_pid:
+            self.attempt_hub_pid=hub_pid
+            self.attempts=0
+            self.last_attempt=0.0
         owners=owner_processes(self.chrome,self.user_data)
         if len(owners)>1:return self.report("MULTIPLE_OWNER_CHROME_PROCESSES")
         remote=status.get("owner_chrome_secondary",{})
@@ -220,12 +269,19 @@ class Recovery:
         if not allow_support:return self.report("CDP_AVAILABLE_AWAITING_NATIVE_CONSENT",pid=pid,port=port)
         if not watcher_running(self.watch_script):
             return self.report("CONSENT_WATCHER_NOT_RUNNING",pid=pid)
-        # Limit intervention: max three support windows in any 15-minute period.
+        requested=fresh_support_request(self.workdir,status["pid"],pid,port)
+        pending=trusted_hub_pending_socket(status["pid"],pid,port)
+        if not requested and not pending:
+            return self.report("NO_TRUSTED_CDP_CONSENT_INTENT",hub_pid=status["pid"],chrome_pid=pid)
+        # Never keep reopening Chrome windows when the exact same Hub has failed
+        # consent three times. A new Hub generation resets the bounded budget.
         now=time.monotonic()
-        if now-self.attempt_window>900:
-            self.attempt_window=now
+        if self.attempts>=3:
+            if not self.last_attempt or now-self.last_attempt<900:
+                retry_after=int(900-(now-self.last_attempt)) if self.last_attempt else 900
+                return self.report("CONSENT_RETRY_COOLDOWN",hub_pid=status["pid"],retry_after_seconds=retry_after)
             self.attempts=0
-        if self.attempts>=3 or now-self.last_attempt<65:
+        if self.last_attempt and now-self.last_attempt<65:
             return self.report("CONSENT_COOLDOWN",attempts=self.attempts)
         self.attempts+=1
         self.last_attempt=now

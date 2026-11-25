@@ -415,6 +415,89 @@ export class FlightController {
     };
   }
 
+  async _executeBatch(cleanArgs, ctx) {
+    const calls = cleanArgs?.calls;
+    const stopOnError = cleanArgs?.stop_on_error !== false;
+    if (!Array.isArray(calls) || calls.length < 1 || calls.length > 16) {
+      const err = new Error("INVALID_BATCH: calls must be an array of 1..16 operations");
+      err.beforeDispatch = true;
+      throw err;
+    }
+    for (let i = 0; i < calls.length; i++) {
+      const c = calls[i];
+      if (!c || typeof c !== "object" || Array.isArray(c) || typeof c.op !== "string" || !c.op.trim()) {
+        const err = new Error(`INVALID_BATCH_STEP[${i}]: expected { op: string, args?: object }`);
+        err.beforeDispatch = true;
+        throw err;
+      }
+      const stepOp = c.op.trim();
+      if (stepOp === "batch" || stepOp.startsWith("__flight_")) {
+        const err = new Error(`INVALID_BATCH_NESTED_OP[${i}]: "${stepOp}" is not allowed inside batch`);
+        err.beforeDispatch = true;
+        throw err;
+      }
+      if (c.args !== undefined && (c.args === null || typeof c.args !== "object" || Array.isArray(c.args))) {
+        const err = new Error(`INVALID_BATCH_ARGS[${i}]: args must be a plain object`);
+        err.beforeDispatch = true;
+        throw err;
+      }
+    }
+
+    const results = [];
+    let stopped = false;
+    for (let i = 0; i < calls.length; i++) {
+      const stepOp = calls[i].op.trim();
+      if (stopped) {
+        results.push({ index: i, op: stepOp, status: "not_started" });
+        continue;
+      }
+      if (ctx.signal?.aborted) {
+        results.push({ index: i, op: stepOp, status: "aborted" });
+        stopped = true;
+        continue;
+      }
+      const { cleanArgs: stepCleanArgs, meta: stepMeta } = extractTransportMeta(calls[i].args ?? {});
+      const stepDedupeKey = stepMeta.dedupeKey || (ctx.dedupeKey ? `${ctx.dedupeKey}:s${i}` : null);
+      const t0 = Date.now();
+      try {
+        const res = await this.executor(stepOp, stepCleanArgs, {
+          requestId: `${ctx.requestId}_s${i}`,
+          dedupeKey: stepDedupeKey,
+          signal: ctx.signal,
+          setBackendUrl: ctx.setBackendUrl,
+        });
+        const failed = !res || res.ok === false || res.result?.ok === false;
+        results.push({
+          index: i,
+          op: stepOp,
+          status: failed ? "error" : "completed",
+          duration_ms: Date.now() - t0,
+          result: res,
+        });
+        if (failed && stopOnError) stopped = true;
+      } catch (err) {
+        results.push({
+          index: i,
+          op: stepOp,
+          status: "outcome_unknown",
+          duration_ms: Date.now() - t0,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        stopped = true;
+      }
+    }
+
+    return {
+      schema: "ff-win-v3-batch-v1",
+      ok: results.every((r) => r.status === "completed"),
+      total: calls.length,
+      dispatched: results.filter((r) => r.status !== "not_started" && r.status !== "aborted").length,
+      completed: results.filter((r) => r.status === "completed").length,
+      stopped_on_error: stopped,
+      results,
+    };
+  }
+
   async dispatch(op, rawArgs = {}) {
     if (op === "__flight_poll") return this.pollFlight(rawArgs);
     if (op === "__flight_list") return this.listFlights(rawArgs);
@@ -520,14 +603,17 @@ export class FlightController {
 
     flight.promise = (async () => {
       try {
-        const rawData = await this.executor(op, cleanArgs, {
+        const execCtx = {
           requestId,
           dedupeKey: meta.dedupeKey,
           signal: controller.signal,
           setBackendUrl: (url) => {
             if (typeof url === "string" && url.length > 0) flight.backend_url = url;
           },
-        });
+        };
+        const rawData = op === "batch"
+          ? await this._executeBatch(cleanArgs, execCtx)
+          : await this.executor(op, cleanArgs, execCtx);
         flight.ended_at = Date.now();
         flight.duration_ms = flight.ended_at - flight.created_at;
         flight.status = "COMPLETED";
