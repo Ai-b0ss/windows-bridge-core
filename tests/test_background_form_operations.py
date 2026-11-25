@@ -1479,7 +1479,18 @@ class BackgroundFormOperationsTests(unittest.TestCase):
     def test_two_consecutive_form_workflows_via_real_chrome158_owner_chrome_hidden_and_focus_retention(self) -> None:
         chrome_exe = hidden_chrome.chrome_path()
         if chrome_exe is None:
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail("FF_REQUIRE_CHROME_158=1 requires installed Google Chrome >= 158.0.8127.2")
             self.skipTest("Google Chrome not installed on this host")
+        chrome_ver = hidden_chrome.chrome_binary_version(chrome_exe)
+        if chrome_ver is None:
+            self.fail(f"Could not read PE version metadata from {chrome_exe}")
+        if not owner_secondary._version_at_least(chrome_ver, owner_secondary.MIN_HIDDEN_TARGET_CHROME):
+            got = ".".join(str(x) for x in chrome_ver)
+            req = ".".join(str(x) for x in owner_secondary.MIN_HIDDEN_TARGET_CHROME)
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail(f"FF_REQUIRE_CHROME_158=1 requires Chrome >= {req}, found {got} at {chrome_exe}")
+            self.skipTest(f"Installed Chrome binary {got} < required {req}")
 
         form_srv = _SyntheticFormServer().start()
         u32 = ctypes.WinDLL("user32", use_last_error=True)

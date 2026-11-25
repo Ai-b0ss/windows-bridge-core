@@ -877,7 +877,18 @@ class OwnerChromeAutonomousChainTests(unittest.TestCase):
         from types import SimpleNamespace
         chrome_exe = hidden_chrome.chrome_path()
         if not chrome_exe:
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail("FF_REQUIRE_CHROME_158=1 requires installed Google Chrome >= 158.0.8127.2")
             self.skipTest("Google Chrome executable not found")
+        chrome_ver = hidden_chrome.chrome_binary_version(chrome_exe)
+        if chrome_ver is None:
+            self.fail(f"Could not read PE version metadata from {chrome_exe}")
+        if not owner_secondary._version_at_least(chrome_ver, owner_secondary.MIN_HIDDEN_TARGET_CHROME):
+            got = ".".join(str(x) for x in chrome_ver)
+            req = ".".join(str(x) for x in owner_secondary.MIN_HIDDEN_TARGET_CHROME)
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail(f"FF_REQUIRE_CHROME_158=1 requires Chrome >= {req}, found {got} at {chrome_exe}")
+            self.skipTest(f"Installed Chrome binary {got} < required {req}")
 
         # Ephemeral local form + page2 server
         form_state: dict = {"submissions": [], "stored": {"name": "", "role": "viewer", "agree": False, "tier": "basic"}}

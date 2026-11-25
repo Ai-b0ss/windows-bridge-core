@@ -675,7 +675,18 @@ class ControlledChrome158Http404HiddenPageE2ETests(unittest.TestCase):
 
         chrome_exe = hidden_chrome.chrome_path()
         if not chrome_exe:
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail("FF_REQUIRE_CHROME_158=1 requires installed Google Chrome >= 158.0.8127.2")
             self.skipTest("Chrome executable not installed")
+        chrome_ver = hidden_chrome.chrome_binary_version(chrome_exe)
+        if chrome_ver is None:
+            self.fail(f"Could not read PE version metadata from {chrome_exe}")
+        if not owner_secondary._version_at_least(chrome_ver, owner_secondary.MIN_HIDDEN_TARGET_CHROME):
+            got = ".".join(str(x) for x in chrome_ver)
+            req = ".".join(str(x) for x in owner_secondary.MIN_HIDDEN_TARGET_CHROME)
+            if os.environ.get("FF_REQUIRE_CHROME_158") == "1":
+                self.fail(f"FF_REQUIRE_CHROME_158=1 requires Chrome >= {req}, found {got} at {chrome_exe}")
+            self.skipTest(f"Installed Chrome binary {got} < required {req}")
 
         u32 = ctypes.WinDLL("user32", use_last_error=True)
         k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -949,7 +960,12 @@ class ControlledChrome158Http404HiddenPageE2ETests(unittest.TestCase):
                 self.assertEqual(owner_after["state"], "READY")
                 self.assertEqual(owner_after["discovery_mode"], "devtools_active_port_ws_only")
                 self.assertEqual(owner_after["http_discovery_status"], 404)
-                self.assertTrue(str(owner_after.get("chrome_version") or "").startswith("158."))
+                reported_ver = str(owner_after.get("chrome_version") or "")
+                _, parsed_ver = owner_secondary._parse_chrome_product("Chrome/" + reported_ver)
+                self.assertTrue(
+                    owner_secondary._version_at_least(parsed_ver, owner_secondary.MIN_HIDDEN_TARGET_CHROME),
+                    reported_ver,
+                )
                 self.assertEqual(proxy.ws_upgrade_count, 1)
 
                 # 4. Verify same-context HttpOnly cookie + localStorage + authenticated DOM action

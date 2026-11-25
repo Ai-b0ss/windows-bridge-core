@@ -11,6 +11,7 @@ import time
 import uuid
 
 from cua_global_resources import _StateLock, process_creation_identity, process_is_same
+from cua_windows_paths import expand_windows_short_path
 
 WORKER = re.compile(r"worker-[0-9a-f]{32}$")
 PROFILE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
@@ -85,7 +86,7 @@ def linked(path: Path) -> bool:
 
 
 def _strip_extended_prefix(raw: str) -> str:
-    if raw.startswith("\\\\?\\UNC\\"):
+    if raw[:8].upper() == "\\\\?\\UNC\\":
         return "\\\\" + raw[8:]
     if raw.startswith("\\\\?\\"):
         return raw[4:]
@@ -136,18 +137,26 @@ def _owner_browser_roots() -> list[str]:
     if appdata_env:
         roaming_bases.add(Path(appdata_env))
 
+    def _add_root(target: Path) -> None:
+        roots.add(_norm_key(target))
+        try:
+            expanded = expand_windows_short_path(target)
+            roots.add(_norm_key(expanded))
+        except OSError:
+            pass
+
     for home in home_bases:
         local_bases.add(home / "AppData" / "Local")
         roaming_bases.add(home / "AppData" / "Roaming")
         for sub in _OWNER_POSIX_SUBPATHS:
-            roots.add(_norm_key(home.joinpath(*sub)))
+            _add_root(home.joinpath(*sub))
 
     for base in local_bases:
         for sub in _OWNER_LOCALAPPDATA_SUBPATHS:
-            roots.add(_norm_key(base.joinpath(*sub)))
+            _add_root(base.joinpath(*sub))
     for base in roaming_bases:
         for sub in _OWNER_APPDATA_SUBPATHS:
-            roots.add(_norm_key(base.joinpath(*sub)))
+            _add_root(base.joinpath(*sub))
     return sorted(roots)
 
 
@@ -157,27 +166,37 @@ def _has_traversal_segment(raw: str) -> bool:
 
 
 def _check_no_links_on_path(candidate: Path) -> Path:
-    """Reject any symlink or junction on candidate or its existing ancestors."""
+    """Reject any symlink or junction on candidate or its existing ancestors.
+
+    Pure Windows 8.3 short paths (e.g. RUNNER~1 -> runneradmin) are canonicalized
+    via GetLongPathNameW (which never follows symlinks, junctions, or SUBST) and
+    verified against os.path.realpath so all link/reparse redirections still fail closed.
+    """
     clean_path = Path(_strip_extended_prefix(str(candidate)))
     chain = list(reversed(clean_path.parents)) + [clean_path]
     deepest_existing: Path | None = None
     for part in chain:
+        if linked(part):
+            raise ProfileIsolationError("ISOLATED_PROFILE_LINK_FORBIDDEN", {"path": str(part)})
         try:
-            exists = part.exists() or part.is_symlink()
+            exists = os.path.lexists(str(part))
         except OSError:
             exists = False
         if not exists:
             continue
-        if linked(part):
-            raise ProfileIsolationError("ISOLATED_PROFILE_LINK_FORBIDDEN", {"path": str(part)})
         deepest_existing = part
     if deepest_existing is not None:
+        long_anc = expand_windows_short_path(deepest_existing)
+        if _norm_key(long_anc) != _norm_key(deepest_existing):
+            for part in list(reversed(long_anc.parents)) + [long_anc]:
+                if linked(part):
+                    raise ProfileIsolationError("ISOLATED_PROFILE_LINK_FORBIDDEN", {"path": str(part)})
         real_anc = os.path.realpath(str(deepest_existing))
-        if _norm_key(real_anc) != _norm_key(deepest_existing):
+        if _norm_key(real_anc) != _norm_key(long_anc):
             if is_owner_browser_profile_path(real_anc):
                 raise ProfileIsolationError("OWNER_BROWSER_PROFILE_FORBIDDEN", {"path": str(candidate)})
             raise ProfileIsolationError("ISOLATED_PROFILE_LINK_FORBIDDEN", {"path": str(deepest_existing)})
-    return clean_path
+    return expand_windows_short_path(clean_path)
 
 
 def is_owner_browser_profile_path(path: str | Path) -> bool:
@@ -186,12 +205,17 @@ def is_owner_browser_profile_path(path: str | Path) -> bool:
     if not raw or "\x00" in raw:
         return True
     candidates = [raw]
+    stripped = _strip_extended_prefix(raw)
     try:
-        candidates.append(os.path.abspath(_strip_extended_prefix(raw)))
+        candidates.append(os.path.abspath(stripped))
     except OSError:
         pass
     try:
-        candidates.append(os.path.realpath(_strip_extended_prefix(raw)))
+        candidates.append(str(expand_windows_short_path(stripped)))
+    except OSError:
+        pass
+    try:
+        candidates.append(os.path.realpath(stripped))
     except OSError:
         pass
     owner_roots = _owner_browser_roots()
@@ -220,11 +244,11 @@ def assert_not_owner_browser_profile(path: str | Path) -> Path:
     clean = Path(_strip_extended_prefix(raw))
     if not clean.is_absolute():
         raise ProfileIsolationError("PROFILE_PATH_NOT_ABSOLUTE", {"path": raw})
-    _check_no_links_on_path(clean)
-    resolved = Path(os.path.realpath(str(clean)))
-    if is_owner_browser_profile_path(resolved):
+    canonical = _check_no_links_on_path(clean)
+    resolved = Path(os.path.realpath(str(canonical)))
+    if is_owner_browser_profile_path(canonical) or is_owner_browser_profile_path(resolved):
         raise ProfileIsolationError("OWNER_BROWSER_PROFILE_FORBIDDEN", {"path": raw})
-    return clean
+    return canonical
 
 
 def validate_profile_id(profile_id: str) -> str:

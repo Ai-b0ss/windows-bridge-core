@@ -9,15 +9,73 @@ jobs:
   portable-syntax:
     runs-on: windows-latest
     steps:
+      - name: Preserve canonical checkout bytes
+        shell: pwsh
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.13'
+      - name: Install explicit CI and tool Python dependencies
+        shell: pwsh
+        run: |
+          # Explicit test/tool-only pinned wheels; deployable runtime under runtime/bridge-v3/ remains stdlib-only.
+          python -m pip install --disable-pip-version-check --only-binary=:all: -r requirements-ci.txt
+          if ($LASTEXITCODE -ne 0) { throw 'CI_PYTHON_DEPENDENCIES_FAILED' }
+      - name: Ensure Google Chrome >= 158.0.8127.2 for live hidden-target tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $minVersion = [version]'158.0.8127.2'
+          function Get-InstalledChromeInfo {
+            foreach ($p in @(
+              "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+              "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+              "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+            )) {
+              if ($p -and (Test-Path -LiteralPath $p)) {
+                $raw = (Get-Item -LiteralPath $p).VersionInfo.ProductVersion
+                if ($raw) {
+                  return @{ Path = $p; Version = [version]($raw.Trim()) }
+                }
+              }
+            }
+            return $null
+          }
+          $cur = Get-InstalledChromeInfo
+          if ($cur) {
+            Write-Host "Pre-installed Chrome: $($cur.Version) at $($cur.Path)"
+          } else {
+            Write-Host "Chrome not pre-installed on runner"
+          }
+          if (-not $cur -or $cur.Version -lt $minVersion) {
+            $msi = Join-Path $env:RUNNER_TEMP 'googlechromestandaloneenterprise64.msi'
+            Write-Host "Upgrading Google Chrome to >= $minVersion via official 64-bit Enterprise MSI..."
+            Invoke-WebRequest -UseBasicParsing -Uri 'https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise64.msi' -OutFile $msi
+            $sig = Get-AuthenticodeSignature -LiteralPath $msi
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '(?:^|,\s*)CN=(?:"Google LLC"|Google LLC)(?:,|$)') {
+              Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+              throw "CHROME_MSI_SIGNATURE_INVALID: status=$($sig.Status) subject=$($sig.SignerCertificate.Subject)"
+            }
+            $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/i "' + $msi + '" /qn /norestart') -Wait -PassThru
+            Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+            if ($proc.ExitCode -ne 0 -and $proc.ExitCode -ne 3010) {
+              throw "CHROME_MSI_INSTALL_FAILED: exit=$($proc.ExitCode)"
+            }
+            $cur = Get-InstalledChromeInfo
+          }
+          if (-not $cur -or $cur.Version -lt $minVersion) {
+            $got = if ($cur) { $cur.Version.ToString() } else { 'missing' }
+            throw "CHROME_VERSION_BELOW_MINIMUM: got=$got required=$minVersion"
+          }
+          Write-Host "Verified Google Chrome $($cur.Version) at $($cur.Path)"
       - name: Python sources compile
         shell: pwsh
         run: python -m compileall -q runtime
       - name: Pairing permission and consent regression
         shell: pwsh
+        env:
+          FF_REQUIRE_CHROME_158: '1'
         run: python -m unittest discover -s tests -v
       - name: Real isolated Bridge RPC and read-only task acceptance
         shell: pwsh
@@ -25,9 +83,6 @@ jobs:
       - name: Real signed owner approval over isolated Windows Bridge RPC
         shell: pwsh
         run: |
-          # Test-only trusted RSA library; the deployable Bridge has no new dependency.
-          python -m pip install --disable-pip-version-check --only-binary=:all: cryptography==46.0.3
-          if ($LASTEXITCODE -ne 0) { throw 'TEST_CRYPTOGRAPHY_DEPENDENCY_FAILED' }
           python tests/integration/owner_signed_approval_real_rpc_smoke.py
           if ($LASTEXITCODE -ne 0) { throw 'REAL_OWNER_SIGNED_RPC_SMOKE_FAILED' }
       - name: Detached session PID identity with real Windows FILETIME
