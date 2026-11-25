@@ -11,7 +11,7 @@ from cua_owner_chrome_secondary import (
     _parse_press_key,
 )
 
-URL = "https://gemini.google.com/u/2/app"
+URL = "https://gemini.google.com/app"
 OWNER = "test-agent\x1ftest-task"
 TAB = "hsec-liveness"
 
@@ -136,6 +136,11 @@ class HiddenTargetLivenessAndPressTests(unittest.TestCase):
         self.assertEqual(_parse_press_key("+")["key"], "+")
         self.assertEqual(_parse_press_key("Ctrl++")["ctrlKey"], True)
         self.assertEqual(_parse_press_key("Ctrl++")["key"], "+")
+        for punct in (".", "-", "'", "(", "&", "%", "!"):
+            parsed = _parse_press_key(punct)
+            self.assertEqual(parsed["key"], punct)
+            self.assertEqual(parsed["keyCode"], 0)
+            self.assertEqual(parsed["which"], 0)
 
     def test_press_action_focuses_element_and_gates_form_submit_on_unmodified_enter(self):
         mgr = OwnerChromeHiddenSecondaryManager(profile_dir_name="Default")

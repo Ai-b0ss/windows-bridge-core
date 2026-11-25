@@ -278,7 +278,8 @@ def _parse_press_key(raw_key: str) -> dict[str, Any]:
             key_code = ord(base)
         else:
             code_val = base
-            key_code = ord(base.upper()) if ord(base) < 128 else 0
+            # Non-alphanumeric ASCII codepoints collide with DOM virtual keyCodes (e.g. '.'=46=Delete, "'"=39=ArrowRight).
+            key_code = 0
     else:
         key_val, code_val, key_code = base, base, 0
 
