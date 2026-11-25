@@ -2190,7 +2190,9 @@ class Hub:
                     "commands": ["preflight", "status", "open", "list", "navigate", "reload", "observe", "read", "act", "wait_for", "evaluate", "screenshot", "close"],
                     "act": {
                         "operation": "fill|click|select|check|uncheck|press",
-                        "target": "{selector}|{ref,snapshot}|{id}|{name}|{label}",
+                        "target": "{accessible_name,document_url,tag?,type?}|{selector}|{ref,snapshot}|{id}|{name}|{label}",
+                        "preferred_target": "Pass controls[].locator from observe; exact unique visible enabled match in the observed URL, bounded pre-action hydration retries only. Name is the legacy HTML name attribute.",
+                        "stale_ref_policy": "Never reinterpret a numeric ref from another snapshot; prefer semantic locators. Nested and top-level snapshot forms supported; conflicting values rejected.",
                         "postcondition": "{type:text_includes|url_equals|url_contains|value_equals|checked_equals}|{text_present}|{text_absent}|{url_contains}|{target,value|checked|state}",
                         "foreground": "unsupported here; use the existing guarded Bridge desktop route",
                     },
@@ -2613,7 +2615,7 @@ class Hub:
             name = args.get("name")
             target = {"secret": name}
             if args.get("use") == "http" and isinstance(args.get("request"), dict):
-                target["host"] = urllib.parse.urlsplit(str(args["request"].get("url") or "")).hostname or ""
+                target["host"] = _extract_url_host(args["request"].get("url"))
             elif args.get("use") == "process" and isinstance(args.get("request"), dict):
                 argv = args["request"].get("argv")
                 if isinstance(argv, list) and argv and isinstance(argv[0], str):

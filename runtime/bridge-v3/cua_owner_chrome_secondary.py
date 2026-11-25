@@ -51,6 +51,249 @@ MAX_TARGETS_PER_OWNER = 8
 MAX_TARGETS_TOTAL = 24
 DEFAULT_VIEWPORT = (1280, 800)
 
+# Windowless hidden targets (Target.createTarget({hidden: true})) have no OS compositor
+# BeginMainFrame cycle in Chrome 158+, causing both requestIdleCallback (even with
+# {timeout}) and requestAnimationFrame to starve indefinitely. SPAs such as Gemini
+# (Angular/RxJS idle-gated loaders like _.HD/_.FD/_.Odc) deadlock their Send action
+# without a bounded timer-backed fallback installed before document bootstrap.
+_HIDDEN_TARGET_LIVENESS_JS = r"""(() => {
+  const G = globalThis;
+  const MARK = Symbol.for("__ff_hidden_target_liveness_v1__");
+  if (G[MARK]) return;
+  try {
+    Object.defineProperty(G, MARK, { value: true, configurable: false, enumerable: false });
+  } catch (_) {
+    G[MARK] = true;
+  }
+  const nativeSetTimeout = typeof G.setTimeout === "function" ? G.setTimeout.bind(G) : null;
+  const nativeClearTimeout = typeof G.clearTimeout === "function" ? G.clearTimeout.bind(G) : null;
+  if (!nativeSetTimeout || !nativeClearTimeout) return;
+  const nowMs = () => {
+    try {
+      if (G.performance && typeof G.performance.now === "function") return G.performance.now();
+    } catch (_) {}
+    return Date.now();
+  };
+  if (typeof G.requestIdleCallback === "function") {
+    const origRIC = G.requestIdleCallback.bind(G);
+    const origCancelRIC = typeof G.cancelIdleCallback === "function" ? G.cancelIdleCallback.bind(G) : null;
+    const pendingIdle = new Map();
+    let nextIdleId = 1;
+    G.requestIdleCallback = function requestIdleCallback(cb, opts) {
+      if (typeof cb !== "function") {
+        throw new TypeError("Failed to execute 'requestIdleCallback': parameter 1 is not of type 'IdleRequestCallback'.");
+      }
+      const id = nextIdleId++;
+      const hasTimeout = !!(opts && typeof opts === "object" && opts.timeout != null && Number.isFinite(Number(opts.timeout)));
+      const rawTimeout = hasTimeout ? Math.max(0, Number(opts.timeout)) : null;
+      const fallbackDelay = rawTimeout === null ? 24 : Math.min(rawTimeout, 24);
+      const entry = { done: false, nativeId: null, timerId: null };
+      pendingIdle.set(id, entry);
+      const fire = (fromFallback, nativeDeadline) => {
+        if (entry.done) return;
+        entry.done = true;
+        pendingIdle.delete(id);
+        if (entry.timerId !== null) {
+          nativeClearTimeout(entry.timerId);
+          entry.timerId = null;
+        }
+        if (fromFallback && entry.nativeId !== null && origCancelRIC) {
+          try { origCancelRIC(entry.nativeId); } catch (_) {}
+          entry.nativeId = null;
+        }
+        const deadline = nativeDeadline || (() => {
+          const started = nowMs();
+          return {
+            didTimeout: rawTimeout !== null && fallbackDelay >= rawTimeout,
+            timeRemaining() {
+              const rem = 50 - (nowMs() - started);
+              return rem > 0 ? rem : 0;
+            },
+          };
+        })();
+        cb(deadline);
+      };
+      try {
+        entry.nativeId = opts === undefined ? origRIC((d) => fire(false, d)) : origRIC((d) => fire(false, d), opts);
+      } catch (_) {
+        entry.nativeId = null;
+      }
+      if (!entry.done) {
+        entry.timerId = nativeSetTimeout(() => fire(true, null), fallbackDelay);
+      }
+      return id;
+    };
+    G.cancelIdleCallback = function cancelIdleCallback(id) {
+      const entry = pendingIdle.get(id);
+      if (!entry) {
+        if (origCancelRIC) {
+          try { origCancelRIC(id); } catch (_) {}
+        }
+        return;
+      }
+      entry.done = true;
+      pendingIdle.delete(id);
+      if (entry.timerId !== null) {
+        nativeClearTimeout(entry.timerId);
+        entry.timerId = null;
+      }
+      if (entry.nativeId !== null && origCancelRIC) {
+        try { origCancelRIC(entry.nativeId); } catch (_) {}
+        entry.nativeId = null;
+      }
+    };
+  }
+  if (typeof G.requestAnimationFrame === "function") {
+    const origRAF = G.requestAnimationFrame.bind(G);
+    const origCancelRAF = typeof G.cancelAnimationFrame === "function" ? G.cancelAnimationFrame.bind(G) : null;
+    const pendingRaf = new Map();
+    let nextRafId = 1;
+    G.requestAnimationFrame = function requestAnimationFrame(cb) {
+      if (typeof cb !== "function") {
+        throw new TypeError("Failed to execute 'requestAnimationFrame': parameter 1 is not of type 'FrameRequestCallback'.");
+      }
+      const id = nextRafId++;
+      const entry = { done: false, nativeId: null, timerId: null };
+      pendingRaf.set(id, entry);
+      const fire = (fromFallback, ts) => {
+        if (entry.done) return;
+        entry.done = true;
+        pendingRaf.delete(id);
+        if (entry.timerId !== null) {
+          nativeClearTimeout(entry.timerId);
+          entry.timerId = null;
+        }
+        if (fromFallback && entry.nativeId !== null && origCancelRAF) {
+          try { origCancelRAF(entry.nativeId); } catch (_) {}
+          entry.nativeId = null;
+        }
+        cb(typeof ts === "number" ? ts : nowMs());
+      };
+      try {
+        entry.nativeId = origRAF((ts) => fire(false, ts));
+      } catch (_) {
+        entry.nativeId = null;
+      }
+      if (!entry.done) {
+        entry.timerId = nativeSetTimeout(() => fire(true, null), 32);
+      }
+      return id;
+    };
+    G.cancelAnimationFrame = function cancelAnimationFrame(id) {
+      const entry = pendingRaf.get(id);
+      if (!entry) {
+        if (origCancelRAF) {
+          try { origCancelRAF(id); } catch (_) {}
+        }
+        return;
+      }
+      entry.done = true;
+      pendingRaf.delete(id);
+      if (entry.timerId !== null) {
+        nativeClearTimeout(entry.timerId);
+        entry.timerId = null;
+      }
+      if (entry.nativeId !== null && origCancelRAF) {
+        try { origCancelRAF(entry.nativeId); } catch (_) {}
+        entry.nativeId = null;
+      }
+    };
+  }
+})();"""
+
+_NAMED_KEYS: dict[str, tuple[str, str, int]] = {
+    "enter": ("Enter", "Enter", 13),
+    "return": ("Enter", "Enter", 13),
+    "tab": ("Tab", "Tab", 9),
+    "escape": ("Escape", "Escape", 27),
+    "esc": ("Escape", "Escape", 27),
+    "backspace": ("Backspace", "Backspace", 8),
+    "delete": ("Delete", "Delete", 46),
+    "del": ("Delete", "Delete", 46),
+    "insert": ("Insert", "Insert", 45),
+    "space": (" ", "Space", 32),
+    "spacebar": (" ", "Space", 32),
+    "arrowleft": ("ArrowLeft", "ArrowLeft", 37),
+    "arrowup": ("ArrowUp", "ArrowUp", 38),
+    "arrowright": ("ArrowRight", "ArrowRight", 39),
+    "arrowdown": ("ArrowDown", "ArrowDown", 40),
+    "home": ("Home", "Home", 36),
+    "end": ("End", "End", 35),
+    "pageup": ("PageUp", "PageUp", 33),
+    "pagedown": ("PageDown", "PageDown", 34),
+}
+
+
+def _parse_press_key(raw_key: str) -> dict[str, Any]:
+    """Parse a key or modifier chord (e.g. 'Enter', 'Shift+Enter', 'Ctrl+k') into KeyboardEventInit fields."""
+    ctrl = shift = alt = meta = False
+    if raw_key == "+":
+        base = "+"
+    else:
+        tokens: list[str] = []
+        i = 0
+        while i < len(raw_key):
+            j = raw_key.find("+", i)
+            if j == -1:
+                tokens.append(raw_key[i:])
+                break
+            if j == i and tokens:
+                tokens.append("+")
+                i = j + 1
+                continue
+            tokens.append(raw_key[i:j])
+            i = j + 1
+            if i == len(raw_key):
+                tokens.append("+")
+        if not tokens:
+            base = raw_key
+        else:
+            for mod in tokens[:-1]:
+                m = mod.strip().lower()
+                if m in {"ctrl", "control"}:
+                    ctrl = True
+                elif m == "shift":
+                    shift = True
+                elif m in {"alt", "option"}:
+                    alt = True
+                elif m in {"meta", "cmd", "command", "win", "super"}:
+                    meta = True
+            base = tokens[-1]
+
+    low = base.lower()
+    if base == " ":
+        key_val, code_val, key_code = " ", "Space", 32
+    elif low in _NAMED_KEYS:
+        key_val, code_val, key_code = _NAMED_KEYS[low]
+    elif re.fullmatch(r"f([1-9]|1[0-2])", low):
+        n = int(low[1:])
+        key_val, code_val, key_code = f"F{n}", f"F{n}", 111 + n
+    elif len(base) == 1:
+        key_val = base
+        if "a" <= low <= "z":
+            code_val = f"Key{base.upper()}"
+            key_code = ord(base.upper())
+        elif "0" <= base <= "9":
+            code_val = f"Digit{base}"
+            key_code = ord(base)
+        else:
+            code_val = base
+            # Non-alphanumeric ASCII codepoints collide with DOM virtual keyCodes (e.g. '.'=46=Delete, "'"=39=ArrowRight).
+            key_code = 0
+    else:
+        key_val, code_val, key_code = base, base, 0
+
+    return {
+        "key": key_val,
+        "code": code_val,
+        "keyCode": key_code,
+        "which": key_code,
+        "ctrlKey": ctrl,
+        "shiftKey": shift,
+        "altKey": alt,
+        "metaKey": meta,
+    }
+
 
 class OwnerChromeSecondaryError(RuntimeError):
     def __init__(self, code: str, message: str | None = None, **details: Any):
@@ -1844,6 +2087,19 @@ class OwnerChromeHiddenSecondaryManager:
                         session_id=session_id,
                         timeout=5.0,
                     )
+                    self._cdp.send("Page.enable", {}, session_id=session_id, timeout=5.0)
+                    self._cdp.send(
+                        "Emulation.setFocusEmulationEnabled",
+                        {"enabled": True},
+                        session_id=session_id,
+                        timeout=5.0,
+                    )
+                    self._cdp.send(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        {"source": _HIDDEN_TARGET_LIVENESS_JS},
+                        session_id=session_id,
+                        timeout=5.0,
+                    )
                     rec = {
                         "tab_id": tab_id,
                         "target_id": target_id,
@@ -1857,6 +2113,11 @@ class OwnerChromeHiddenSecondaryManager:
                         "viewport": {"width": width, "height": height},
                         "created_at": time.time(),
                     }
+                    if url == "about:blank":
+                        try:
+                            self._eval(rec, _HIDDEN_TARGET_LIVENESS_JS, timeout_s=3.0)
+                        except OwnerChromeSecondaryError:
+                            pass
                     if url != "about:blank":
                         nav = self._cdp.send("Page.navigate", {"url": url}, session_id=session_id, timeout=min(timeout, 15.0))
                         if nav.get("errorText"):
@@ -2100,6 +2361,17 @@ class OwnerChromeHiddenSecondaryManager:
                 rec["snapshot"] = token
                 rec["url"] = str(data.get("url") or rec["url"])
                 rec["title"] = str(data.get("title") or rec["title"])
+                # Supply snapshot-independent targets for explicitly named controls.
+                # Anonymous and overly long names keep the original strict ref contract.
+                for control in data.get("controls", []):
+                    name = control.get("name")
+                    if isinstance(name, str) and name.strip() and len(name.strip()) <= 512:
+                        control["locator"] = {
+                            "accessible_name": name.strip(),
+                            "tag": control.get("tag"),
+                            "type": control.get("type", ""),
+                            "document_url": rec["url"],
+                        }
                 return {**data, "snapshot": token, "tab_id": rec["tab_id"], "target_id": rec["target_id"], "route": ROUTE_NAME}
 
             if op == "read":
@@ -2187,17 +2459,56 @@ class OwnerChromeHiddenSecondaryManager:
                 selector = args.get("selector")
                 if not selector and isinstance(target.get("selector"), str):
                     selector = target["selector"]
+                # Accept both the documented nested target form and the legacy top-level form.
                 snap = args.get("snapshot")
+                nested_snap = target.get("snapshot")
+                if snap is not None and nested_snap is not None and snap != nested_snap:
+                    raise OwnerChromeSecondaryError("TARGET_INVALID", "conflicting snapshot values", attempted=False)
+                if snap is None:
+                    snap = nested_snap
                 ref = args.get("ref") if args.get("ref") is not None else target.get("ref")
+                if args.get("ref") is not None and target.get("ref") is not None and args["ref"] != target["ref"]:
+                    raise OwnerChromeSecondaryError("TARGET_INVALID", "conflicting ref values", attempted=False)
                 target_id_attr = target.get("id")
                 target_name_attr = target.get("name")
                 target_label = target.get("label")
+                accessible_name = target.get("accessible_name")
+                semantic_target = accessible_name is not None
 
                 has_explicit_target = bool(
-                    selector or ref is not None or target_id_attr or target_name_attr or target_label
+                    selector or ref is not None or target_id_attr or target_name_attr or target_label or semantic_target
                 )
+                if semantic_target:
+                    if (not isinstance(accessible_name, str) or not accessible_name.strip()
+                            or len(accessible_name) > 512 or selector or ref is not None
+                            or target_id_attr or target_name_attr or target_label):
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid or mixed semantic target", attempted=False)
+                    if target.get("tag") is not None and not re.fullmatch(r"[a-z][a-z0-9-]{0,63}", str(target["tag"])):
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid semantic tag", attempted=False)
+                    if target.get("type") is not None and (not isinstance(target["type"], str) or len(target["type"]) > 64):
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid semantic type", attempted=False)
+                    expected_url = target.get("document_url")
+                    if not isinstance(expected_url, str) or not expected_url or len(expected_url) > 8192:
+                        raise OwnerChromeSecondaryError("TARGET_INVALID", "semantic target requires observed document_url", attempted=False)
                 if operation == "press" and not has_explicit_target:
                     locate_js = "const e=document.activeElement||document.body;if(!e)return {error:'TARGET_NOT_FOUND'};"
+                elif semantic_target:
+                    # Resolve the exact visible accessible name in the same document URL.
+                    # This avoids dependence on an index into a historical DOM snapshot.
+                    locate_js = (
+                        f"if(location.href!=={json.dumps(expected_url)})return {{error:'TAB_DOCUMENT_CHANGED'}};"
+                        f"const wanted={json.dumps(accessible_name.strip())};"
+                        f"const wantedTag={json.dumps(target.get('tag'))};"
+                        f"const wantedType={json.dumps(target.get('type'))};"
+                        "const nodes=[...document.querySelectorAll('input,textarea,button,select,a,[role=button],[contenteditable=true]')].filter(el=>{"
+                        "if(!el.isConnected||!el.getClientRects().length||el.closest('[inert]')||el.disabled||el.getAttribute('aria-disabled')==='true')return false;"
+                        "const style=getComputedStyle(el);if(style.visibility==='hidden'||style.visibility==='collapse')return false;"
+                        "const name=(el.getAttribute('aria-label')||el.labels?.[0]?.innerText||el.innerText||el.name||'').trim();"
+                        "return name===wanted&&(wantedTag===null||el.tagName.toLowerCase()===wantedTag)&&(wantedType===null||(el.type||'')===wantedType);});"
+                        "if(nodes.length===0)return {error:'TARGET_NOT_FOUND'};"
+                        "if(nodes.length!==1)return {error:'TARGET_AMBIGUOUS'};"
+                        "const e=nodes[0];"
+                    )
                 elif selector:
                     if not isinstance(selector, str) or len(selector) > 512:
                         raise OwnerChromeSecondaryError("TARGET_INVALID", "invalid selector", attempted=False)
@@ -2261,6 +2572,21 @@ class OwnerChromeHiddenSecondaryManager:
                     "e.click();"
                 )
 
+                press_spec = _parse_press_key(key) if operation == "press" and isinstance(key, str) else None
+                press_js = (
+                    f"const ks={json.dumps(press_spec or {})};"
+                    "if(typeof e.focus==='function')e.focus({preventScroll:true});"
+                    "const kinit={...ks,bubbles:true,cancelable:true,composed:true,view:window};"
+                    "const proceed=e.dispatchEvent(new KeyboardEvent('keydown',kinit));"
+                    "e.dispatchEvent(new KeyboardEvent('keyup',kinit));"
+                    "const hasMods=Boolean(ks.ctrlKey||ks.shiftKey||ks.altKey||ks.metaKey);"
+                    "let detail='dispatched';"
+                    "if(!proceed){detail='prevented_by_page';}"
+                    "else if(ks.key==='Enter'&&!hasMods&&e.tagName!=='TEXTAREA'&&e.form&&typeof e.form.requestSubmit==='function'){"
+                    "const isSub=(e.tagName==='BUTTON'&&(e.type||'submit')==='submit')||(e.tagName==='INPUT'&&['submit','image'].includes(String(e.type||'').toLowerCase()));"
+                    "if(isSub)e.form.requestSubmit(e);else e.form.requestSubmit();detail='form_submitted';}"
+                )
+
                 action_js = {
                     "fill": (
                         "if(e.readOnly)return {error:'TARGET_NOT_EDITABLE'};"
@@ -2320,25 +2646,25 @@ class OwnerChromeHiddenSecondaryManager:
                         "if(after)return {error:'ACTION_NO_EFFECT',attempted:true};"
                         "const detail={mode:'dom-check',checked:false};"
                     ),
-                    "press": (
-                        f"const k={json.dumps(key or '')};"
-                        "const kinit={key:k,code:k.length===1?'Key'+k.toUpperCase():k,bubbles:true,cancelable:true,composed:true};"
-                        "const proceed=e.dispatchEvent(new KeyboardEvent('keydown',kinit));"
-                        "e.dispatchEvent(new KeyboardEvent('keyup',kinit));"
-                        "let detail='dispatched';"
-                        "if(!proceed){detail='prevented_by_page';}"
-                        "else if(k==='Enter'&&e.tagName!=='TEXTAREA'&&e.form&&typeof e.form.requestSubmit==='function'){"
-                        "const isSub=(e.tagName==='BUTTON'&&(e.type||'submit')==='submit')||(e.tagName==='INPUT'&&['submit','image'].includes(String(e.type||'').toLowerCase()));"
-                        "if(isSub)e.form.requestSubmit(e);else e.form.requestSubmit();detail='form_submitted';}"
-                    ),
+                    "press": press_js,
                 }[operation]
                 url_before = rec["url"]
                 rec["snapshot"] = None
-                outcome = self._eval(
-                    rec,
-                    "(()=>{" + host_guard_js + locate_js + action_js + "return {acted:true,url:location.href,title:document.title,detail:detail};})()",
-                    timeout_s=min(timeout, 10.0),
-                )
+                expression = "(()=>{" + host_guard_js + locate_js + action_js + "return {acted:true,url:location.href,title:document.title,detail:detail};})()"
+                # Only explicit semantic locators may wait for hydration. A returned
+                # TARGET_NOT_FOUND is produced before any input; never replay an
+                # exception, ambiguous action, failed postcondition or changed URL.
+                deadline = time.monotonic() + min(max(timeout, 0.0), 1.0)
+                resolution_attempts = 0
+                while True:
+                    resolution_attempts += 1
+                    outcome = self._eval(rec, expression, timeout_s=min(timeout, 10.0))
+                    if (not semantic_target or not isinstance(outcome, dict)
+                            or outcome.get("error") != "TARGET_NOT_FOUND"
+                            or outcome.get("attempted") is not None
+                            or resolution_attempts >= 4 or time.monotonic() >= deadline):
+                        break
+                    time.sleep(min(0.15, max(0.0, deadline - time.monotonic())))
                 if not isinstance(outcome, dict) or outcome.get("error"):
                     err_code = str((outcome or {}).get("error") or "ACTION_FAILED")
                     was_attempted = bool((outcome or {}).get("attempted", False))
@@ -2363,6 +2689,7 @@ class OwnerChromeHiddenSecondaryManager:
                     "acted": True,
                     "verified": verified,
                     "action": operation,
+                    "resolution_attempts": resolution_attempts,
                     "detail": outcome.get("detail"),
                     "tab_id": rec["tab_id"],
                     "target_id": rec["target_id"],

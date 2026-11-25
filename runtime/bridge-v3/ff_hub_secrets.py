@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import json
+import math
 import os
 import re
 import subprocess
@@ -172,6 +173,14 @@ class Vault:
         return _dpapi(sealed, protect=False).decode("utf-8")
 
     @staticmethod
+    def _timeout(value: Any, default: float, minimum: float, maximum: float, error_code: str) -> float:
+        if value is None:
+            return float(default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise SecretError(error_code, execution_started=False)
+        return min(max(float(value), minimum), maximum)
+
+    @staticmethod
     def _scrub(text: str, value: str) -> str:
         variants = {value, base64.b64encode(value.encode()).decode(), urllib.parse.quote(value, safe="")}
         for variant in sorted((item for item in variants if item), key=len, reverse=True):
@@ -182,31 +191,36 @@ class Vault:
         """One HTTPS request to an allowed host; `{{secret}}` in a header value is replaced."""
         meta = self._allowed(name, agent_id)
         if not isinstance(request, dict) or set(request) - {"method", "url", "headers", "body", "timeout_s"}:
-            raise SecretError("SECRET_REQUEST_INVALID")
-        url = urllib.parse.urlsplit(str(request.get("url") or ""))
+            raise SecretError("SECRET_REQUEST_INVALID", execution_started=False)
+        try:
+            url = urllib.parse.urlsplit(str(request.get("url") or ""))
+            port = url.port
+        except ValueError:
+            raise SecretError("SECRET_URL_INVALID", execution_started=False) from None
         if url.username is not None or url.password is not None or url.fragment:
-            raise SecretError("SECRET_URL_INVALID")
+            raise SecretError("SECRET_URL_INVALID", execution_started=False)
         loopback = url.hostname in {"127.0.0.1", "localhost"}
         if url.scheme != "https" and not (url.scheme == "http" and loopback):
-            raise SecretError("SECRET_HTTPS_REQUIRED")
+            raise SecretError("SECRET_HTTPS_REQUIRED", execution_started=False)
         host = (url.hostname or "").lower()
-        allowed = host in meta["hosts"] or f"{host}:{url.port}" in meta["hosts"]
+        allowed = host in meta["hosts"] or (port is not None and f"{host}:{port}" in meta["hosts"])
         if not allowed:
-            raise SecretError("SECRET_HOST_NOT_ALLOWED", host=host, allowed_hosts=meta["hosts"])
+            raise SecretError("SECRET_HOST_NOT_ALLOWED", host=host, allowed_hosts=meta["hosts"], execution_started=False)
         method = str(request.get("method") or "GET").upper()
         if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}:
-            raise SecretError("SECRET_METHOD_INVALID")
+            raise SecretError("SECRET_METHOD_INVALID", execution_started=False)
         headers = request.get("headers") or {}
         if not isinstance(headers, dict) or not any(PLACEHOLDER in str(item) for item in headers.values()):
-            raise SecretError("SECRET_PLACEHOLDER_REQUIRED", hint="put {{secret}} into a header value")
+            raise SecretError("SECRET_PLACEHOLDER_REQUIRED", hint="put {{secret}} into a header value", execution_started=False)
         if any(str(key).lower() in {"host", "proxy-authorization", "proxy-connection", "connection"} for key in headers):
-            raise SecretError("SECRET_HEADER_FORBIDDEN")
+            raise SecretError("SECRET_HEADER_FORBIDDEN", execution_started=False)
         if PLACEHOLDER in str(request.get("url")) or PLACEHOLDER in str(request.get("body") or ""):
-            raise SecretError("SECRET_PLACEHOLDER_ONLY_IN_HEADERS")
-        value = self._value(meta)
+            raise SecretError("SECRET_PLACEHOLDER_ONLY_IN_HEADERS", execution_started=False)
         body = request.get("body")
         if body is not None and not isinstance(body, str):
-            raise SecretError("SECRET_REQUEST_INVALID")
+            raise SecretError("SECRET_REQUEST_INVALID", execution_started=False)
+        timeout = self._timeout(request.get("timeout_s"), 30, 1, 120, "SECRET_REQUEST_INVALID")
+        value = self._value(meta)
         data = body.encode("utf-8") if isinstance(body, str) else None
         prepared = urllib.request.Request(url.geturl(), data=data, method=method, headers={
             str(key): str(item).replace(PLACEHOLDER, value) for key, item in headers.items()})
@@ -217,14 +231,14 @@ class Vault:
                 return None
 
         opener = urllib.request.build_opener(_NoRedirect, *([urllib.request.ProxyHandler({})] if loopback else []))
-        timeout = min(max(float(request.get("timeout_s") or 30), 1), 120)
         try:
             with opener.open(prepared, timeout=timeout) as response:
                 status, raw, response_headers = response.status, response.read(MAX_RESPONSE_BYTES + 1), dict(response.headers)
         except urllib.error.HTTPError as exc:
             status, raw, response_headers = exc.code, exc.read(MAX_RESPONSE_BYTES + 1), dict(exc.headers)
         except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-            raise SecretError("SECRET_REQUEST_FAILED", cause=type(exc).__name__, attempted=True, retry_safe=False) from None
+            raise SecretError("SECRET_REQUEST_FAILED", cause=type(exc).__name__, attempted=True, retry_safe=False,
+                              outcome_unknown=True) from None
         text = self._scrub(raw[:MAX_RESPONSE_BYTES].decode("utf-8", "replace"), value)
         return {"status": status, "truncated": len(raw) > MAX_RESPONSE_BYTES, "body": text,
                 "headers": {key: self._scrub(str(item), value) for key, item in response_headers.items()
@@ -235,28 +249,29 @@ class Vault:
         """Run an allowed program with the secret in one environment variable."""
         meta = self._allowed(name, agent_id)
         if not isinstance(spec, dict) or set(spec) - {"argv", "env_name", "cwd", "timeout_s"}:
-            raise SecretError("SECRET_PROCESS_INVALID")
+            raise SecretError("SECRET_PROCESS_INVALID", execution_started=False)
         argv = spec.get("argv")
         if not isinstance(argv, list) or not argv or any(not isinstance(item, str) for item in argv):
-            raise SecretError("SECRET_PROCESS_INVALID")
+            raise SecretError("SECRET_PROCESS_INVALID", execution_started=False)
         executable = os.path.normcase(os.path.abspath(argv[0]))
         if executable not in meta["commands"] or not os.path.isfile(executable):
-            raise SecretError("SECRET_COMMAND_NOT_ALLOWED", allowed_commands=meta["commands"])
+            raise SecretError("SECRET_COMMAND_NOT_ALLOWED", allowed_commands=meta["commands"], execution_started=False)
         env_name = spec.get("env_name")
         if not isinstance(env_name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,63}", env_name):
-            raise SecretError("SECRET_ENV_NAME_INVALID")
+            raise SecretError("SECRET_ENV_NAME_INVALID", execution_started=False)
         cwd = spec.get("cwd")
         if cwd is not None and (not isinstance(cwd, str) or not os.path.isdir(cwd)):
-            raise SecretError("SECRET_CWD_INVALID")
+            raise SecretError("SECRET_CWD_INVALID", execution_started=False)
+        timeout = self._timeout(spec.get("timeout_s"), 60, 1, 600, "SECRET_PROCESS_INVALID")
         value = self._value(meta)
-        timeout = min(max(float(spec.get("timeout_s") or 60), 1), 600)
         try:
             done = subprocess.run([executable, *argv[1:]], env={**os.environ, env_name: value}, cwd=cwd,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                   timeout=timeout, stdin=subprocess.DEVNULL,
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except subprocess.TimeoutExpired:
-            raise SecretError("SECRET_PROCESS_TIMEOUT", attempted=True, retry_safe=False) from None
+            raise SecretError("SECRET_PROCESS_TIMEOUT", attempted=True, retry_safe=False,
+                              outcome_unknown=True) from None
 
         # A caller-controlled command can encode/reorder the value. Redacting a few string
         # variants is insufficient, so no child output crosses the broker RPC boundary.
