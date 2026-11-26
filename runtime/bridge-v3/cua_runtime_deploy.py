@@ -1303,7 +1303,8 @@ def rollback_active_release(
     if not isinstance(current, dict) or current.get("schema") != ACTIVE_RELEASE_SCHEMA:
         raise RuntimeError("ACTIVE_RELEASE_SCHEMA_INVALID")
     prev = current.get("previous") if isinstance(current.get("previous"), dict) else None
-    if target_release_dir is None:
+    rolling_back_to_prev = target_release_dir is None
+    if rolling_back_to_prev:
         if not prev or not isinstance(prev.get("release_dir"), str) or not prev["release_dir"].strip():
             raise RuntimeError("ROLLBACK_TARGET_UNAVAILABLE")
         target_dir = Path(prev["release_dir"])
@@ -1315,10 +1316,37 @@ def rollback_active_release(
         target_name = target_dir.parent.name or target_dir.name
         target_pw = None
         target_entry = str(current.get("agent_entrypoint") or "ff_win_v3_main.py")
+
+    def _is_hex64(value: Any) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+    # When rolling back to the recorded `previous` pointer, a live predecessor
+    # may originate from a squash-merged branch whose exact commit SHA is not in
+    # the public repo's linear history (while still cryptographically pinned by
+    # all four SHA-256/commit fields recorded in active-release.json). Require
+    # all four pins and fail closed on any stale commit, missing pin, or drift.
+    effective_repo = repo
+    git_commit_in_repo: bool | None = None
+    if repo is not None and (repo / ".git").exists():
+        if rolling_back_to_prev and prev is not None:
+            prev_head = prev.get("source_head")
+            git_commit_in_repo = bool(is_hex40_commit(prev_head) and git_commit_exists(repo, str(prev_head)))
+            all_prev_pins_present = (
+                is_hex40_commit(prev_head)
+                and str(prev_head).lower() not in KNOWN_STALE_COMMITS
+                and _is_hex64(prev.get("manifest_sha256"))
+                and _is_hex64(prev.get("release_id"))
+                and _is_hex64(prev.get("agent_entrypoint_sha256"))
+            )
+            if not git_commit_in_repo and all_prev_pins_present:
+                effective_repo = None
+        else:
+            git_commit_in_repo = None
+
     checked = _validate_release_dir_for_pointer(
         base_phys,
         target_dir,
-        repo=repo,
+        repo=effective_repo,
         playwright_root=target_pw,
         check_playwright=check_playwright,
         agent_entrypoint=target_entry,
@@ -1328,6 +1356,12 @@ def rollback_active_release(
             raise RuntimeError("ROLLBACK_TARGET_MANIFEST_DRIFTED")
         if prev.get("source_head") and prev["source_head"] != checked["source_head"]:
             raise RuntimeError("ROLLBACK_TARGET_SOURCE_HEAD_DRIFTED")
+        if prev.get("release_id") and prev["release_id"] != checked["release_id"]:
+            raise RuntimeError("ROLLBACK_TARGET_RELEASE_ID_DRIFTED")
+        if prev.get("agent_entrypoint_sha256") and prev["agent_entrypoint_sha256"] != checked["agent_entrypoint_sha256"]:
+            raise RuntimeError("ROLLBACK_TARGET_ENTRYPOINT_DRIFTED")
+    if repo is not None and (repo / ".git").exists() and git_commit_in_repo is None:
+        git_commit_in_repo = git_commit_exists(repo, checked["source_head"])
     payload: dict[str, Any] = {
         "schema": ACTIVE_RELEASE_SCHEMA,
         "release_dir": checked["release_dir"],
@@ -1346,9 +1380,12 @@ def rollback_active_release(
         "rolled_back_from": _pointer_summary(current),
     }
     atomic_json(pointer_path, payload)
-    verified = verify_active_release_pointer(base_phys, repo=repo, check_playwright=check_playwright)
+    verified = verify_active_release_pointer(base_phys, repo=effective_repo, check_playwright=check_playwright)
     if not verified.get("ok"):
         raise RuntimeError("ROLLBACK_POST_VERIFY_FAILED:" + str(verified.get("error")))
+    if git_commit_in_repo is not None:
+        verified["git_commit_in_repo"] = git_commit_in_repo
+    verified["rollback_pin_verified"] = bool(rolling_back_to_prev)
     return verified
 
 

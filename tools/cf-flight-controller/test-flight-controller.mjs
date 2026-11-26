@@ -442,3 +442,124 @@ test("FlightController cancelFlight on running batch never overwrites status to 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("createFF3FlightCaller invalidates stale primary cache on ECONNREFUSED and fails over without poisoning dedupe key", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "fc-econnrefused-"));
+  const secretFile = path.join(tmpDir, "secret");
+  fs.writeFileSync(secretFile, "test-secret-failover", "utf8");
+
+  const primary = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json", connection: "close" });
+      res.end(JSON.stringify({ ok: true, result: { backend: "primary", op: body.op } }));
+    });
+  });
+
+  let backupCalls = 0;
+  const backup = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      backupCalls++;
+      const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      res.writeHead(200, { "content-type": "application/json", connection: "close" });
+      res.end(JSON.stringify({ ok: true, result: { backend: "backup", op: body.op, n: backupCalls } }));
+    });
+  });
+
+  await new Promise((resolve) => primary.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve) => backup.listen(0, "127.0.0.1", resolve));
+  const primaryUrl = `http://127.0.0.1:${primary.address().port}/rpc`;
+  const backupUrl = `http://127.0.0.1:${backup.address().port}/rpc`;
+
+  let okUntil = 0;
+  let invalidatedUrls = [];
+  const selectBackend = async () => {
+    if (Date.now() < okUntil) return primaryUrl;
+    try {
+      const r = await fetch(primaryUrl, {
+        method: "POST",
+        headers: { "content-type": "application/json", "X-FF3-Key": "test-secret-failover" },
+        body: JSON.stringify({ op: "ping", args: {} }),
+        signal: AbortSignal.timeout(500),
+      });
+      await r.json();
+      if (r.ok) {
+        okUntil = Date.now() + 5000;
+        return primaryUrl;
+      }
+    } catch {
+      okUntil = 0;
+    }
+    return backupUrl;
+  };
+
+  const callFF3 = createFF3FlightCaller({
+    stateDir: tmpDir,
+    secretPath: secretFile,
+    selectBackend,
+    onBackendConnectRefused: (failedUrl) => {
+      invalidatedUrls.push(failedUrl);
+      if (failedUrl === primaryUrl) okUntil = 0;
+    },
+  });
+
+  try {
+    // 1. Warm the 5s primary cache.
+    const r0 = await callFF3("ping", {});
+    assert.equal(r0.result.backend, "primary");
+    assert.ok(okUntil > Date.now());
+
+    // 2. Kill primary while okUntil is still ~5s in the future!
+    primary.closeAllConnections?.();
+    await new Promise((resolve) => primary.close(resolve));
+
+    // 3. First call after primary death must fail over immediately to backup.
+    const r1 = await callFF3("ping", { __dedupe_key: "fo-immediate-1" });
+    assert.equal(r1.ok, true);
+    assert.equal(r1.result.backend, "backup");
+    assert.deepEqual(invalidatedUrls, [primaryUrl]);
+
+    // 4. Dedupe replay returns cached backup result without re-executing.
+    const r1Replay = await callFF3("ping", { __dedupe_key: "fo-immediate-1" });
+    assert.equal(r1Replay.deduped_replay, true);
+    assert.equal(r1Replay.result.n, r1.result.n);
+
+    // 5. If BOTH backends refuse connection (ECONNREFUSED), dedupe key is NOT poisoned as OUTCOME_UNKNOWN.
+    backup.closeAllConnections?.();
+    await new Promise((resolve) => backup.close(resolve));
+    await assert.rejects(
+      () => callFF3("capabilities", { __dedupe_key: "fo-both-down" }),
+      (err) => !(err instanceof FlightOutcomeUnknownError)
+    );
+    // Restart a new listener on backup port to prove retry with same dedupe key is NOT blocked.
+    const recovered = http.createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ ok: true, result: { recovered: true } }));
+      });
+    });
+    await new Promise((resolve) => recovered.listen(0, "127.0.0.1", resolve));
+    const recoveredUrl = `http://127.0.0.1:${recovered.address().port}/rpc`;
+    try {
+      const callRecovered = createFF3FlightCaller({
+        stateDir: tmpDir,
+        secretPath: secretFile,
+        selectBackend: async () => recoveredUrl,
+      });
+      const r2 = await callRecovered("capabilities", { __dedupe_key: "fo-both-down" });
+      assert.equal(r2.ok, true);
+      assert.equal(r2.result.recovered, true);
+    } finally {
+      await new Promise((resolve) => recovered.close(resolve));
+    }
+  } finally {
+    try { primary.close(); } catch {}
+    try { backup.close(); } catch {}
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

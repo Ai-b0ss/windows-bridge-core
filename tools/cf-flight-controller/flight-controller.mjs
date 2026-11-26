@@ -818,7 +818,25 @@ export class FlightController {
   }
 }
 
-export function createFF3FlightCaller({ selectBackend, secretPath, stateDir } = {}) {
+export function isConnectionRefusedError(err) {
+  if (!err || typeof err !== "object") return false;
+  if (err.code === "ECONNREFUSED") return true;
+  if (Array.isArray(err.errors) && err.errors.length > 0) {
+    return err.errors.every((inner) => isConnectionRefusedError(inner));
+  }
+  if (err.cause && err.cause !== err) {
+    return isConnectionRefusedError(err.cause);
+  }
+  return false;
+}
+
+export function createFF3FlightCaller({
+  selectBackend,
+  secretPath,
+  stateDir,
+  onBackendConnectRefused = null,
+  onBackendTransportError = null,
+} = {}) {
   const fc = new FlightController({
     stateDir,
     executor: async (op, cleanArgs, { requestId, dedupeKey, signal, setBackendUrl }) => {
@@ -835,12 +853,62 @@ export function createFF3FlightCaller({ selectBackend, secretPath, stateDir } = 
       }
       const payload = { op, args: cleanArgs, request_id: requestId };
       if (dedupeKey) payload.dedupe_key = dedupeKey;
-      const response = await fetch(targetUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json", "X-FF3-Key": secret },
-        body: JSON.stringify(payload),
-        signal,
-      });
+      const postTo = (url) =>
+        fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json", "X-FF3-Key": secret },
+          body: JSON.stringify(payload),
+          signal,
+        });
+
+      let response;
+      try {
+        response = await postTo(targetUrl);
+      } catch (fetchErr) {
+        if (typeof onBackendTransportError === "function") {
+          try {
+            await onBackendTransportError(targetUrl, fetchErr);
+          } catch {}
+        }
+        if (!isConnectionRefusedError(fetchErr)) {
+          throw fetchErr;
+        }
+        // Strictly TCP ECONNREFUSED proves no listener accepted the request;
+        // invalidate any cached backend health probe and attempt one failover.
+        if (typeof onBackendConnectRefused === "function") {
+          try {
+            await onBackendConnectRefused(targetUrl, fetchErr);
+          } catch {}
+        }
+        let fallbackUrl = null;
+        try {
+          const candidate = await selectBackend(op, cleanArgs);
+          if (typeof candidate === "string" && candidate.length > 0 && candidate !== targetUrl) {
+            fallbackUrl = candidate;
+          }
+        } catch {}
+        if (!fallbackUrl) {
+          const wrapped = fetchErr instanceof Error ? fetchErr : new Error(String(fetchErr));
+          wrapped.beforeDispatch = true;
+          throw wrapped;
+        }
+        if (typeof setBackendUrl === "function") setBackendUrl(fallbackUrl);
+        try {
+          response = await postTo(fallbackUrl);
+        } catch (fallbackErr) {
+          if (typeof onBackendTransportError === "function") {
+            try {
+              await onBackendTransportError(fallbackUrl, fallbackErr);
+            } catch {}
+          }
+          if (isConnectionRefusedError(fallbackErr)) {
+            const wrapped = fallbackErr instanceof Error ? fallbackErr : new Error(String(fallbackErr));
+            wrapped.beforeDispatch = true;
+            throw wrapped;
+          }
+          throw fallbackErr;
+        }
+      }
       const text = await response.text();
       let data;
       try {

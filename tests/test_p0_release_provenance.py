@@ -537,6 +537,66 @@ class TestReleaseProvenanceContract(unittest.TestCase):
             self.assertEqual(prov["source_head"], v1)
             self.assertEqual(prov["release_name"], "rel-v1")
 
+    def test_rollback_to_cryptographically_pinned_squashed_previous_succeeds_and_rejects_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="ff-prov-squashed-rb-") as td:
+            base = Path(td)
+            # Predecessor release came from a separate squash-merged local repo.
+            old_repo = self._make_git_repo(base / "old-src")
+            (old_repo / "runtime" / "bridge-v3").mkdir(parents=True)
+            (old_repo / "runtime" / "bridge-v3" / "ff_win_v3_agent.py").write_bytes(b"A = 'old-branch'\n")
+            (old_repo / "runtime" / "bridge-v3" / "ff_win_v3_main.py").write_bytes(b"M = 'old-branch'\n")
+            _git(old_repo, "add", ".")
+            _git(old_repo, "commit", "-q", "-m", "predecessor branch commit")
+            old_sha = _git(old_repo, "rev-parse", "HEAD")
+
+            # Public core repo has squashed commit (old_sha is NOT in public_repo git DB).
+            pub_repo = self._make_git_repo(base / "public-core")
+            (pub_repo / "runtime" / "bridge-v3").mkdir(parents=True)
+            (pub_repo / "runtime" / "bridge-v3" / "ff_win_v3_agent.py").write_bytes(b"A = 'public-main'\n")
+            (pub_repo / "runtime" / "bridge-v3" / "ff_win_v3_main.py").write_bytes(b"M = 'public-main'\n")
+            _git(pub_repo, "add", ".")
+            _git(pub_repo, "commit", "-q", "-m", "squashed public main")
+            pub_sha = _git(pub_repo, "rev-parse", "HEAD")
+            self.assertFalse(rel_manifest.git_commit_exists(pub_repo, old_sha))
+
+            bridge_root = base / "bridge"
+            rel_old = bridge_root / "runtime-releases" / "rel-old" / "bridge-v3"
+            rel_pub = bridge_root / "runtime-releases" / "rel-pub" / "bridge-v3"
+            deploy.apply_runtime(old_repo, rel_old, ref=old_sha)
+            deploy.apply_runtime(pub_repo, rel_pub, ref=pub_sha)
+
+            # Activate rel-old, then upgrade to rel-pub using public_repo.
+            deploy.activate_release(bridge_root, rel_old, repo=None, release_name="rel-old")
+            act_pub = deploy.activate_release(bridge_root, rel_pub, repo=pub_repo, release_name="rel-pub")
+            self.assertEqual(act_pub["source_head"], pub_sha)
+            self.assertEqual(act_pub["previous"]["source_head"], old_sha)
+
+            # Explicit target_release_dir outside pub_repo MUST still fail closed.
+            with self.assertRaisesRegex(RuntimeError, "INSTALLED_MANIFEST_COMMIT_UNKNOWN_IN_GIT"):
+                deploy.rollback_active_release(bridge_root, target_release_dir=rel_old, repo=pub_repo)
+
+            # Rolling back to recorded pinned `previous` with --repo=pub_repo MUST succeed.
+            rb = deploy.rollback_active_release(bridge_root, repo=pub_repo)
+            self.assertTrue(rb["ok"])
+            self.assertEqual(rb["source_head"], old_sha)
+            self.assertFalse(rb["git_commit_in_repo"])
+            self.assertTrue(rb["rollback_pin_verified"])
+
+            # Negative: re-activate rel-pub, tamper previous.release_id -> MUST fail closed.
+            deploy.activate_release(bridge_root, rel_pub, repo=pub_repo, release_name="rel-pub")
+            ptr_path = deploy.active_release_pointer_path(bridge_root)
+            ptr_doc = json.loads(ptr_path.read_text(encoding="utf-8"))
+            ptr_doc["previous"]["release_id"] = "0" * 64
+            ptr_path.write_text(json.dumps(ptr_doc, indent=2), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "ROLLBACK_TARGET_RELEASE_ID_DRIFTED"):
+                deploy.rollback_active_release(bridge_root, repo=pub_repo)
+
+            # Negative: missing previous.manifest_sha256 pin -> MUST fail closed against pub_repo.
+            del ptr_doc["previous"]["manifest_sha256"]
+            ptr_path.write_text(json.dumps(ptr_doc, indent=2), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "INSTALLED_MANIFEST_COMMIT_UNKNOWN_IN_GIT"):
+                deploy.rollback_active_release(bridge_root, repo=pub_repo)
+
 
 @unittest.skipUnless(os.name == "nt" and shutil.which("git") and (shutil.which("powershell.exe") or shutil.which("pwsh")),
                      "Windows + git + PowerShell required for real keeper drill")
