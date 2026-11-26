@@ -53,8 +53,21 @@ DEVICE = str(CONFIG.get("device") or platform.node())
 SOURCE_BRANCH = str(CONFIG.get("branch") or "main")
 SCHEMA = "ff-win-github-comment-v5"
 RESULT_SCHEMA = "ff-win-github-comment-result-v5"
+def _env_bounded_float(name: str, default: float, low: float, high: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if not math.isfinite(value):
+        return default
+    return max(low, min(high, value))
+
+
 INBOX_ISSUE = int(os.environ.get("FF_GH_INBOX_ISSUE") or CONFIG.get("inbox_issue", 3807))
-POLL_SECONDS = float(os.environ.get("FF_GH_POLL_SECONDS", "1.0"))  # GitHub is the backup transport; was 0.25
+POLL_SECONDS = _env_bounded_float("FF_GH_POLL_SECONDS", 1.0, 0.1, 60.0)  # GitHub is the backup transport; was 0.25
 MAX_WORKERS = int(os.environ.get("FF_GH_MAX_WORKERS", "8"))
 RESULT_BATCH_WINDOW_SECONDS = float(os.environ.get("FF_GH_RESULT_BATCH_WINDOW", "0.05"))
 RESULT_BATCH_BURST_WINDOW_SECONDS = float(os.environ.get("FF_GH_RESULT_BATCH_BURST_WINDOW", "0.35"))
@@ -288,19 +301,27 @@ def parse_task(comment: dict[str, Any]) -> dict[str, Any] | None:
 _last_health_at = 0.0
 _last_health_key = None
 # Health is consumed with a 15 s freshness limit (ff_win_github_transport_health.ps1),
-# so a 2 s heartbeat keeps a 7x margin while avoiding a create/rename cycle per poll.
-HEALTH_HEARTBEAT_SECONDS = float(os.environ.get("FF_GH_HEALTH_HEARTBEAT", "2.0"))
+# so a 2 s heartbeat (clamped <= 10 s) keeps a safe margin while avoiding a create/rename cycle per poll.
+HEALTH_HEARTBEAT_SECONDS = _env_bounded_float("FF_GH_HEALTH_HEARTBEAT", 2.0, 0.1, 10.0)
 
 
 def write_health(payload: dict[str, Any]) -> None:
     global _last_health_at, _last_health_key
     now = time.monotonic()
-    key = (str(HEALTH), payload.get("last_error"), payload.get("active"), payload.get("durable_pending"),
-           payload.get("quarantined_requests"), payload.get("waiting_for_login"),
-           payload.get("scheduled_retries"))
-    if key == _last_health_key and now - _last_health_at < HEALTH_HEARTBEAT_SECONDS and HEALTH.exists():
+    heartbeat = (
+        HEALTH_HEARTBEAT_SECONDS
+        if (isinstance(HEALTH_HEARTBEAT_SECONDS, (int, float))
+            and not isinstance(HEALTH_HEARTBEAT_SECONDS, bool)
+            and math.isfinite(HEALTH_HEARTBEAT_SECONDS)
+            and HEALTH_HEARTBEAT_SECONDS > 0)
+        else 2.0
+    )
+    key = (str(HEALTH), payload.get("inbox_issue"), payload.get("last_error"), payload.get("active"),
+           payload.get("durable_pending"), payload.get("quarantined_requests"),
+           payload.get("waiting_for_login"), payload.get("scheduled_retries"))
+    if key == _last_health_key and 0.0 <= (now - _last_health_at) < heartbeat and HEALTH.exists():
         return
-    GH_HOME.mkdir(parents=True, exist_ok=True)
+    HEALTH.parent.mkdir(parents=True, exist_ok=True)
     tmp = HEALTH.with_suffix(".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
     os.replace(tmp, HEALTH)

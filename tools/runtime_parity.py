@@ -16,7 +16,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -30,8 +32,36 @@ if str(_RUNTIME_DIR) not in sys.path:
 import cua_runtime_deploy as _deploy  # noqa: E402
 
 
+def _is_reparse(path: Path) -> bool:
+    try:
+        if path.is_symlink() or getattr(path, "is_junction", lambda: False)():
+            return True
+        st = os.lstat(path)
+        attrs = getattr(st, "st_file_attributes", 0)
+        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        return bool(attrs & reparse_flag) or bool(getattr(st, "st_reparse_tag", 0))
+    except OSError:
+        return False
+
+
+def _has_reparse_in_tree(root: Path, rel_posix: str) -> bool:
+    if _is_reparse(root):
+        return True
+    cursor = root
+    for part in rel_posix.split("/"):
+        if not part:
+            continue
+        cursor = cursor / part
+        if _is_reparse(cursor):
+            return True
+    return False
+
+
 def git(repo: Path, *args: str) -> bytes:
-    done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True)
+    env = dict(os.environ)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    done = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, env=env)
     if done.returncode:
         raise SystemExit("git failed: " + " ".join(args))
     return done.stdout
@@ -42,20 +72,42 @@ def resolve_commit(repo: Path, ref: str) -> str:
 
 
 def compare(repo: Path, installed: Path, ref: str) -> dict:
-    names = [n for n in git(repo, "ls-tree", "-r", "--name-only", ref, PREFIX).decode().split("\n") if n]
-    same, different, missing = 0, [], []
+    ref_commit = resolve_commit(repo, ref)
+    ref_is_stale = ref_commit.lower() in _deploy.KNOWN_STALE_COMMITS
+    root_reparse = _is_reparse(installed)
+    names = [
+        n
+        for n in git(
+            repo, "-c", "core.quotepath=false", "ls-tree", "-r", "--name-only", ref, PREFIX
+        ).decode("utf-8", errors="replace").splitlines()
+        if n
+    ]
+    same, different, missing, reparse_points = 0, [], [], []
     for name in names:
-        target = installed / name[len(PREFIX):]
+        rel = name[len(PREFIX):]
+        target = installed / rel
+        if root_reparse or _has_reparse_in_tree(installed, rel):
+            reparse_points.append(rel)
+            continue
         if not target.is_file():
-            missing.append(name[len(PREFIX):])
+            missing.append(rel)
             continue
         stored = git(repo, "show", f"{ref}:{name}")
         if hashlib.sha256(stored).digest() == hashlib.sha256(target.read_bytes()).digest():
             same += 1
         else:
-            different.append(name[len(PREFIX):])
-    return {"ref": ref, "tracked": len(names), "identical": same,
-            "different": different, "missing_in_installed": missing}
+            different.append(rel)
+    return {
+        "ref": ref,
+        "ref_commit": ref_commit,
+        "ref_is_stale": ref_is_stale,
+        "tracked": len(names),
+        "identical": same,
+        "different": different,
+        "missing_in_installed": missing,
+        "reparse_points": reparse_points,
+        "installed_root_reparse": root_reparse,
+    }
 
 
 def check_installed_manifest(
@@ -170,8 +222,12 @@ def main(argv=None) -> int:
         report["disk_free_gb"] = round(usage.free / 1e9, 1)
         report["disk_free_percent"] = round(100 * usage.free / usage.total, 1)
     report["parity"] = (
-        not report["different"]
+        report["tracked"] > 0
+        and not report["different"]
         and not report["missing_in_installed"]
+        and not report.get("reparse_points")
+        and not report.get("installed_root_reparse")
+        and not report.get("ref_is_stale")
         and bool(manifest_report["ok"])
         and pw_ok
         and pointer_ok

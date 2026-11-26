@@ -194,5 +194,41 @@ class Tests(unittest.TestCase):
         self.assertIn("CDP_CONNECTED",lines[1])
         self.assertIn("HUB_UNAVAILABLE",lines[2])
 
+    def test_report_flushes_on_backward_clock_jump(self):
+        t=[1000.0]
+        with patch.object(mod.time,"time",side_effect=lambda:t[0]):
+            self.rec.report("CDP_CONNECTED",hub_pid=1234)
+            t[0]=900.0
+            self.rec.report("CDP_CONNECTED",hub_pid=1234)
+            t[0]=910.0
+            self.rec.report("CDP_CONNECTED",hub_pid=1234)
+        lines=self.rec.log_file.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines),2)
+
+    def test_non_dict_json_and_missing_hub_pid_fail_closed(self):
+        (self.rec.workdir/"support-window-request.json").write_text("[]",encoding="utf-8")
+        self.assertFalse(mod.fresh_support_request(self.rec.workdir,1234,1099,9222))
+        (self.rec.workdir/"support-window-request.json").write_text(json.dumps({
+            "schema":"ff-consent-helper-request-v1",
+            "hub_pid":True,"chrome_pid":1099,"cdp_port":9222,"issued_at":mod.time.time(),
+        }),encoding="utf-8")
+        self.assertFalse(mod.fresh_support_request(self.rec.workdir,1,1099,9222))
+        (self.rec.user_data/"Local State").write_text('{"devtools":null}',encoding="utf-8")
+        self.assertFalse(mod.remote_debugging_enabled(self.rec.user_data))
+
+        hub_dir=self.root/"hub_no_pid"
+        pkg_dir=self.root/"pkg_no_pid"
+        hub_dir.mkdir(); pkg_dir.mkdir()
+        (pkg_dir/"ff_hub.py").write_text("print('{}')\n",encoding="utf-8")
+        (hub_dir/"endpoint.json").write_text(json.dumps({"package":str(pkg_dir)}),encoding="utf-8")
+        self.assertIsNone(mod.hub_status(hub_dir))
+
+        (self.rec.user_data/"Local State").write_text(json.dumps({"devtools":{"remote_debugging":{"user-enabled":True}}}),encoding="utf-8")
+        with patch.object(mod,"hub_status",return_value={"owner_chrome_secondary":{"connected":False}}),\
+             patch.object(mod,"native_support_window") as helper:
+            r=self.rec.step()
+        self.assertEqual(r["code"],"HUB_UNAVAILABLE")
+        helper.assert_not_called()
+
 
 if __name__=="__main__":unittest.main()

@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -93,12 +94,18 @@ def configured_port(user_data:Path) -> int:
     return 9222
 
 
+def _valid_pid(value: object) -> int | None:
+    return value if type(value) is int and value > 0 else None
+
+
 def trusted_hub_pending_socket(hub_pid:int, chrome_pid:int, port:int)->bool:
     """Only show the one-off helper for a fresh connection from the live Hub.
 
     Transferred WSADuplicateSocket sockets can retain their originating PID;
     do not infer consent eligibility from sockets owned by an old process.
     """
+    if _valid_pid(hub_pid) is None or type(port) is not int or not 1<=port<=65535:
+        return False
     try:
         for c in psutil.net_connections(kind="tcp"):
             if (c.status=="ESTABLISHED" and c.pid==hub_pid and c.laddr and c.raddr
@@ -113,28 +120,41 @@ def trusted_hub_pending_socket(hub_pid:int, chrome_pid:int, port:int)->bool:
 
 def fresh_support_request(workdir:Path, hub_pid:int, chrome_pid:int, port:int)->bool:
     """A short-lived, matching request from the owner-verified consent watcher."""
+    if _valid_pid(hub_pid) is None or _valid_pid(chrome_pid) is None or type(port) is not int or not 1<=port<=65535:
+        return False
     try:
         raw=json.loads((workdir/"support-window-request.json").read_text(encoding="utf-8-sig"))
-        if raw.get("schema")!="ff-consent-helper-request-v1":return False
+        if not isinstance(raw,dict) or raw.get("schema")!="ff-consent-helper-request-v1":return False
+        if any(type(raw.get(k)) is bool for k in ("hub_pid","chrome_pid","cdp_port","issued_at")):return False
         if (int(raw.get("hub_pid",-1))!=hub_pid
                 or int(raw.get("chrome_pid",-1))!=chrome_pid
                 or int(raw.get("cdp_port",-1))!=port):return False
-        age=time.time()-float(raw.get("issued_at",0))
+        issued_at=float(raw.get("issued_at",0))
+        if not math.isfinite(issued_at):return False
+        age=time.time()-issued_at
         return 0<=age<=25
-    except (OSError,ValueError,TypeError):
+    except (OSError,ValueError,TypeError,AttributeError):
         return False
 
 
 def remote_debugging_enabled(user_data:Path) -> bool:
     try:
         settings=json.loads((user_data/"Local State").read_text(encoding="utf-8-sig"))
-        return settings.get("devtools",{}).get("remote_debugging",{}).get("user-enabled") is True
-    except (OSError,ValueError,UnicodeError):return False
+        if not isinstance(settings,dict):return False
+        devtools=settings.get("devtools")
+        if not isinstance(devtools,dict):return False
+        remote_dbg=devtools.get("remote_debugging")
+        if not isinstance(remote_dbg,dict):return False
+        return remote_dbg.get("user-enabled") is True
+    except (OSError,ValueError,UnicodeError,TypeError,AttributeError):return False
 
 
 def hub_status(hub_state:Path, timeout=4)->dict|None:
     try:
         endpoint=json.loads((hub_state/"endpoint.json").read_text(encoding="utf-8-sig"))
+        if not isinstance(endpoint,dict):return None
+        expected_pid=_valid_pid(endpoint.get("pid"))
+        if expected_pid is None:return None
         pkg=Path(endpoint["package"])
         script=pkg/"ff_hub.py"
         if not script.is_file():return None
@@ -142,9 +162,9 @@ def hub_status(hub_state:Path, timeout=4)->dict|None:
                               encoding="utf-8",errors="replace",timeout=timeout,creationflags=FLAGS)
         if result.returncode:return None
         data=json.loads(result.stdout)
-        if data.get("pid")!=endpoint.get("pid"):return None
+        if not isinstance(data,dict) or _valid_pid(data.get("pid"))!=expected_pid:return None
         return data
-    except (OSError,ValueError,subprocess.TimeoutExpired,KeyError):return None
+    except (OSError,ValueError,subprocess.TimeoutExpired,KeyError,TypeError):return None
 
 
 def watcher_running(script:Path)->bool:
@@ -207,7 +227,7 @@ class Recovery:
         tmp.write_text(json.dumps(status,ensure_ascii=False,indent=2)+"\n",encoding="utf-8")
         os.replace(tmp,self.status_file)
         # Log transitions and a periodic heartbeat, not 240 identical lines/hour.
-        if code != self.last_report_code or now-self.last_log_time>=120:
+        if code != self.last_report_code or now<self.last_log_time or now-self.last_log_time>=120:
             with self.log_file.open("a",encoding="utf-8") as log:
                 log.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {code} {json.dumps(extra,ensure_ascii=False)}\n")
             self.last_report_code=code
@@ -221,11 +241,13 @@ class Recovery:
         if not remote_debugging_enabled(self.user_data):
             return self.report("OWNER_CHROME_REMOTE_DEBUG_DISABLED")
         status=hub_status(self.hub_state)
-        if status is None:
+        if not isinstance(status,dict):
             # CLI status occasionally times out during Chrome's pending CDP handshake.
             # Avoid opening any helper windows on an indeterminate Hub state.
             return self.report("HUB_UNAVAILABLE")
-        hub_pid=status.get("pid")
+        hub_pid=_valid_pid(status.get("pid"))
+        if hub_pid is None:
+            return self.report("HUB_UNAVAILABLE")
         if self.attempt_hub_pid is None:
             self.attempt_hub_pid=hub_pid
         elif hub_pid!=self.attempt_hub_pid:
@@ -241,7 +263,7 @@ class Recovery:
                 connected_at=remote.get("connected_at")
                 try:
                     if connected_at is not None and float(connected_at)>=current.create_time()-1:
-                        return self.report("CDP_CONNECTED",hub_pid=status["pid"],chrome_pid=current.pid)
+                        return self.report("CDP_CONNECTED",hub_pid=hub_pid,chrome_pid=current.pid)
                 except (ValueError,TypeError,psutil.Error):pass
                 return self.report("STALE_CDP_WAIT_FOR_HUB_KEEPALIVE",chrome_pid=current.pid)
         elif remote.get("connected") and not owners:
@@ -269,17 +291,17 @@ class Recovery:
         if not allow_support:return self.report("CDP_AVAILABLE_AWAITING_NATIVE_CONSENT",pid=pid,port=port)
         if not watcher_running(self.watch_script):
             return self.report("CONSENT_WATCHER_NOT_RUNNING",pid=pid)
-        requested=fresh_support_request(self.workdir,status["pid"],pid,port)
-        pending=trusted_hub_pending_socket(status["pid"],pid,port)
+        requested=fresh_support_request(self.workdir,hub_pid,pid,port)
+        pending=trusted_hub_pending_socket(hub_pid,pid,port)
         if not requested and not pending:
-            return self.report("NO_TRUSTED_CDP_CONSENT_INTENT",hub_pid=status["pid"],chrome_pid=pid)
+            return self.report("NO_TRUSTED_CDP_CONSENT_INTENT",hub_pid=hub_pid,chrome_pid=pid)
         # Never keep reopening Chrome windows when the exact same Hub has failed
         # consent three times. A new Hub generation resets the bounded budget.
         now=time.monotonic()
         if self.attempts>=3:
             if not self.last_attempt or now-self.last_attempt<900:
                 retry_after=int(900-(now-self.last_attempt)) if self.last_attempt else 900
-                return self.report("CONSENT_RETRY_COOLDOWN",hub_pid=status["pid"],retry_after_seconds=retry_after)
+                return self.report("CONSENT_RETRY_COOLDOWN",hub_pid=hub_pid,retry_after_seconds=retry_after)
             self.attempts=0
         if self.last_attempt and now-self.last_attempt<65:
             return self.report("CONSENT_COOLDOWN",attempts=self.attempts)
@@ -294,7 +316,7 @@ class Recovery:
                 if (self.workdir/"stop.flag").exists():break
                 state=hub_status(self.hub_state)
                 if state and state.get("owner_chrome_secondary",{}).get("connected"):
-                    return self.report("CDP_RECOVERED",chrome_pid=pid,hub_pid=state["pid"])
+                    return self.report("CDP_RECOVERED",chrome_pid=pid,hub_pid=state.get("pid",hub_pid))
                 time.sleep(2)
             return self.report("CONSENT_NOT_CONFIRMED",chrome_pid=pid)
         finally:

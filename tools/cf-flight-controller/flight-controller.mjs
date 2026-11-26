@@ -292,6 +292,17 @@ export class ContextShield {
   }
 }
 
+function deriveBatchStepDedupeKey(baseKey, stepIndex) {
+  if (!baseKey) return null;
+  const suffix = `:s${stepIndex}`;
+  if (baseKey.length + suffix.length <= 160) {
+    return `${baseKey}${suffix}`;
+  }
+  const digest = crypto.createHash("sha256").update(baseKey).digest("hex").slice(0, 12);
+  const prefixLen = Math.max(1, 160 - 1 - digest.length - suffix.length);
+  return `${baseKey.slice(0, prefixLen)}:${digest}${suffix}`;
+}
+
 export class FlightController {
   constructor({ executor, reconciler = null, stateDir } = {}) {
     this.executor = executor;
@@ -457,7 +468,7 @@ export class FlightController {
         continue;
       }
       const { cleanArgs: stepCleanArgs, meta: stepMeta } = extractTransportMeta(calls[i].args ?? {});
-      const stepDedupeKey = stepMeta.dedupeKey || (ctx.dedupeKey ? `${ctx.dedupeKey}:s${i}` : null);
+      const stepDedupeKey = stepMeta.dedupeKey || deriveBatchStepDedupeKey(ctx.dedupeKey, i);
       const t0 = Date.now();
       try {
         const res = await this.executor(stepOp, stepCleanArgs, {
@@ -616,6 +627,24 @@ export class FlightController {
           : await this.executor(op, cleanArgs, execCtx);
         flight.ended_at = Date.now();
         flight.duration_ms = flight.ended_at - flight.created_at;
+        if (flight.status === "CANCELLED") {
+          const hasUnknownStep =
+            op === "batch" &&
+            Array.isArray(rawData?.results) &&
+            rawData.results.some((r) => r?.status === "outcome_unknown");
+          if (hasUnknownStep && meta.dedupeKey) {
+            flight.status = "OUTCOME_UNKNOWN";
+            flight.error = "BATCH_CANCELLED_WITH_OUTCOME_UNKNOWN";
+            this._persistJournal();
+          } else {
+            flight.error = flight.error || "CANCELLED_BY_CALLER";
+            if (meta.dedupeKey && this.dedupeIndex.get(meta.dedupeKey) === flightId) {
+              this.dedupeIndex.delete(meta.dedupeKey);
+            }
+            if (flight.handover_triggered) this._persistJournal();
+          }
+          return { ok: false };
+        }
         flight.status = "COMPLETED";
         flight.shieldedResult = this.shield.apply(op, rawData, flightId, meta);
         if (flight.handover_triggered || meta.dedupeKey) this._persistJournal();

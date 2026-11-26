@@ -79,6 +79,40 @@ class GitHubCommentDaemonThrottleTests(unittest.TestCase):
         self.assertEqual([w[1]["ts"] for w in writes], [1, 3, 4, 5])
         self.assertTrue(self.health_path.is_file())
 
+    def test_env_bounded_float_clamps_and_rejects_nan_or_oversized_throttle(self) -> None:
+        with patch.dict(os.environ, {"FF_GH_HEALTH_HEARTBEAT": "nan"}, clear=False):
+            self.assertEqual(self.daemon._env_bounded_float("FF_GH_HEALTH_HEARTBEAT", 2.0, 0.1, 10.0), 2.0)
+        with patch.dict(os.environ, {"FF_GH_HEALTH_HEARTBEAT": "inf"}, clear=False):
+            self.assertEqual(self.daemon._env_bounded_float("FF_GH_HEALTH_HEARTBEAT", 2.0, 0.1, 10.0), 2.0)
+        with patch.dict(os.environ, {"FF_GH_HEALTH_HEARTBEAT": "999"}, clear=False):
+            self.assertEqual(self.daemon._env_bounded_float("FF_GH_HEALTH_HEARTBEAT", 2.0, 0.1, 10.0), 10.0)
+        with patch.dict(os.environ, {"FF_GH_HEALTH_HEARTBEAT": "-5"}, clear=False):
+            self.assertEqual(self.daemon._env_bounded_float("FF_GH_HEALTH_HEARTBEAT", 2.0, 0.1, 10.0), 0.1)
+        with patch.dict(os.environ, {"FF_GH_POLL_SECONDS": "not-a-number"}, clear=False):
+            self.assertEqual(self.daemon._env_bounded_float("FF_GH_POLL_SECONDS", 1.0, 0.1, 60.0), 1.0)
+
+    def test_write_health_creates_parent_flushes_on_inbox_rotation_and_backward_clock(self) -> None:
+        nested = self.root / "nested" / "sub" / "health.json"
+        clock = [50.0]
+        writes = []
+        real_replace = os.replace
+
+        def counting_replace(src: Path, dst: Path) -> None:
+            writes.append(json.loads(Path(src).read_text(encoding="utf-8")))
+            real_replace(src, dst)
+
+        with patch.object(self.daemon, "HEALTH", nested), \
+             patch.object(self.daemon.time, "monotonic", side_effect=lambda: clock[0]), \
+             patch.object(self.daemon.os, "replace", side_effect=counting_replace):
+            self.daemon.write_health({"inbox_issue": 3807, "active": 0, "ts": 1})
+            clock[0] = 50.5
+            self.daemon.write_health({"inbox_issue": 3808, "active": 0, "ts": 2})
+            clock[0] = 40.0
+            self.daemon.write_health({"inbox_issue": 3808, "active": 0, "ts": 3})
+
+        self.assertTrue(nested.is_file())
+        self.assertEqual([w["ts"] for w in writes], [1, 2, 3])
+
 
 if __name__ == "__main__":
     unittest.main()
