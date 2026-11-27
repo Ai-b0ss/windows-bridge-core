@@ -1,3 +1,4 @@
+import { READ_ANNOTATIONS, WRITE_ANNOTATIONS } from "./bridge-tool-policy";
 import { DurableObject } from "cloudflare:workers";
 import OAuthProvider, { type OAuthHelpers } from "@cloudflare/workers-oauth-provider";
 import { createMcpHandler } from "agents/mcp/server";
@@ -319,7 +320,7 @@ export class DeviceHub extends DurableObject<Env> {
 }
 
 function hub(env: Env) {
-  return env.DEVICE_HUB.getByName("igor-win");
+  return env.DEVICE_HUB.getByName("default");
 }
 
 function resultOrError(run: () => Promise<unknown>) {
@@ -342,7 +343,7 @@ function makeMcp(env: Env) {
     "device_status",
     {
       description: "Return FF Windows agent connection status.",
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { ...READ_ANNOTATIONS, openWorldHint: false },
     },
     async () => {
       const status = await hub(env).getStatus();
@@ -355,7 +356,7 @@ function makeMcp(env: Env) {
     {
       description: "Round-trip ping through Cloudflare to the Windows agent.",
       inputSchema: { message: z.string().optional(), target_device: z.string().optional() },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { ...READ_ANNOTATIONS, openWorldHint: false },
     },
     async ({ message, target_device }) =>
       resultOrError(() => hub(env).pingDevice(message ?? "ping", target_device)),
@@ -369,7 +370,7 @@ function makeMcp(env: Env) {
         action: z.enum(["hostname", "whoami", "node_version"]),
         target_device: z.string().optional(),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { ...READ_ANNOTATIONS, openWorldHint: false },
     },
     async ({ action, target_device }) => resultOrError(() => hub(env).execTest(action, target_device)),
   );
@@ -378,7 +379,7 @@ function makeMcp(env: Env) {
     "bridge_capabilities",
     {
       description: "Return the live capabilities and operations exposed by the existing FF Windows Bridge v3 runtime.",
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { ...READ_ANNOTATIONS, openWorldHint: false },
     },
     async () => resultOrError(() => hub(env).bridgeRpc("capabilities", {})),
   );
@@ -392,7 +393,7 @@ function makeMcp(env: Env) {
         args: z.record(z.string(), z.unknown()).optional(),
         target_device: z.string().optional(),
       },
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: WRITE_ANNOTATIONS,
     },
     async ({ op, args, target_device }) => resultOrError(() => hub(env).bridgeRpc(op, args ?? {}, target_device)),
   );
@@ -409,11 +410,39 @@ const defaultHandler = {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
 
-    if (url.pathname === "/device/igor-win") {
+    if (url.pathname === "/ws") {
       if (bearer(request) !== env.DEVICE_TOKEN) {
         return new Response("Unauthorized", { status: 401 });
       }
       return hub(env).fetch(request);
+    }
+
+    if (url.pathname === "/health" && request.method === "GET") {
+      return Response.json(
+        { ok: true, service: "windows-bridge-mcp" },
+        { headers: { "cache-control": "no-store" } },
+      );
+    }
+
+    if (url.pathname === "/bootstrap" && request.method === "GET") {
+      const returnTo = url.searchParams.get("return_to") ?? "";
+      const html = `<!doctype html><meta charset="utf-8">
+<title>Windows-Bridge Owner Bootstrap</title>
+<style>body{font:16px system-ui;max-width:520px;margin:60px auto;padding:0 20px}input,button{font:16px system-ui;padding:8px 12px;margin-top:8px}input{width:100%;box-sizing:border-box}</style>
+<h2>Windows-Bridge Owner Login</h2>
+<p>Enter your <code>MCP_TOKEN</code> secret to authorize this browser for OAuth approvals (ChatGPT / Gemini).</p>
+<form method="POST" action="/bootstrap">
+  <input type="hidden" name="return_to" value="${esc(returnTo)}">
+  <input type="password" name="token" placeholder="MCP_TOKEN" required autocomplete="off">
+  <button type="submit">Authorize owner browser</button>
+</form>`;
+      return new Response(html, {
+        headers: {
+          "content-type": "text/html; charset=utf-8",
+          "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
+          "cache-control": "no-store",
+        },
+      });
     }
 
     if (url.pathname === "/bootstrap" && request.method === "POST") {
@@ -422,13 +451,21 @@ const defaultHandler = {
         return new Response("Unauthorized", { status: 401 });
       }
       const owner = await sha256(env.MCP_TOKEN);
-      return new Response("FF owner browser authorized. You can close this tab.", {
-        headers: {
-          "content-type": "text/plain; charset=utf-8",
-          "set-cookie":
-            "__Host-FF_OWNER=" + owner +
-            "; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=7776000",
-        },
+      const cookie = "__Host-FF_OWNER=" + owner + "; HttpOnly; Secure; Path=/; SameSite=Lax; Max-Age=7776000";
+      const rawReturnTo = String(form.get("return_to") ?? "");
+      if (rawReturnTo) {
+        try {
+          const target = new URL(rawReturnTo, ORIGIN);
+          if (target.origin === ORIGIN && target.pathname === "/authorize") {
+            return new Response(null, {
+              status: 303,
+              headers: { location: target.pathname + target.search, "set-cookie": cookie, "cache-control": "no-store" },
+            });
+          }
+        } catch {}
+      }
+      return new Response("Owner browser authorized. You can now return to ChatGPT/Gemini OAuth or close this tab.", {
+        headers: { "content-type": "text/plain; charset=utf-8", "set-cookie": cookie, "cache-control": "no-store" },
       });
     }
 
@@ -464,7 +501,10 @@ const defaultHandler = {
 
     if (url.pathname === "/authorize" && request.method === "GET") {
       if (!(await isOwner(request, env))) {
-        return mobilePairPage(url);
+        if (url.searchParams.get("client_id") === "https://claude.ai/oauth/mcp-oauth-client-metadata") {
+          return mobilePairPage(url);
+        }
+        return Response.redirect(ORIGIN + "/bootstrap?return_to=" + encodeURIComponent(url.pathname + url.search), 302);
       }
       const info = await env.OAUTH_PROVIDER.parseAuthRequest(request);
       const payload = b64urlEncode(JSON.stringify({

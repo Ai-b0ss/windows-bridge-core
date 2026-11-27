@@ -2,15 +2,19 @@
   "name": "windows-bridge-mcp-worker",
   "private": true,
   "type": "module",
+  "scripts": {
+    "check:agent": "node --check agent/cf-bridge-agent.mjs",
+    "check:bundle": "wrangler deploy src/index.ts --name windows-bridge-mcp --compatibility-date 2026-09-27 --compatibility-flags nodejs_compat --dry-run --outdir .wrangler/dry-run"
+  },
   "dependencies": {
-    "@cloudflare/workers-oauth-provider": "^1.1.0",
-    "@modelcontextprotocol/server": "latest",
-    "agents": "latest",
-    "hono": "^4.13.9",
-    "ws": "^8.22.0",
-    "zod": "latest"
+    "@cloudflare/workers-oauth-provider": "1.1.0",
+    "@modelcontextprotocol/server": "2.0.0",
+    "agents": "0.24.0",
+    "hono": "4.13.9",
+    "ws": "8.22.0",
+    "zod": "4.6.5"
   },
   "devDependencies": {
-    "wrangler": "latest"
+    "wrangler": "4.142.0"
   }
 }

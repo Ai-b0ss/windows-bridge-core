@@ -1,0 +1,31 @@
+name: Cloudflare Worker CI
+
+on:
+  push:
+    branches: [main]
+    paths: ['cloudflare-worker/**', '.github/workflows/cloudflare-worker-ci.yml']
+  pull_request:
+    paths: ['cloudflare-worker/**', '.github/workflows/cloudflare-worker-ci.yml']
+
+permissions:
+  contents: read
+
+jobs:
+  worker-check:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloudflare-worker
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: cloudflare-worker/package-lock.json
+      - name: Install pinned dependencies
+        run: npm ci
+      - name: Syntax check client WebSocket agent
+        run: npm run check:agent
+      - name: Dry-run bundle Worker with Wrangler
+        run: npm run check:bundle

@@ -1,0 +1,10 @@
+{
+  "workerBaseUrl": "https://<YOUR_WORKER_NAME>.<YOUR_SUBDOMAIN>.workers.dev",
+  "wsPath": "/ws",
+  "deviceName": "<YOUR_WINDOWS_HOSTNAME>",
+  "rpcUrl": "http://127.0.0.1:39073/rpc",
+  "fallbackRpcUrl": "http://127.0.0.1:39076/rpc",
+  "deviceTokenFile": "C:/path/to/secrets/device-token.txt",
+  "rpcSecretFile": "C:/path/to/secrets/bridge-v3-secret.txt",
+  "heartbeatMs": 20000
+}
