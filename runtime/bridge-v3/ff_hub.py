@@ -2008,6 +2008,38 @@ class Hub:
                         cleanup_verified=not cleanup["errors"],
                         **cleanup,
                     )
+        # Reconcile orphaned owner_chrome_hidden_target resources whose sessions are no longer active
+        try:
+            active_sids = {s["session_id"] for s in self.store.sessions()}
+            stale_ids = []
+            now_ts = time.time()
+            for item in self.store.resources(kind="owner_chrome_hidden_target"):
+                if item.get("session_id") in active_sids:
+                    continue
+                age_s = now_ts - float(item.get("created_at") or 0.0)
+                if age_s < 60.0:
+                    continue
+                try:
+                    tid = (item.get("meta") or {}).get("target_id")
+                    sec_close = getattr(self.owner_chrome_secondary, "close_target", None)
+                    if tid and callable(sec_close):
+                        sec_close(tid)
+                except Exception:
+                    pass
+                stale_ids.append(item["resource_id"])
+            if stale_ids:
+                released = self.store.release_resources_by_ids(stale_ids)
+                for r_item in released:
+                    self.store.audit(
+                        "owner_chrome_hidden_target_orphan_reconciled",
+                        agent_id=r_item["agent_id"],
+                        task_id=r_item["task_id"],
+                        session_id=r_item["session_id"],
+                        resource_id=r_item["resource_id"],
+                    )
+                report["orphaned_hidden_targets_released"] = len(released)
+        except Exception as exc:
+            self.store.audit("orphan_reconcile_error", error=type(exc).__name__)
         return report
 
     def run_maintenance(self) -> None:
