@@ -1,0 +1,21 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "windows-bridge-mcp",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-27",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "durable_objects": {
+    "bindings": [
+      { "name": "DEVICE_HUB", "class_name": "DeviceHub" }
+    ]
+  },
+  "kv_namespaces": [
+    {
+      "binding": "OAUTH_KV",
+      "id": "<YOUR_OAUTH_KV_NAMESPACE_ID>"
+    }
+  ],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DeviceHub"] }
+  ]
+}

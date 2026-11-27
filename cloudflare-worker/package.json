@@ -1,0 +1,16 @@
+{
+  "name": "windows-bridge-mcp-worker",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@cloudflare/workers-oauth-provider": "^1.1.0",
+    "@modelcontextprotocol/server": "latest",
+    "agents": "latest",
+    "hono": "^4.13.9",
+    "ws": "^8.22.0",
+    "zod": "latest"
+  },
+  "devDependencies": {
+    "wrangler": "latest"
+  }
+}
