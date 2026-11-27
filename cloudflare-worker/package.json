@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "check:agent": "node --check agent/cf-bridge-agent.mjs",
-    "check:bundle": "wrangler deploy src/index.ts --name windows-bridge-mcp --compatibility-date 2026-09-27 --compatibility-flags nodejs_compat --dry-run --outdir .wrangler/dry-run"
+    "check:bundle": "wrangler deploy src/index.ts --name windows-bridge-mcp --compatibility-date 2026-09-27 --compatibility-flags nodejs_compat --dry-run --outdir .wrangler/dry-run",
+    "test:contract": "node --test test-agent-contract.mjs"
   },
   "dependencies": {
     "@cloudflare/workers-oauth-provider": "1.1.0",

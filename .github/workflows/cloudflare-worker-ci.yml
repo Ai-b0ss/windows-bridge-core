@@ -29,3 +29,5 @@ jobs:
         run: npm run check:agent
       - name: Dry-run bundle Worker with Wrangler
         run: npm run check:bundle
+      - name: End-to-end WebSocket agent <-> RPC contract tests
+        run: npm run test:contract
