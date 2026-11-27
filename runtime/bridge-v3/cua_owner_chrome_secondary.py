@@ -710,7 +710,8 @@ class _BrowserCDPClient:
     """Thread-safe loopback browser-target CDP client for one already-running Chrome instance."""
 
     KEEPALIVE_INTERVAL_S = 45.0
-    KEEPALIVE_TIMEOUT_S = 4.0
+    KEEPALIVE_TIMEOUT_S = 15.0
+    KEEPALIVE_MAX_CONSECUTIVE_TIMEOUTS = 3
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -748,6 +749,7 @@ class _BrowserCDPClient:
             ).start()
 
     def _keepalive_loop(self, generation: int, stop: threading.Event) -> None:
+        consecutive_timeouts = 0
         try:
             while not stop.wait(self.KEEPALIVE_INTERVAL_S):
                 with self._lock:
@@ -755,13 +757,24 @@ class _BrowserCDPClient:
                         return
                     try:
                         # Browser.getVersion is read-only; no new WebSocket or target is created.
-                        self.send("Browser.getVersion", timeout=self.KEEPALIVE_TIMEOUT_S)
+                        self.send(
+                            "Browser.getVersion",
+                            timeout=self.KEEPALIVE_TIMEOUT_S,
+                            preserve_on_timeout=True,
+                        )
+                        consecutive_timeouts = 0
                         self.keepalive_ok_count += 1
                         self.last_keepalive_at = time.time()
                         self.last_keepalive_error = None
                     except OwnerChromeSecondaryError as exc:
+                        if exc.code == "OWNER_CHROME_CDP_TIMEOUT":
+                            consecutive_timeouts += 1
+                            self.last_keepalive_error = f"OWNER_CHROME_CDP_TIMEOUT_{consecutive_timeouts}"
+                            if consecutive_timeouts < self.KEEPALIVE_MAX_CONSECUTIVE_TIMEOUTS:
+                                continue
+                            self.reset()
                         self.last_keepalive_error = exc.code
-                        # send() tears down a broken socket. Never reattach automatically.
+                        # Socket torn down after real disconnect or repeated timeouts; never reattach here.
                         return
         finally:
             with self._lock:
@@ -779,6 +792,7 @@ class _BrowserCDPClient:
             return {
                 "keepalive_active": active,
                 "keepalive_interval_s": float(self.KEEPALIVE_INTERVAL_S),
+                "keepalive_timeout_s": float(self.KEEPALIVE_TIMEOUT_S),
                 "keepalive_ok_count": int(self.keepalive_ok_count),
                 "last_keepalive_at": self.last_keepalive_at,
                 "last_keepalive_error": self.last_keepalive_error,
@@ -868,6 +882,7 @@ class _BrowserCDPClient:
         *,
         session_id: str | None = None,
         timeout: float = 10.0,
+        preserve_on_timeout: bool = False,
     ) -> dict[str, Any]:
         with self._lock:
             if self.socket is None:
@@ -877,6 +892,17 @@ class _BrowserCDPClient:
             except OwnerChromeSecondaryError:
                 raise
             except (TimeoutError, socket.timeout) as exc:
+                # Preserve an already-approved socket on a clean keepalive timeout when requested.
+                if preserve_on_timeout and not getattr(self.socket, "frame_dirty", False):
+                    raise OwnerChromeSecondaryError(
+                        "OWNER_CHROME_CDP_TIMEOUT",
+                        "CDP keepalive timed out on a clean socket; preserving connection for retry",
+                        cause=type(exc).__name__,
+                        method=method,
+                        outcome_unknown=True,
+                        retry_safe=True,
+                        connection_preserved=True,
+                    ) from exc
                 # A slow page-session command must not destroy an already-approved
                 # browser-level CDP channel if the WebSocket stream is still clean.
                 if session_id is not None and not getattr(self.socket, "frame_dirty", False):
