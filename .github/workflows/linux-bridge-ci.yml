@@ -1,0 +1,29 @@
+name: Linux Bridge CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'linux-bridge/**'
+      - '.github/workflows/linux-bridge-ci.yml'
+  pull_request:
+    paths:
+      - 'linux-bridge/**'
+      - '.github/workflows/linux-bridge-ci.yml'
+
+jobs:
+  test-linux-bridge:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Check install.sh syntax
+        run: bash -n linux-bridge/install.sh
+      - name: Compile Python modules
+        run: python3 -m compileall -q linux-bridge/ff_linux_bridge linux-bridge/tests
+      - name: Run Linux Bridge unit and Chromium CDP E2E tests
+        run: |
+          which google-chrome chromium chromium-browser || true
+          PYTHONPATH=linux-bridge python3 -m unittest discover -s linux-bridge/tests -v

@@ -1,0 +1,16 @@
+[Unit]
+Description=FF Bridge Cloudflare WebSocket Agent (NAT traversal)
+After=ff-linux-bridge.service network-online.target
+Requires=ff-linux-bridge.service
+
+[Service]
+Type=simple
+# Set FF_MCP_BASE, FF_DEVICE_NAME, FF_DEVICE_TOKEN_FILE, FF_RPC_SECRET_FILE in this env file:
+EnvironmentFile=%h/.config/ff-linux-bridge/cf-agent.env
+WorkingDirectory=__REPO_ROOT__/cloudflare-worker
+ExecStart=/usr/bin/env node agent/cf-bridge-agent.mjs
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

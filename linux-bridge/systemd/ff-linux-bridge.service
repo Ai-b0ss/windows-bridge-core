@@ -1,0 +1,15 @@
+[Unit]
+Description=FF Linux Bridge v3 (Level 2) Local RPC Server
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=__ENV_FILE__
+Environment=PYTHONPATH=__BRIDGE_DIR__
+WorkingDirectory=__BRIDGE_DIR__
+ExecStart=/usr/bin/env python3 -m ff_linux_bridge.server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
