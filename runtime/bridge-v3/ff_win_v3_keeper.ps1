@@ -87,6 +87,7 @@ $continuationDaemon = Join-Path $root 'cua_session_continuation.py'
 $ownerChromeBootstrap = Join-Path $root 'cua_owner_chrome_logon.ps1'
 $runtimeDeployLock = Join-Path $root '.cua-runtime-deploy-lock.json'
 $coldMaintenanceLock = Join-Path $root '.cua-cold-maintenance.lock'
+$stateMaintenanceLock = Join-Path $bridgeBase 'state\maintenance.lock.json'
 $coldMaintenanceMaxTtlSeconds = 300
 if ($Port -gt 0) {
     $port = $Port
@@ -671,13 +672,23 @@ function Test-FF3ColdMaintenanceLockActive {
     }
 }
 
+function Test-FF3AnyMaintenanceLockActive {
+    if (Test-FF3ColdMaintenanceLockActive -LockPath $coldMaintenanceLock -MaxTtlSeconds $coldMaintenanceMaxTtlSeconds) {
+        return $true
+    }
+    if (Test-FF3ColdMaintenanceLockActive -LockPath $stateMaintenanceLock -MaxTtlSeconds $coldMaintenanceMaxTtlSeconds) {
+        return $true
+    }
+    return $false
+}
+
 function Test-FF3AgentStartAllowed {
     # A failed HTTP health probe is not evidence that a live process or its
     # jobs are safe to terminate. Only respawn after verified absence. An
     # unresponsive live agent remains diagnosable; trusted runtime deployment
     # owns its separately verified stop/backup/recovery transaction.
     if (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf) { return $false }
-    if (Test-FF3ColdMaintenanceLockActive -LockPath $coldMaintenanceLock) {
+    if (Test-FF3AnyMaintenanceLockActive) {
         Write-FF3RelayWatchdogLog 'agent_restart_suppressed:cold_maintenance_lock'
         return $false
     }
@@ -782,7 +793,7 @@ try {
     $loopIteration = 0
     while ($true) {
         $loopIteration++
-        if ((-not (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf)) -and (-not (Test-FF3ColdMaintenanceLockActive -LockPath $coldMaintenanceLock))) {
+        if ((-not (Test-Path -LiteralPath $runtimeDeployLock -PathType Leaf)) -and (-not (Test-FF3AnyMaintenanceLockActive))) {
             $agentHealthy = Test-FF3Agent
             if ($agentHealthy) {
                 $agentConsecutiveFailures = 0

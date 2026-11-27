@@ -2,10 +2,12 @@ param([switch]$LoadFunctionsOnly)
 
 $ErrorActionPreference = 'SilentlyContinue'
 $env:FF_ENABLE_COMMANDER_RELAY = '1'
-$bridgeDir = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge\bridge-v3'
+$bridgeBase = Join-Path $env:LOCALAPPDATA 'FF-Windows-Bridge'
+$bridgeDir = Join-Path $bridgeBase 'bridge-v3'
 $keeper = Join-Path $bridgeDir 'ff_win_v3_keeper.ps1'
 $deployLock = Join-Path $bridgeDir '.cua-runtime-deploy-lock.json'
 $maintLock = Join-Path $bridgeDir '.cua-cold-maintenance.lock'
+$stateMaintLock = Join-Path $bridgeBase 'state\maintenance.lock.json'
 $maintMaxTtlSeconds = 300
 $log = Join-Path $env:ProgramData 'FF-Windows-Bridge\bridge-v3-keeper-launch.log'
 
@@ -52,6 +54,7 @@ function Test-FF3ColdMaintenanceLockActive {
 function Test-KeeperLauncherStartAllowed {
     if (Test-Path -LiteralPath $deployLock -PathType Leaf) { return $false }
     if (Test-FF3ColdMaintenanceLockActive -LockPath $maintLock -MaxTtlSeconds $maintMaxTtlSeconds) { return $false }
+    if (Test-FF3ColdMaintenanceLockActive -LockPath $stateMaintLock -MaxTtlSeconds $maintMaxTtlSeconds) { return $false }
     return $true
 }
 

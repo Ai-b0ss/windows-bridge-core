@@ -99,6 +99,31 @@ class TestKeeperMaintenanceLock(unittest.TestCase):
             self.assertFalse(r3["outer_lock_active"])
             self.assertTrue(r3["outer_start_allowed"])
 
+            # Case 5: Unified state/maintenance.lock.json (TTL <= 300s) blocks BOTH inner and outer keepers,
+            # and expires cleanly once past its expires_epoch.
+            lock_file.unlink(missing_ok=True)
+            state_lock = local_app / "FF-Windows-Bridge" / "state" / "maintenance.lock.json"
+            state_lock.parent.mkdir(parents=True, exist_ok=True)
+            state_lock.write_text(json.dumps({
+                "schema": "ff-cold-maintenance-lock/v1",
+                "created_epoch": now,
+                "expires_epoch": now + 180,
+                "ttl_seconds": 180,
+            }), encoding="utf-8")
+            r4 = json.loads(subprocess.check_output([ps, "-NoLogo", "-NoProfile", "-Command", probe_cmd], env=env, text=True))
+            self.assertFalse(r4["inner_start_allowed"], "Inner keeper must honor state/maintenance.lock.json")
+            self.assertFalse(r4["outer_start_allowed"], "Outer launcher must honor state/maintenance.lock.json")
+
+            state_lock.write_text(json.dumps({
+                "schema": "ff-cold-maintenance-lock/v1",
+                "created_epoch": now - 400,
+                "expires_epoch": now - 10,
+                "ttl_seconds": 300,
+            }), encoding="utf-8")
+            r5 = json.loads(subprocess.check_output([ps, "-NoLogo", "-NoProfile", "-Command", probe_cmd], env=env, text=True))
+            self.assertTrue(r5["inner_start_allowed"], "Expired state/maintenance.lock.json must unblock inner keeper")
+            self.assertTrue(r5["outer_start_allowed"], "Expired state/maintenance.lock.json must unblock outer launcher")
+
 
 if __name__ == "__main__":
     unittest.main()
