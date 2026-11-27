@@ -28,7 +28,7 @@ REPO = "Ai-b0ss/windows-bridge-core"
 REPO_URL = f"https://github.com/{REPO}.git"
 REQUIRED_CHECKS = ("portable-syntax", "candidate-install")
 
-BRIDGE_ROOT = Path(os.environ.get("FF_BRIDGE_ROOT") or (Path(os.environ.get("LOCALAPPDATA", ".")) / "FF-Windows-Bridge"))
+BRIDGE_ROOT = Path(r"K:\FF-Windows-Bridge")
 STATE_DIR = BRIDGE_ROOT / "state" / "hub"
 ACTIVE_RELEASE = BRIDGE_ROOT / "state" / "active-release.json"
 RELEASES_ROOT = BRIDGE_ROOT / "runtime-releases"
@@ -93,6 +93,41 @@ def ci_is_green(sha: str) -> tuple[bool, dict[str, str]]:
     return ok, latest
 
 
+
+def _dir_digest(root: Path) -> str:
+    h = hashlib.sha256()
+    if not root.is_dir():
+        return ""
+    for p in sorted(root.rglob("*")):
+        if "__pycache__" in p.parts or p.suffix == ".pyc":
+            continue
+        if p.is_file():
+            rel = p.relative_to(root).as_posix().encode("utf-8")
+            h.update(rel + b"\0")
+            h.update(p.read_bytes())
+            h.update(b"\0")
+    return h.hexdigest()
+
+
+def runtime_tree_changed(base_sha: str, head_sha: str) -> tuple[bool | None, int]:
+    """Return (changed, file_count) for runtime/bridge-v3/ between base_sha and head_sha."""
+    if not base_sha or len(base_sha) < 7:
+        return True, 0
+    r = run_cmd(
+        ["gh", "api", f"repos/{REPO}/compare/{base_sha}...{head_sha}", "--jq", "[.files[].filename]"],
+        timeout=15,
+    )
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        return None, 0
+    try:
+        files = json.loads(r.stdout)
+    except Exception:
+        return None, 0
+    if not isinstance(files, list):
+        return None, 0
+    changed = any(str(f).startswith("runtime/bridge-v3/") for f in files)
+    return changed, len(files)
+
 def deploy_commit(full_sha: str) -> int:
     short_sha = full_sha[:7]
     rel_root = RELEASES_ROOT / f"bridge-{short_sha}"
@@ -113,6 +148,15 @@ def deploy_commit(full_sha: str) -> int:
         if not (src / "ff_hub.py").is_file():
             log(f"ERROR missing_ff_hub sha={short_sha}")
             return 2
+
+        cur_check = json.loads(ACTIVE_RELEASE.read_text(encoding="utf-8-sig"))
+        cur_rel_dir = Path(str(cur_check.get("release_dir") or ""))
+        if cur_rel_dir.is_dir() and _dir_digest(src) == _dir_digest(cur_rel_dir):
+            cur_check["source_head"] = full_sha
+            cur_check["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            ACTIVE_RELEASE.write_text(json.dumps(cur_check, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            log(f"SKIP_RUNTIME_UNCHANGED sha={short_sha} check=digest")
+            return 0
 
         if rel_root.exists():
             shutil.rmtree(rel_root, ignore_errors=True)
@@ -248,6 +292,13 @@ def main() -> int:
             return 1
         if remote_sha == cur_head:
             log(f"UP_TO_DATE sha={remote_sha[:7]}")
+            return 0
+        rt_changed, changed_count = runtime_tree_changed(cur_head, remote_sha)
+        if rt_changed is False:
+            cur["source_head"] = remote_sha
+            cur["updated_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            ACTIVE_RELEASE.write_text(json.dumps(cur, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            log(f"SKIP_RUNTIME_UNCHANGED sha={remote_sha[:7]} files={changed_count}")
             return 0
         green, checks = ci_is_green(remote_sha)
         if not green:
